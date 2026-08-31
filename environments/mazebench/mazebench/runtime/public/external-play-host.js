@@ -111,22 +111,30 @@
       }
 
       if (app.state?.actors?.[playerIdx]) {
+        app.state.actors[playerIdx].type = "player";
         app.state.actors[playerIdx].x = state.player.x;
         app.state.actors[playerIdx].y = state.player.y;
         app.state.actors[playerIdx].elevation = state.player.elevation;
         app.state.actors[playerIdx].renderX = state.player.x;
         app.state.actors[playerIdx].renderY = state.player.y;
         app.state.actors[playerIdx].renderElevation = state.player.elevation;
+        app.state.actors[playerIdx].renderScale = 1;
+        app.state.actors[playerIdx].renderAlpha = 1;
+        app.state.actors[playerIdx].renderSink = 0;
+        app.state.actors[playerIdx].renderInHole = false;
         app.state.actors[playerIdx].removed = false;
       }
       if (app.playData?.actors?.[playerIdx]) {
+        app.playData.actors[playerIdx].type = "player";
         app.playData.actors[playerIdx].x = state.player.x;
         app.playData.actors[playerIdx].y = state.player.y;
         app.playData.actors[playerIdx].elevation = state.player.elevation;
         app.playData.actors[playerIdx].renderX = state.player.x;
         app.playData.actors[playerIdx].renderY = state.player.y;
         app.playData.actors[playerIdx].renderElevation = state.player.elevation;
+        app.playData.actors[playerIdx].removed = false;
       }
+      app.playerActorIndex = playerIdx;
     }
 
     // 4. Non-Player Actors using authoritative viewer_actor_index
@@ -138,22 +146,37 @@
           if (match) idx = parseInt(match[1], 10);
         }
         if (idx !== undefined && idx >= 0) {
-          if (app.state?.actors?.[idx]) {
-            app.state.actors[idx].x = a.x;
-            app.state.actors[idx].y = a.y;
-            app.state.actors[idx].elevation = a.elevation;
-            app.state.actors[idx].renderX = a.x;
-            app.state.actors[idx].renderY = a.y;
-            app.state.actors[idx].renderElevation = a.elevation;
-            app.state.actors[idx].removed = Boolean(a.removed);
-          }
-          if (app.playData?.actors?.[idx]) {
-            app.playData.actors[idx].x = a.x;
-            app.playData.actors[idx].y = a.y;
-            app.playData.actors[idx].elevation = a.elevation;
-            app.playData.actors[idx].renderX = a.x;
-            app.playData.actors[idx].renderY = a.y;
-            app.playData.actors[idx].renderElevation = a.elevation;
+          const isPlayerIdx = state.player && idx === state.player.viewer_actor_index;
+          if (!isPlayerIdx) {
+            if (app.state?.actors?.[idx]) {
+              if (a.type) app.state.actors[idx].type = a.type;
+              app.state.actors[idx].x = a.x;
+              app.state.actors[idx].y = a.y;
+              app.state.actors[idx].elevation = a.elevation;
+              app.state.actors[idx].renderX = a.x;
+              app.state.actors[idx].renderY = a.y;
+              app.state.actors[idx].renderElevation = a.elevation;
+              app.state.actors[idx].removed = Boolean(a.removed);
+              if (a.removed) {
+                app.state.actors[idx].renderScale = 0;
+                app.state.actors[idx].renderAlpha = 0;
+                app.state.actors[idx].renderInHole = false;
+              } else {
+                app.state.actors[idx].renderScale = 1;
+                app.state.actors[idx].renderAlpha = 1;
+                app.state.actors[idx].renderInHole = false;
+              }
+            }
+            if (app.playData?.actors?.[idx]) {
+              if (a.type) app.playData.actors[idx].type = a.type;
+              app.playData.actors[idx].x = a.x;
+              app.playData.actors[idx].y = a.y;
+              app.playData.actors[idx].elevation = a.elevation;
+              app.playData.actors[idx].renderX = a.x;
+              app.playData.actors[idx].renderY = a.y;
+              app.playData.actors[idx].renderElevation = a.elevation;
+              app.playData.actors[idx].removed = Boolean(a.removed);
+            }
           }
         }
       }
@@ -165,6 +188,7 @@
       app.collectedGemIds.clear();
       collected.forEach((id) => app.collectedGemIds.add(id));
     }
+    const currentRoomId = state.current_room || app.currentLevelId || "level_HxI";
     if (Array.isArray(app.state?.actors)) {
       for (let i = 0; i < app.state.actors.length; i++) {
         const act = app.state.actors[i];
@@ -172,13 +196,53 @@
           const origX = app.playData?.actors?.[i]?.x ?? act.x;
           const origY = app.playData?.actors?.[i]?.y ?? act.y;
           const origElev = app.playData?.actors?.[i]?.elevation ?? act.elevation ?? 0;
-          const gemId = `${state.current_room || "level_HxI"}:gem:${origX},${origY},${origElev}`;
-          if (app.collectedGemIds?.has(gemId)) {
-            act.removed = true;
+          const gemId = act.collectionId || `${currentRoomId}:gem:${origX},${origY},${origElev}`;
+          const isCollected = Boolean(app.collectedGemIds?.has(gemId));
+
+          if (isCollected) {
+            if (typeof app.applyCollectedGemVisual === "function") {
+              app.applyCollectedGemVisual(act);
+            } else {
+              act.collected = true;
+              act.removed = true;
+              act.showCollectedGhost = true;
+              act.renderScale = 1;
+              act.renderAlpha = app.COLLECTED_GEM_ALPHA ?? 0.22;
+              act.renderSink = 0;
+              act.renderInHole = false;
+            }
+            act.collectionId = gemId;
+          } else {
+            if (typeof app.clearCollectedGemVisual === "function") {
+              app.clearCollectedGemVisual(act);
+            } else {
+              act.collected = false;
+              act.removed = false;
+              act.showCollectedGhost = false;
+              act.renderScale = 1;
+              act.renderAlpha = 1;
+              act.renderSink = 0;
+              act.renderInHole = false;
+            }
+            act.collectionId = gemId;
+          }
+
+          if (app.playData?.actors?.[i]) {
+            const playAct = app.playData.actors[i];
+            playAct.collectionId = gemId;
+            playAct.collected = isCollected;
+            playAct.removed = isCollected;
+            playAct.showCollectedGhost = isCollected;
+            playAct.renderScale = 1;
+            playAct.renderAlpha = isCollected ? (app.COLLECTED_GEM_ALPHA ?? 0.22) : 1;
           }
         }
       }
     }
+    if (typeof app.applyCollectedGemProgressToActors === "function") {
+      app.applyCollectedGemProgressToActors(app.state?.actors, currentRoomId);
+    }
+    app.threeRenderer?.invalidateSceneCache?.();
 
     // 6. Terrain Overrides (Lifts & Devices)
     if (Array.isArray(state.terrain_overrides)) {
@@ -239,6 +303,37 @@
       return;
     }
 
+    // Sync gem collection immediately when move begins so ghost material takes effect
+    const transCollected = endState.collected_gems || endState.collected_gem_ids;
+    if (Array.isArray(transCollected) && app.collectedGemIds instanceof Set) {
+      app.collectedGemIds.clear();
+      transCollected.forEach((id) => app.collectedGemIds.add(id));
+      const room = endState.current_room || app.currentLevelId || "level_HxI";
+      if (Array.isArray(app.state?.actors)) {
+        for (let i = 0; i < app.state.actors.length; i++) {
+          const act = app.state.actors[i];
+          if (act && act.type === "gem") {
+            const origX = app.playData?.actors?.[i]?.x ?? act.x;
+            const origY = app.playData?.actors?.[i]?.y ?? act.y;
+            const origElev = app.playData?.actors?.[i]?.elevation ?? act.elevation ?? 0;
+            const gemId = act.collectionId || `${room}:gem:${origX},${origY},${origElev}`;
+            if (app.collectedGemIds.has(gemId)) {
+              if (typeof app.applyCollectedGemVisual === "function") {
+                app.applyCollectedGemVisual(act);
+              } else {
+                act.collected = true;
+                act.removed = true;
+                act.showCollectedGhost = true;
+                act.renderScale = 1;
+                act.renderAlpha = app.COLLECTED_GEM_ALPHA ?? 0.22;
+              }
+            }
+          }
+        }
+      }
+      app.threeRenderer?.invalidateSceneCache?.();
+    }
+
     function stepAnimation(now) {
       const elapsed = now - startMs;
       const progress = Math.min(1, Math.max(0, elapsed / durationMs));
@@ -273,7 +368,8 @@
           const curElev = delta.before.elevation + (delta.after.elevation - delta.before.elevation) * localT;
 
           let targetIdx = -1;
-          if (delta.type === "player") {
+          const isPlayerDelta = delta.type === "player" || delta.type === "circle_player";
+          if (isPlayerDelta) {
             targetIdx = endState.player?.viewer_actor_index ?? app.playerActorIndex ?? 0;
           } else {
             const m = String(delta.id || "").match(/:actor:(\d+)$/);
@@ -281,12 +377,36 @@
           }
 
           if (targetIdx >= 0 && app.state?.actors?.[targetIdx]) {
-            app.state.actors[targetIdx].x = curX;
-            app.state.actors[targetIdx].y = curY;
-            app.state.actors[targetIdx].elevation = curElev;
-            app.state.actors[targetIdx].renderX = curX;
-            app.state.actors[targetIdx].renderY = curY;
-            app.state.actors[targetIdx].renderElevation = curElev;
+            const actor = app.state.actors[targetIdx];
+            if (isPlayerDelta) {
+              actor.type = "player";
+            } else if (delta.type) {
+              actor.type = delta.type;
+            }
+            actor.x = curX;
+            actor.y = curY;
+            actor.elevation = curElev;
+            actor.renderX = curX;
+            actor.renderY = curY;
+            actor.renderElevation = curElev;
+
+            // Handle falling into void/hole animation
+            if (delta.after.removed) {
+              actor.renderSink = localT * 50;
+              actor.renderScale = Math.max(0, 1 - localT);
+              actor.renderAlpha = Math.max(0, 1 - localT);
+              if (localT >= 1) {
+                actor.removed = true;
+                actor.renderScale = 0;
+                actor.renderAlpha = 0;
+                actor.renderInHole = false;
+              }
+            } else {
+              actor.removed = false;
+              actor.renderScale = 1;
+              actor.renderAlpha = 1;
+              actor.renderSink = 0;
+            }
           }
         }
       }
