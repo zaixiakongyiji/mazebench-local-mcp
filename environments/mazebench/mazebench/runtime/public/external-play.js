@@ -73,10 +73,14 @@
 
     const statusPill = document.getElementById("external-status-pill");
     const timerElem = document.getElementById("spectator-timer");
+    const timerValElem = document.getElementById("spectator-timer-val");
+    const roomsElem = document.getElementById("spectator-rooms-stat");
+    const roomsValElem = document.getElementById("spectator-rooms-val");
+    const gemsElem = document.getElementById("spectator-gems");
+    const gemsValElem = document.getElementById("spectator-gems-val");
     const actionsElem = document.getElementById("spectator-actions");
     const actionsValElem = document.getElementById("spectator-actions-val");
-    const gemsElem = document.getElementById("spectator-gems");
-    const roomsValElem = document.getElementById("spectator-rooms-val");
+    const roomElem = document.getElementById("spectator-room-stat");
     const roomValElem = document.getElementById("spectator-room-val");
     const controllerStatusElem = document.getElementById("controller-status");
     const cancelBtn = document.getElementById("cancel-run-btn");
@@ -195,19 +199,23 @@
     function updateStatsUI(roomsCount, roomName, gems, actions) {
       if (roomsValElem) {
         roomsValElem.textContent = String(roomsCount);
+      } else if (roomsElem) {
+        roomsElem.innerHTML = `🏛️ <strong>${escapeText(roomsCount)}</strong>`;
       }
       if (roomValElem) {
         roomValElem.textContent = String(roomName);
+      } else if (roomElem) {
+        roomElem.innerHTML = `🚪 <strong>${escapeText(roomName)}</strong>`;
       }
       if (gemsValElem) {
         gemsValElem.textContent = String(gems);
       } else if (gemsElem) {
-        gemsElem.innerHTML = `💎 Gems: <strong>${gems}</strong>`;
+        gemsElem.innerHTML = `💎 <strong>${escapeText(gems)}</strong>`;
       }
       if (actionsValElem) {
         actionsValElem.textContent = String(actions);
       } else if (actionsElem) {
-        actionsElem.innerHTML = `Actions: <strong>${actions}</strong>`;
+        actionsElem.innerHTML = `👟 <strong>${escapeText(actions)}</strong>`;
       }
     }
 
@@ -443,61 +451,64 @@
       if (isProcessingQueue || actionQueue.length === 0) return;
       isProcessingQueue = true;
 
-      while (actionQueue.length > 0) {
-        if (genId !== undefined && genId !== currentGenerationId) {
-          isProcessingQueue = false;
-          return;
-        }
+      try {
+        while (actionQueue.length > 0) {
+          if (genId !== undefined && genId !== currentGenerationId) {
+            return;
+          }
 
-        const item = actionQueue.shift();
-        const isImmediate = isEnded || item.immediate === true;
+          const item = actionQueue.shift();
+          const isImmediate = isEnded || item.immediate === true;
 
-        // Calibrate step delay: if ended or behind queue, speed up smoothly
-        if (isImmediate) {
-          dynamicStepDelayMs = 0;
-        } else if (actionQueue.length > 10) {
-          dynamicStepDelayMs = 20;
-        } else if (actionQueue.length > 5) {
-          dynamicStepDelayMs = 60;
-        } else if (actionQueue.length > 2) {
-          dynamicStepDelayMs = 120;
-        } else {
-          dynamicStepDelayMs = 220;
-        }
+          // Calibrate step delay: if ended or behind queue, speed up smoothly
+          if (isImmediate) {
+            dynamicStepDelayMs = 0;
+          } else if (actionQueue.length > 10) {
+            dynamicStepDelayMs = 20;
+          } else if (actionQueue.length > 5) {
+            dynamicStepDelayMs = 60;
+          } else if (actionQueue.length > 2) {
+            dynamicStepDelayMs = 120;
+          } else {
+            dynamicStepDelayMs = 220;
+          }
 
-        if (host && item.action && (isLiveMode || isImmediate)) {
-          await host.applyAction(item.action, item.transition, item.post_viewer_state, { immediate: isImmediate });
-        }
+          if (host && item.action && (isLiveMode || isImmediate)) {
+            try {
+              await host.applyAction(item.action, item.transition, item.post_viewer_state, { immediate: isImmediate });
+            } catch (err) {
+              console.warn("Error applying action in host:", err);
+            }
+          }
 
-        const roomName = item.post_viewer_state?.current_room || item.transition?.world_transition?.target_room || item.observation?.current_room;
-        if (roomName && (isLiveMode || isImmediate)) {
-          currentRoom = roomName;
-          roomElem.innerHTML = `🚪 Room: <strong>${escapeText(currentRoom)}</strong>`;
-        }
+          const roomName = item.post_viewer_state?.current_room || item.transition?.world_transition?.target_room || item.observation?.current_room;
+          if (roomName) {
+            currentRoom = roomName;
+            visitedRooms.add(roomName);
+          }
 
-        if (item.observation && (isLiveMode || isImmediate)) {
-          if (item.observation.collected_gems_count !== undefined) {
-            gemCount = item.observation.collected_gems_count;
-            gemsElem.innerHTML = `💎 Gems: <strong>${gemCount}</strong>`;
-          } else if (item.observation.gem_count !== undefined) {
-            gemCount = item.observation.gem_count;
-            gemsElem.innerHTML = `💎 Gems: <strong>${gemCount}</strong>`;
+          if (item.observation) {
+            if (item.observation.collected_gems_count !== undefined) {
+              gemCount = item.observation.collected_gems_count;
+            } else if (item.observation.gem_count !== undefined) {
+              gemCount = item.observation.gem_count;
+            }
+          }
+
+          totalActions++;
+          if (isLiveMode || isImmediate) {
+            currentPlaybackStep = totalActions;
+            updateStatsUI(visitedRooms.size, currentRoom, gemCount, totalActions);
+          }
+          updateScrubberUI();
+
+          if (dynamicStepDelayMs > 0 && !isImmediate) {
+            await new Promise((resolve) => setTimeout(resolve, dynamicStepDelayMs));
           }
         }
-
-        totalActions++;
-        if (isLiveMode || isImmediate) {
-          currentPlaybackStep = totalActions;
-          actionsElem.innerHTML = `Actions: <strong>${totalActions}</strong>`;
-        }
-        updateScrubberUI();
-
-        if (dynamicStepDelayMs > 0 && !isImmediate) {
-          await new Promise((resolve) => setTimeout(resolve, dynamicStepDelayMs));
-        }
+      } finally {
+        isProcessingQueue = false;
       }
-
-      isProcessingQueue = false;
     }
 
     function escapeText(str) {
@@ -667,6 +678,7 @@
           await new Promise((r) => setTimeout(r, 20));
         }
         currentPlaybackStep = historyActions.length;
+        updateStatsUI(visitedRooms.size, currentRoom, gemCount, totalActions);
         updateScrubberUI();
 
         // Check if run is in a terminal state
@@ -712,16 +724,20 @@
         }
 
         if (!response.ok) {
-          controllerStatusElem.textContent = "Stream Reconnecting...";
-          controllerStatusElem.className = "spectator-badge controller-badge is-disconnected";
+          if (controllerStatusElem) {
+            controllerStatusElem.textContent = "Stream Reconnecting...";
+            controllerStatusElem.className = "spectator-badge controller-badge is-disconnected";
+          }
           const delay = Math.min(5000, 500 * Math.pow(1.5, sseRetryCount++));
           setTimeout(() => startSSEStream(genId), delay);
           return;
         }
 
         sseRetryCount = 0;
-        controllerStatusElem.textContent = "Live Stream Connected";
-        controllerStatusElem.className = "spectator-badge controller-badge is-connected";
+        if (controllerStatusElem) {
+          controllerStatusElem.textContent = "Live Stream Connected";
+          controllerStatusElem.className = "spectator-badge controller-badge is-connected";
+        }
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
@@ -737,8 +753,10 @@
           if (done) {
             // Normal stream close (EOF): reconnect if not ended
             if (!isEnded && (genId === undefined || genId === currentGenerationId)) {
-              controllerStatusElem.textContent = "Stream Reconnecting...";
-              controllerStatusElem.className = "spectator-badge controller-badge is-disconnected";
+              if (controllerStatusElem) {
+                controllerStatusElem.textContent = "Stream Reconnecting...";
+                controllerStatusElem.className = "spectator-badge controller-badge is-disconnected";
+              }
               const delay = Math.min(5000, 500 * Math.pow(1.5, sseRetryCount++));
               setTimeout(() => startSSEStream(genId), delay);
             }
@@ -750,7 +768,15 @@
           buffer = parts.pop(); // keep remainder
 
           for (const block of parts) {
-            if (!block.trim() || block.startsWith(":")) continue;
+            if (!block.trim()) continue;
+            if (block.startsWith(":")) {
+              lastEventTimestamp = Date.now();
+              if (controllerStatusElem && !isEnded) {
+                controllerStatusElem.textContent = "Live Stream Connected";
+                controllerStatusElem.className = "spectator-badge controller-badge is-connected";
+              }
+              continue;
+            }
 
             const lines = block.split("\n");
             let eventType = "message";
@@ -773,6 +799,10 @@
             }
 
             lastEventTimestamp = Date.now();
+            if (controllerStatusElem && !isEnded) {
+              controllerStatusElem.textContent = "Live Stream Connected";
+              controllerStatusElem.className = "spectator-badge controller-badge is-connected";
+            }
 
             if (eventDataStr) {
               try {
@@ -786,8 +816,10 @@
           }
         }
       } catch (err) {
-        controllerStatusElem.textContent = "Stream Disconnected";
-        controllerStatusElem.className = "spectator-badge controller-badge is-disconnected";
+        if (controllerStatusElem) {
+          controllerStatusElem.textContent = "Stream Disconnected";
+          controllerStatusElem.className = "spectator-badge controller-badge is-disconnected";
+        }
         if (!isEnded && (genId === undefined || genId === currentGenerationId)) {
           const delay = Math.min(5000, 500 * Math.pow(1.5, sseRetryCount++));
           setTimeout(() => startSSEStream(genId), delay);
