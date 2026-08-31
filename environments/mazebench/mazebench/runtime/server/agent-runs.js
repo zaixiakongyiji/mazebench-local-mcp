@@ -44,10 +44,11 @@ const {
 } = require("../shared/auto-quit");
 const { BOARD_STATE_HASH_VERSION } = require("../shared/board-state");
 const GAME_WON_GEM_COUNT = 100;
-const {
-  CHECKPOINT_FILE: PRIME_RESUME_CHECKPOINT_FILE,
-  writePrimeResumeCheckpoint
-} = require("./prime-resume");
+const VIEW_NAMES = ["top", "top-diagonal", "diagonal", "side-diagonal", "side"];
+const PRIME_RESUME_CHECKPOINT_FILE = "prime-resume.json";
+function writePrimeResumeCheckpoint(...args) {
+  return require("./integrations/prime/resume").writePrimeResumeCheckpoint(...args);
+}
 
 // GUI-launched servers (editors, preview harnesses) often get a minimal PATH
 // that misses the dirs where codex/claude/docker/prime live. Enrich the PATH
@@ -63,9 +64,6 @@ function enrichedPathEnv() {
     "/usr/local/bin"
   ];
   const current = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
-  // Prefer the running Node installation's bin directory. That is where this
-  // app installs npm-global agents, and it may be newer than a Homebrew cask
-  // that appears earlier in a GUI process's inherited PATH.
   const merged = [];
 
   [extra[0], ...current, ...extra.slice(1)].forEach((dir) => {
@@ -97,26 +95,7 @@ function normalizeEventTimestamp(value) {
   return Number.isFinite(date.getTime()) ? date.toISOString() : null;
 }
 
-// Agent Mode backend: launches the isolated Prime runner and reads both current
-// and historical run artifacts under outputs/maze-local/site/.
-
-const VIEW_NAMES = ["top", "top-diagonal", "diagonal", "side-diagonal", "side"];
-const PRIME_HARNESS_CATALOG = require("../environments/mazebench/prime-harness-catalog.json");
-const PRIME_HARNESSES = new Map(
-  PRIME_HARNESS_CATALOG.harnesses.map((definition) => [definition.id, {
-    ...definition,
-    launchable: Boolean(definition.launchable),
-    taskset: "mazebench-tools",
-    protocol: definition.adapter,
-    custom: true
-  }])
-);
-const UNSAFE_PRIME_AGENT_HARNESS_MESSAGE =
-  "This Prime harness is not approved for MazeBench's isolated game-control boundary.";
-
 const STANDARD_REASONING_LEVELS = ["low", "medium", "high"];
-const PRIME_REASONING_LEVELS = ["low", "medium", "high"];
-const PRIME_PYTHON_HARNESSES = new Set(["codex", "claude_code"]);
 
 function claudeReasoningLevels(modelId) {
   const id = String(modelId || "").toLowerCase().replace(/\./g, "-");
@@ -136,21 +115,6 @@ function claudeReasoningLevels(modelId) {
   ];
 }
 
-// Keep Prime's runner contract provider-neutral. Provider-specific extensions
-// are intentionally excluded, but every Prime model gets the stable
-// off/low/medium/high choice exposed by the runner.
-function primeReasoningLevels(_modelId) {
-  return [...PRIME_REASONING_LEVELS];
-}
-
-function primeHarnessModelCompatible(modelId, harnessId) {
-  const harness = normalizePrimeHarness(harnessId);
-  const id = String(modelId || "").trim();
-  if (!id) return false;
-  // Approved harnesses use Verifiers' provider-neutral interception endpoint.
-  return true;
-}
-
 function resolveAgentRunsDir(rootDir, env = process.env) {
   const configured = String(env.MAZEBENCH_RUNS_DIR || "").trim();
   if (configured) return path.resolve(configured);
@@ -167,150 +131,40 @@ function resolveAgentRunsDir(rootDir, env = process.env) {
   return path.join(sharedRoot, "outputs", "maze-local", "site");
 }
 
-function primeSandboxIdsFromText(value) {
-  const ids = new Set();
-  const text = String(value || "");
-  for (const pattern of [
-    /\bsandbox\s+([a-z0-9]{12,64})\s+up\b/gi,
-    /\bsandbox-job-([a-z0-9]{12,64})\b/gi
-  ]) {
-    for (const match of text.matchAll(pattern)) ids.add(match[1]);
-  }
-  return [...ids];
+function getPrimeCatalog() {
+  return require("./integrations/prime/catalog");
+}
+
+function primeReasoningLevels(modelId) {
+  return getPrimeCatalog().primeReasoningLevels(modelId);
+}
+
+function primeHarnessModelCompatible(modelId, harnessId) {
+  return getPrimeCatalog().primeHarnessModelCompatible(modelId, harnessId);
 }
 
 function filterPrimeCatalogForHarness(catalog, harnessId) {
-  const harness = normalizePrimeHarness(harnessId);
-  const definition = PRIME_HARNESSES.get(harness);
-  const allModels = Array.isArray(catalog?.models) ? catalog.models : [];
-  if (!definition?.launchable) {
-    return {
-      ...catalog,
-      harness,
-      models: [],
-      default_model_id: "",
-      note: definition.reason || UNSAFE_PRIME_AGENT_HARNESS_MESSAGE
-    };
-  }
-  const models = allModels
-    .filter((model) => primeHarnessModelCompatible(model.id, harness))
-    .map((model) => ({
-      ...model,
-      harness_compatible: true,
-      compatibility: definition.adapter || definition.protocol
-    }));
-  return {
-    ...catalog,
-    harness,
-    models,
-    default_model_id: models[0]?.id || "",
-    note: models.length
-      ? `${models.length} live Prime model${models.length === 1 ? "" : "s"}. ${definition.label} is connected through MazeBench's ${definition.adapter || "native"} game-tools-only route.`
-      : catalog?.note || `Prime's live model catalog is currently empty.`
-  };
+  return getPrimeCatalog().filterPrimeCatalogForHarness(catalog, harnessId);
 }
 
 function publicPrimeHarnesses() {
-  return [...PRIME_HARNESSES.values()]
-    // The Prime Agent card is intentionally a single, opinionated Prime Agent
-    // route. Keep the rest of the pinned Verifiers catalog private for
-    // validation and the dedicated first-class harness cards.
-    .filter((definition) => definition.custom && definition.id === "mazebench_prime_agent")
-    .map((definition) => ({
-      id: definition.id,
-      label: definition.label,
-      description: definition.description || "",
-      launchable: Boolean(definition.launchable),
-      reason: definition.reason || "",
-      protocol: definition.protocol || "",
-      boundary: definition.boundary || "",
-      observation_modes: [...(definition.observation_modes || [])],
-      default_config: { ...(definition.default_config || {}) },
-      configurable: [...(definition.configurable || [])],
-      config_schema: definition.config_schema || { properties: {} },
-      adapter: definition.adapter || "native_mcp",
-      runtime_harness_id: definition.runtime_harness_id || definition.id,
-      upstream_id: definition.upstream_id || null,
-      supports_mcp: Boolean(definition.supports_mcp),
-      status: definition.status || (definition.launchable ? "compatible" : "catalog_error"),
-      catalog_fingerprint: PRIME_HARNESS_CATALOG.catalog_fingerprint,
-      verifiers_version: PRIME_HARNESS_CATALOG.verifiers_version
-    }));
+  return getPrimeCatalog().publicPrimeHarnesses();
 }
 
 function primeHarnessConfigValueValid(value, schema = {}) {
-  if (Array.isArray(schema.anyOf)) {
-    return schema.anyOf.some((option) => primeHarnessConfigValueValid(value, option));
-  }
-  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) return false;
-  if (schema.type === "null") return value === null;
-  if (schema.type === "boolean") return typeof value === "boolean";
-  if (schema.type === "integer") return Number.isInteger(value);
-  if (schema.type === "number") return typeof value === "number" && Number.isFinite(value);
-  if (schema.type === "string") {
-    if (typeof value !== "string") return false;
-    if (schema.pattern && !(new RegExp(schema.pattern)).test(value)) return false;
-    return true;
-  }
-  if (schema.type === "array") {
-    if (!Array.isArray(value)) return false;
-    if (Number.isInteger(schema.minItems) && value.length < schema.minItems) return false;
-    if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) return false;
-    if (Array.isArray(schema.prefixItems)) {
-      return schema.prefixItems.every((item, index) => primeHarnessConfigValueValid(value[index], item));
-    }
-    return !schema.items || value.every((item) => primeHarnessConfigValueValid(item, schema.items));
-  }
-  if (schema.type === "object") return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-  return value === null || ["string", "number", "boolean"].includes(typeof value) || Array.isArray(value);
+  return getPrimeCatalog().primeHarnessConfigValueValid(value, schema);
 }
 
 function normalizePrimeHarnessConfig(value, harnessId) {
-  const definition = PRIME_HARNESSES.get(normalizePrimeHarness(harnessId));
-  const raw = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  if (Buffer.byteLength(JSON.stringify(raw), "utf8") > 16_384) {
-    throw new Error(`${definition.label} configuration is too large.`);
-  }
-  const allowed = new Set(definition.configurable || []);
-  const defaults = definition.default_config || {};
-  const unknown = Object.keys(raw).filter((key) =>
-    !allowed.has(key) &&
-    !(Object.prototype.hasOwnProperty.call(defaults, key) && isDeepStrictEqual(raw[key], defaults[key]))
-  );
-  if (unknown.length) {
-    throw new Error(`Unsupported ${definition.label} configuration: ${unknown.join(", ")}.`);
-  }
-  const config = { ...defaults };
-  for (const [key, value] of Object.entries(raw)) {
-    const schema = definition.config_schema?.properties?.[key] || {};
-    if (!primeHarnessConfigValueValid(value, schema)) {
-      throw new Error(`${definition.label} configuration field "${key}" does not match its pinned Verifiers schema.`);
-    }
-    config[key] = value;
-  }
-  return config;
+  return getPrimeCatalog().normalizePrimeHarnessConfig(value, harnessId);
 }
 
 function normalizePrimeHarness(value) {
-  const requested = String(value || "mazebench_prime_agent").trim().toLowerCase();
-  const aliases = {
-    claude: "claude_code",
-    "claude-code": "claude_code",
-    default: "mazebench_prime_agent",
-    "prime-agent": "mazebench_prime_agent",
-    prime_agent: "mazebench_prime_agent",
-    "kimi-code": "kimi_code",
-    "mini-swe-agent": "mini_swe_agent",
-    none: "mazebench_prime_agent",
-    "terminus-2": "terminus_2"
-  };
-  const normalized = aliases[requested] || requested;
-  if (!PRIME_HARNESSES.has(normalized)) {
-    throw new Error(
-      `Unknown Prime harness "${value}". Supported harnesses: ${[...PRIME_HARNESSES.keys()].join(", ")}.`
-    );
-  }
-  return normalized;
+  return getPrimeCatalog().normalizePrimeHarness(value);
+}
+
+function primeSandboxIdsFromText(value) {
+  return require("./integrations/prime/runner").primeSandboxIdsFromText(value);
 }
 
 function normalizeObservationMode(value) {
@@ -487,6 +341,7 @@ function primeEvaluationReward(sample, scorecard = null) {
 function createAgentRunService({
   agentEnvironment,
   agentEnvironmentAsync,
+  primeIntegration = null,
   primeEvaluationCreator = {},
   syncPrimeEvaluations = false,
   ensureDirectory,
@@ -496,6 +351,13 @@ function createAgentRunService({
   rootDir,
   worldMaps
 }) {
+  let effectivePrimeIntegration = primeIntegration;
+  if (!effectivePrimeIntegration && process.env.MAZEBENCH_ENABLE_PRIME === "1") {
+    try {
+      const { createPrimeIntegration } = require("./integrations/prime");
+      effectivePrimeIntegration = createPrimeIntegration({ rootDir });
+    } catch (_error) {}
+  }
   // Linked Git worktrees share one benchmark history in the primary worktree.
   // This keeps runs visible while testing a feature branch instead of making
   // them appear to vanish whenever the server starts from another checkout.
@@ -1184,6 +1046,7 @@ function createAgentRunService({
   }
 
   function syncPrimeEvaluation(runId) {
+    if (!effectivePrimeIntegration) throw new Error("Prime integration is disabled.");
     const meta = readRunMeta(runId);
     if (!meta) throw new Error(`Unknown run "${runId}".`);
     if (meta.kind !== "prime") throw new Error("Only Prime-backed runs can sync to Prime Evals.");
@@ -1287,7 +1150,7 @@ function createAgentRunService({
           "--output", "json",
           "--plain"
         ],
-        { cwd: rootDir, env: enrichedPathEnv(), stdio: ["ignore", "pipe", "pipe"] }
+        { cwd: rootDir, env: enrichedPathEnv(), stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32" }
       );
       child.unref();
       primeSyncChildren.set(runId, child);
@@ -1340,7 +1203,7 @@ function createAgentRunService({
     const creator = spawn(
       String(primeEvaluationCreator.bin || process.execPath),
       creatorArgs,
-      { cwd: rootDir, env: enrichedPathEnv(), stdio: ["ignore", "pipe", "pipe"] }
+      { cwd: rootDir, env: enrichedPathEnv(), stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32" }
     );
     creator.unref();
     primeSyncChildren.set(runId, creator);
@@ -2569,17 +2432,84 @@ function createAgentRunService({
     };
   }
 
-  function allRunSummaries() {
-    if (!fs.existsSync(runsDir)) {
-      return [];
-    }
+  function listExternalRunRecords() {
+    const extDir = path.join(runsDir, "external");
+    if (!fs.existsSync(extDir)) return [];
 
     return fs
-      .readdirSync(runsDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && RUN_ID_PATTERN.test(entry.name))
-      .map((entry) => summarizeRun(entry.name))
-      .filter(Boolean)
-      .sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")));
+      .readdirSync(extDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith("EXT-"))
+      .flatMap((entry) => {
+        const itemDir = path.join(extDir, entry.name);
+        const manifestPath = path.join(itemDir, "manifest.json");
+        const summaryPath = path.join(itemDir, "summary.json");
+        let manifest = {};
+        let summary = null;
+        try {
+          if (fs.existsSync(manifestPath)) manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        } catch (_e) {}
+        try {
+          if (fs.existsSync(summaryPath)) summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+        } catch (_e) {}
+
+        const modelName = manifest.model_name || summary?.model_name || "External MCP";
+        const harnessName = manifest.harness_name || summary?.harness_name || "stdio-mcp";
+        const createdAt = manifest.created_at || summary?.started_at || entry.name;
+
+        let status = "waiting";
+        if (summary) {
+          if (summary.outcome === "won") status = "finished";
+          else if (["timed_out", "cancelled"].includes(summary.outcome)) status = "stopped";
+          else if (summary.outcome === "failed") status = "failed";
+          else status = "finished";
+        } else if (manifest.claimed_at) {
+          status = "running";
+        }
+
+        const turns = summary?.turns ?? summary?.actions ?? 0;
+        const gemCount = summary?.gem_count ?? summary?.gems ?? 0;
+        const roomCount = summary?.room_count ?? summary?.rooms ?? 1;
+
+        return [{
+          id: entry.name,
+          created_at: createdAt,
+          game_id: "world_41b30cd9e1b5",
+          game_title: "Maze Bench (3D)",
+          model: modelName,
+          model_name: modelName,
+          harness: harnessName,
+          harness_label: harnessName,
+          provider: "local_mcp",
+          kind: "external",
+          unverified: true,
+          status,
+          turns,
+          moves: turns,
+          unlimited: true,
+          gem_count: gemCount,
+          gem_total: 100,
+          room_count: roomCount,
+          room_total: 100,
+          favorited: isRunFavorite(entry.name),
+          deletable: true,
+          url: `/external-play/${encodeURIComponent(entry.name)}`
+        }];
+      });
+  }
+
+  function allRunSummaries() {
+    const regular = !fs.existsSync(runsDir)
+      ? []
+      : fs
+          .readdirSync(runsDir, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && RUN_ID_PATTERN.test(entry.name))
+          .map((entry) => summarizeRun(entry.name))
+          .filter(Boolean);
+
+    const external = listExternalRunRecords();
+    return [...regular, ...external].sort((left, right) =>
+      String(right.created_at || "").localeCompare(String(left.created_at || ""))
+    );
   }
 
   // The runs page usually shows only five recent cards. Reading and parsing every
@@ -2589,30 +2519,34 @@ function createAgentRunService({
   // summarize only the requested page. Metric sorts still use full summaries
   // because their ordering genuinely depends on replay-derived data.
   function lightweightRunRecords() {
-    if (!fs.existsSync(runsDir)) return [];
+    const regular = !fs.existsSync(runsDir)
+      ? []
+      : fs
+          .readdirSync(runsDir, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && RUN_ID_PATTERN.test(entry.name))
+          .flatMap((entry) => {
+            const raw = readRunMeta(entry.name);
+            if (!raw) return [];
+            const meta = ["running", "pausing", "stopping"].includes(raw.status)
+              ? finalizeStatus(entry.name, raw)
+              : raw;
+            return [{
+              id: entry.name,
+              created_at: meta.created_at || entry.name,
+              game_id: meta.game_id || "",
+              game_title: meta.game_title || "",
+              model: meta.model || "",
+              model_name: meta.model_name || meta.model || "",
+              provider: meta.kind === "prime" ? "prime" : meta.model,
+              status: meta.status || "",
+              favorited: isRunFavorite(entry.name)
+            }];
+          });
 
-    return fs
-      .readdirSync(runsDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && RUN_ID_PATTERN.test(entry.name))
-      .flatMap((entry) => {
-        const raw = readRunMeta(entry.name);
-        if (!raw) return [];
-        const meta = ["running", "pausing", "stopping"].includes(raw.status)
-          ? finalizeStatus(entry.name, raw)
-          : raw;
-        return [{
-          id: entry.name,
-          created_at: meta.created_at || entry.name,
-          game_id: meta.game_id || "",
-          game_title: meta.game_title || "",
-          model: meta.model || "",
-          model_name: meta.model_name || meta.model || "",
-          provider: meta.kind === "prime" ? "prime" : meta.model,
-          status: meta.status || "",
-          favorited: isRunFavorite(entry.name)
-        }];
-      })
-      .sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")));
+    const external = listExternalRunRecords();
+    return [...regular, ...external].sort((left, right) =>
+      String(right.created_at || "").localeCompare(String(left.created_at || ""))
+    );
   }
 
   // Paginated, filterable, sortable runs listing. Returns the requested page plus
@@ -4940,11 +4874,20 @@ function createAgentRunService({
   }
 
   function listPrimeHarnesses() {
+    if (!effectivePrimeIntegration) {
+      return {
+        harnesses: [],
+        verifiers_version: "",
+        catalog_fingerprint: "",
+        policy: {}
+      };
+    }
+    const catalog = getPrimeCatalog().getCatalogJson();
     return {
-      harnesses: publicPrimeHarnesses(),
-      verifiers_version: PRIME_HARNESS_CATALOG.verifiers_version,
-      catalog_fingerprint: PRIME_HARNESS_CATALOG.catalog_fingerprint,
-      policy: PRIME_HARNESS_CATALOG.policy
+      harnesses: effectivePrimeIntegration.listHarnesses(),
+      verifiers_version: catalog.verifiers_version,
+      catalog_fingerprint: catalog.catalog_fingerprint,
+      policy: catalog.policy
     };
   }
 
@@ -5138,13 +5081,17 @@ function createAgentRunService({
   // Verifiers provisions the native harness and the evaluator-owned game/Python
   // Toolset in separate Prime containers.
   function buildPrimeCommand(params, runDir, runId, game) {
+    if (!effectivePrimeIntegration) {
+      throw new Error("Prime integration is disabled. Set MAZEBENCH_ENABLE_PRIME=1 to enable.");
+    }
+    const primeHarnesses = getPrimeCatalog().getPrimeHarnesses();
+    const primeCatalogJson = getPrimeCatalog().getCatalogJson();
     const harness = normalizePrimeHarness(params.harness);
-    const definition = PRIME_HARNESSES.get(harness);
+    const definition = primeHarnesses.get(harness);
     if (!definition.launchable) throw new Error(definition.reason || UNSAFE_PRIME_AGENT_HARNESS_MESSAGE);
     const harnessConfig = normalizePrimeHarnessConfig(params.harness_config, harness);
     const model = String(params.model_name || params.model || "").trim();
     if (!primeHarnessModelCompatible(model, harness)) {
-      const definition = PRIME_HARNESSES.get(harness);
       throw new Error(
         `${definition.label} requires a known-compatible Prime model using ${definition.protocol}. Choose a model from the displayed catalog.`
       );
@@ -5166,7 +5113,7 @@ function createAgentRunService({
     }
     const hosted = false;
     const requestedToolUse = String(params.tool_use || "").trim().toLowerCase();
-    if (requestedToolUse === "offline" && !PRIME_PYTHON_HARNESSES.has(harness)) {
+    if (requestedToolUse === "offline" && !getPrimeCatalog().PRIME_PYTHON_HARNESSES.has(harness)) {
       throw new Error("Isolated Python tools are supported only by the Codex and Claude Code harnesses.");
     }
     const toolUse = requestedToolUse === "offline" ? "offline" : "read-only";
@@ -5234,8 +5181,8 @@ function createAgentRunService({
         harnessAdapter: "codex-prime-inference-local-isolation",
         runtimeHarnessId: definition.runtime_harness_id || definition.id,
         upstreamHarnessId: definition.upstream_id || null,
-        harnessCatalogFingerprint: PRIME_HARNESS_CATALOG.catalog_fingerprint,
-        verifiersVersion: PRIME_HARNESS_CATALOG.verifiers_version,
+        harnessCatalogFingerprint: primeCatalogJson.catalog_fingerprint,
+        verifiersVersion: primeCatalogJson.verifiers_version,
         runtimeImage: "mazebench-agent",
         taskset: definition.taskset,
         model,
@@ -5367,8 +5314,8 @@ function createAgentRunService({
       harnessAdapter: definition.adapter || "user_simulator",
       runtimeHarnessId: definition.runtime_harness_id || definition.id,
       upstreamHarnessId: definition.upstream_id || null,
-      harnessCatalogFingerprint: PRIME_HARNESS_CATALOG.catalog_fingerprint,
-      verifiersVersion: PRIME_HARNESS_CATALOG.verifiers_version,
+      harnessCatalogFingerprint: primeCatalogJson.catalog_fingerprint,
+      verifiersVersion: primeCatalogJson.verifiers_version,
       runtimeImage: null,
       taskset: definition.taskset,
       model,
@@ -6720,52 +6667,20 @@ function createAgentRunService({
   }
 
   function stopPrimeAgentSandboxes(runId) {
+    if (!effectivePrimeIntegration) return false;
     const runDir = runDirFor(runId);
-    const ids = new Set();
-    for (const filePath of [
-      path.join(runDir, "launcher.log"),
-      path.join(runDir, "eval-output", "eval.log")
-    ]) {
-      try {
-        primeSandboxIdsFromText(fs.readFileSync(filePath, "utf8")).forEach((id) => ids.add(id));
-      } catch (_error) {
-        /* the sandbox may not have started or logged its id yet */
-      }
-    }
-    if (!ids.size) return false;
-
-    const sandboxIds = [...ids];
-    const result = spawnSync(
-      "prime",
-      ["sandbox", "delete", ...sandboxIds, "--yes", "--plain"],
-      {
-        cwd: rootDir,
-        encoding: "utf8",
-        env: enrichedPathEnv(),
-        timeout: 30_000,
-        maxBuffer: 2 * 1024 * 1024
-      }
-    );
-    const record = {
-      sandbox_ids: sandboxIds,
-      stopped_at: result.status === 0 ? new Date().toISOString() : null,
-      error: result.status === 0
-        ? null
-        : String(result.stderr || result.stdout || "Prime sandbox cleanup failed.").trim()
-    };
-    try {
-      fs.writeFileSync(
-        path.join(runDir, "prime-sandbox-cleanup.json"),
-        `${JSON.stringify(record, null, 2)}\n`,
-        "utf8"
-      );
-    } catch (_error) {
-      /* cleanup must still proceed when its audit record cannot be written */
-    }
-    return result.status === 0;
+    return effectivePrimeIntegration.cleanupSandboxes(runId, runDir, rootDir, enrichedPathEnv());
   }
 
   function deleteRun(runId) {
+    if (String(runId || "").startsWith("EXT-")) {
+      const extRunDir = path.join(runsDir, "external", runId);
+      if (fs.existsSync(extRunDir)) {
+        fs.rmSync(extRunDir, { recursive: true, force: true });
+      }
+      return { id: runId, deleted: true };
+    }
+
     const meta = readRunMeta(runId);
     const runDir = runDirFor(runId);
     const agentWorkspaceRoot = agentWorkspaceRootFor(runId);
@@ -6968,6 +6883,7 @@ function createAgentRunService({
     listProviderModels,
     listRuns,
     pauseRun,
+    primeIntegration: effectivePrimeIntegration,
     regenerateRunVideo,
     resolveRunFilePath,
     resumeRun,

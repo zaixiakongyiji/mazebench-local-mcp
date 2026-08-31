@@ -96,6 +96,24 @@ function createState(playData) {
 }
 
 {
+  const actors = [
+    { type: "player", x: 0, y: 0, removed: false },
+    { type: "gem", x: 1, y: 0, removed: false }
+  ];
+  const { engine } = createState({
+    width: 2,
+    height: 1,
+    terrain: floorTerrain(2, 1),
+    actors
+  });
+
+  assert.deepEqual(engine.viewerActorIndices, [0, 1]);
+  assert.equal(Object.isFrozen(engine.viewerActorIndices), true);
+  actors.reverse();
+  assert.deepEqual(engine.viewerActorIndices, [0, 1], "viewer identities must not follow later source-array mutations");
+}
+
+{
   // Cross-room movement continues the main player's motion in the next room,
   // but must not replay the source-room input against clones already there.
   const { engine, state } = createState({

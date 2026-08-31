@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
-const python = process.env.PYTHON || "python3";
+const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
 const testPath = path.join(__dirname, "prime-verifiers-auto-quit.test.py");
 const result = spawnSync(python, [testPath], {
   cwd: path.join(__dirname, ".."),

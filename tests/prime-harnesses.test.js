@@ -1,3 +1,4 @@
+process.env.MAZEBENCH_ENABLE_PRIME = "1";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -64,6 +65,10 @@ try {
   const appSource = fs.readFileSync(path.join(root, "server", "app.js"), "utf8");
   const runsSource = fs.readFileSync(path.join(root, "server", "agent-runs.js"), "utf8");
   const pagesSource = fs.readFileSync(path.join(root, "server", "pages.js"), "utf8");
+  const primeCatalogSource = fs.readFileSync(
+    path.join(root, "server", "integrations", "prime", "catalog.js"),
+    "utf8"
+  );
   const harnessCatalog = JSON.parse(
     fs.readFileSync(path.join(environmentDir, "prime-harness-catalog.json"), "utf8")
   );
@@ -84,9 +89,9 @@ try {
     /async function main\(\) \{\s*return localCodexMain\(\)/
   );
   assert.match(localAgentSource, /localAgentIsolationPreflight\(config\)/);
-  assert.match(runsSource, /prime-harness-catalog\.json/);
-  assert.match(runsSource, /catalog_fingerprint/);
-  assert.match(runsSource, /PRIME_PYTHON_HARNESSES = new Set\(\["codex", "claude_code"\]\)/);
+  assert.match(primeCatalogSource, /prime-harness-catalog\.json/);
+  assert.match(primeCatalogSource, /catalog_fingerprint/);
+  assert.match(primeCatalogSource, /PRIME_PYTHON_HARNESSES = new Set\(\["codex", "claude_code"\]\)/);
   assert.match(runsSource, /const toolUse = requestedToolUse === "offline" \? "offline" : "read-only"/);
   assert.match(runsSource, /if \(harness === "codex"\)/);
   assert.match(runsSource, /inference: "prime"/);

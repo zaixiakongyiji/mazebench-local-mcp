@@ -183,6 +183,10 @@
     const orangeTerrainCells = [];
     const orangeButtonCells = [];
     const actorSource = Array.isArray(playData?.actors) ? playData.actors : [];
+    // Viewer identity is allocated once from the canonical actor order.  Keep
+    // it independent from mutable positions/removal state so replay records
+    // retain stable actor references for the lifetime of this engine.
+    const viewerActorIndices = Object.freeze(actorSource.map((_actor, index) => index));
     const actorTypes = actorSource.map((actor) => actorType(actor));
     const actorGroupIds = actorSource.map((actor) => actor?.groupId ?? "");
     // Owner feature (2026-07): slope-SHAPED group members. A weightless box
@@ -12041,6 +12045,7 @@
       stateKey,
       terrainTypes,
       undoMove,
+      viewerActorIndices,
       width
     };
   }

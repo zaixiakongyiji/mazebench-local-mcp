@@ -94,6 +94,9 @@
   }
 
   function handlePrimeSetupError(error, readiness = null) {
+    if (error?.message?.includes("disabled") || readiness?.issue?.includes("disabled")) {
+      return false;
+    }
     const kind = primeSetupKind(error?.message || readiness?.issue, readiness);
     if (!kind) return false;
     showPrimeSetup(kind);
@@ -351,6 +354,12 @@
   });
 
   async function initialize() {
+    if (data.capabilities && !data.capabilities.training) {
+      document.getElementById("train-model-loading").innerHTML = "<span>Prime training integration is disabled.</span>";
+      setStatus("Prime training integration is disabled.", true);
+      readinessEl.textContent = "DISABLED";
+      return;
+    }
     // Training history is independent of model/readiness discovery. Start it
     // immediately so a slow Prime model probe never leaves the whole page
     // looking stalled.

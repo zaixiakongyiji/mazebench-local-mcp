@@ -56,6 +56,7 @@ function pageHead({ title, description = "", extraHeadHtml = "" } = {}) {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/site.css">
+    <script src="/i18n.js"></script>
     ${extraHeadHtml}`;
 }
 
@@ -83,16 +84,18 @@ function remoteAccountUrl(origin) {
   }
 }
 
-function topbar({ rightHtml = "", extraNavHtml = "", extraHtml = "" } = {}) {
+function topbar({ rightHtml = "", extraNavHtml = "", extraHtml = "", capabilities = null } = {}) {
+  const showTrain = capabilities ? Boolean(capabilities.training) : true;
   return `<header class="topbar">
       <a class="brand-link" href="/"><span class="brand-mark" aria-hidden="true">${BRAND_MARK_SVG}</span>Maze Bench</a>
       <nav class="topbar-nav" aria-label="Site">
-        <a class="nav-link" href="/build">Build</a>
-        <a class="nav-link" href="/agent">Agent</a>
-        <a class="nav-link" href="/train">Train</a>
+        <a class="nav-link" href="/build" data-i18n="nav_build">Build</a>
+        <a class="nav-link" href="/agent" data-i18n="nav_agent">Agent</a>
+        ${showTrain ? '<a class="nav-link" href="/train" data-i18n="nav_train">Train</a>' : ""}
         ${extraNavHtml}
       </nav>
       <div class="topbar-end">
+        <button class="lang-toggle-btn" type="button" title="Switch Language / 切换语言">🌐 中文</button>
         ${extraHtml}
         <div class="account-actions" aria-label="Account">${rightHtml}</div>
       </div>
@@ -100,12 +103,13 @@ function topbar({ rightHtml = "", extraNavHtml = "", extraHtml = "" } = {}) {
     </header>`;
 }
 
-function siteFooter() {
+function siteFooter({ capabilities = null } = {}) {
+  const showTrain = capabilities ? Boolean(capabilities.training) : true;
   return `<footer class="site-footer">
       <span>Maze Bench (local)</span>
-      <a class="text-link" href="/build">Build</a>
-      <a class="text-link" href="/agent">Agent</a>
-      <a class="text-link" href="/train">Train</a>
+      <a class="text-link" href="/build" data-i18n="nav_build">Build</a>
+      <a class="text-link" href="/agent" data-i18n="nav_agent">Agent</a>
+      ${showTrain ? '<a class="text-link" href="/train" data-i18n="nav_train">Train</a>' : ""}
       <a class="text-link" href="https://mazebench.com">mazebench.com</a>
     </footer>`;
 }

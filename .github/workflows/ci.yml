@@ -14,8 +14,8 @@ permissions:
   contents: read
 
 jobs:
-  # Keep the merge gate dependency-free and quick. The complete browser,
-  # Python packaging, and wheel matrix still run after every push to main.
+  # Keep the merge gate deterministic: generated validators and packaged
+  # runtime must be rebuilt and proven drift-free before behavioral tests.
   pr-smoke:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -29,6 +29,19 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
+
+      - run: npm ci
+
+      - name: Build standalone validators
+        run: npm run build:validators
+
+      - name: Sync runtime assets
+        run: npm run sync-runtime
+
+      - name: Verify zero tracked and untracked runtime drift
+        run: |
+          git diff --exit-code -- shared/validators.standalone.js environments/mazebench/mazebench/runtime
+          test -z "$(git status --porcelain -- shared/validators.standalone.js environments/mazebench/mazebench/runtime)"
 
       - name: Python CLI tests
         run: python -m unittest tests/test_mazebench_cli.py
@@ -50,11 +63,29 @@ jobs:
       - name: Verify isolated game runtime
         run: uv run --locked --project environments/mazebench python3 -m unittest tests/test_game_runtime_isolation.py
 
-  test:
-    if: github.event_name != 'pull_request'
+  test-browser:
     runs-on: ubuntu-latest
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Chromium for Playwright tests
+        run: npx playwright-core install --with-deps chromium
+
+      - name: Browser E2E test suite
+        run: npm run test:browser
+
+  test:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -78,11 +109,36 @@ jobs:
       - name: Python CLI tests
         run: python -m unittest tests/test_mazebench_cli.py
 
-      - name: Install Chromium for vision integration tests
-        run: npx playwright-core install --with-deps chromium
-
       - name: Node test suite
         run: npm test
+
+  build:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - run: npm ci
+
+      - name: Build standalone validators
+        run: npm run build:validators
+
+      - name: Sync runtime assets
+        run: npm run sync-runtime
+
+      - name: Verify zero tracked and untracked runtime drift
+        run: |
+          git diff --exit-code -- shared/validators.standalone.js environments/mazebench/mazebench/runtime
+          test -z "$(git status --porcelain -- shared/validators.standalone.js environments/mazebench/mazebench/runtime)"
 
       - name: Stage the Python runtime
         run: node scripts/build-python-runtime.js
@@ -102,16 +158,19 @@ jobs:
           if-no-files-found: error
 
   # Prove the supported Python range on every full run: the oldest we claim
-  # (requires-python >= 3.9) and the newest stable release.
+  # (requires-python >= 3.9) and the newest stable release across Ubuntu and Windows.
   wheel-smoke:
     if: github.event_name != 'pull_request'
-    needs: test
-    runs-on: ubuntu-latest
+    needs: build
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.14"]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.12", "3.14"]
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
@@ -125,46 +184,5 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Install the wheel (with the prime extra) and launch the site
-        run: |
-          python -m venv /tmp/mzvenv
-          /tmp/mzvenv/bin/pip install --quiet "$(ls dist/mazebench-*.whl)[prime]"
-          cd /
-          MAZEBENCH_HOME=/tmp/mzhome /tmp/mzvenv/bin/mazebench ascii --level CxD --once > /tmp/ascii.txt
-          grep -q 'maze level_CxD' /tmp/ascii.txt
-          MAZEBENCH_HOME=/tmp/mzhome /tmp/mzvenv/bin/mazebench json --level CxD --omniscient > /tmp/json.txt
-          python - <<'PY'
-          import json
-          payload = json.load(open('/tmp/json.txt', encoding='utf8'))
-          assert payload['observation_mode'] == 'json'
-          assert payload['json_observation']['omniscient'] is True
-          assert payload['json_observation']['hide_names'] is False
-          assert payload['json_observation']['objects']['wall']
-          assert 'level' not in payload and 'screen' not in payload
-          PY
-          MAZEBENCH_HOME=/tmp/mzhome nohup /tmp/mzvenv/bin/mazebench launch port=3311 open=false > /tmp/launch.log 2>&1 &
-          server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-          ready=false
-          for i in $(seq 1 60); do
-            if curl -sf -o /dev/null http://127.0.0.1:3311/; then
-              ready=true
-              break
-            fi
-            if ! kill -0 "$server_pid" 2>/dev/null; then
-              echo "MazeBench exited before becoming ready"
-              cat /tmp/launch.log
-              exit 1
-            fi
-            sleep 1
-          done
-          if [ "$ready" != "true" ]; then
-            echo "MazeBench did not become ready within 60 seconds"
-            cat /tmp/launch.log
-            exit 1
-          fi
-          for path in / /play /build /agent /play/maze/level_HxI /api/play/maze/level_HxI /vendor/three.module.js; do
-            code=$(curl -sL -o /dev/null -w '%{http_code}' "http://127.0.0.1:3311$path" || true)
-            echo "$path -> $code"
-            [ "$code" = "200" ] || { cat /tmp/launch.log; exit 1; }
-          done
+      - name: Verify wheel smoke, MCP stdio handshake, and isolated validator
+        run: python scripts/verify-wheel-smoke.py dist

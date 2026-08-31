@@ -1,3 +1,4 @@
+process.env.MAZEBENCH_ENABLE_PRIME = "1";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -43,6 +44,24 @@ printf '{"evaluation_id":"evalsync123"}\n'
 `,
   { mode: 0o755 }
 );
+if (process.platform === "win32") {
+  fs.writeFileSync(
+    path.join(binDir, "prime-create.js"),
+    `const fs = require('fs');\nfs.writeFileSync(${JSON.stringify(creatorArgsPath)}, process.argv.slice(2).join('\\n') + '\\n');\nconsole.log('{"evaluation_id":"evalsync123"}');\n`
+  );
+  fs.writeFileSync(
+    path.join(binDir, "prime-create.cmd"),
+    `@"${process.execPath}" "%~dp0prime-create.js" %*\r\n`
+  );
+  fs.writeFileSync(
+    path.join(binDir, "prime.js"),
+    `const fs = require('fs');\nfs.writeFileSync(${JSON.stringify(argsPath)}, process.argv.slice(2).join('\\n') + '\\n');\nfs.appendFileSync(${JSON.stringify(callsPath)}, 'called\\n');\nconsole.log('{"evaluation_id":"evalsync123"}');\n`
+  );
+  fs.writeFileSync(
+    path.join(binDir, "prime.cmd"),
+    `@"${process.execPath}" "%~dp0prime.js" %*\r\n`
+  );
+}
 fs.writeFileSync(
   path.join(runDir, "run.json"),
   `${JSON.stringify({
@@ -76,7 +95,7 @@ const service = createAgentRunService({
   ensureDirectory: (directory) => fs.mkdirSync(directory, { recursive: true }),
   getGame: () => game,
   loadJson,
-  primeEvaluationCreator: { bin: path.join(binDir, "prime-create"), args: [] },
+  primeEvaluationCreator: { bin: path.join(binDir, process.platform === "win32" ? "prime-create.cmd" : "prime-create"), args: [] },
   rootDir,
   syncPrimeEvaluations: true,
   worldMaps: { defaultLevelIdForGame: () => "level_HxI", isMazeWorldLevelId: () => true }

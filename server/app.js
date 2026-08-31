@@ -64,6 +64,11 @@ const PUBLIC_FILE_ROUTES = new Map(
     "/author-theme.css",
     "/play-theme.css",
     "/local-site.css",
+    "/i18n.js",
+    "/external-play.js",
+    "/external-play-host.js",
+    "/external-play.css",
+    "/validators.standalone.js",
     "/favicon.svg",
     "/logos/codex.png",
     "/logos/claude.png",
@@ -227,10 +232,29 @@ const buildWorlds = createLocalBuildWorldService({
   worldMaps
 });
 
+const enablePrime = Boolean(
+  process.env.MAZEBENCH_ENABLE_PRIME === "1"
+);
+
+let primeIntegration = null;
+if (enablePrime) {
+  const { createPrimeIntegration } = require("./integrations/prime");
+  primeIntegration = createPrimeIntegration({
+    syncEvaluations: true
+  });
+}
+
+const capabilities = {
+  external_play: true,
+  local_mcp: true,
+  prime_integration: Boolean(primeIntegration),
+  training: Boolean(primeIntegration)
+};
+
 const agentRuns = createAgentRunService({
   agentEnvironment,
   agentEnvironmentAsync,
-  syncPrimeEvaluations: true,
+  primeIntegration,
   buildWorlds,
   ensureDirectory,
   getGame,
@@ -243,7 +267,9 @@ const training = createTrainingService({
   buildWorlds,
   getGame,
   rootDir: ROOT_DIR,
-  worldMaps
+  worldMaps,
+  primeIntegration,
+  enabled: Boolean(primeIntegration)
 });
 
 const remote = createRemoteService({
@@ -390,7 +416,7 @@ function agentEnvironment(options = {}) {
   const codexInstalled = probe("codex");
   const claudeInstalled = probe("claude");
   const kimiInstalled = probe("kimi");
-  const primeInstalled = probe("prime");
+  const primeInstalled = enablePrime && probe("prime");
   const codexAuth = codexSubscriptionStatus(
     codexInstalled ? probeCommand("codex", ["login", "status"]) : null
   );
@@ -439,7 +465,7 @@ function agentEnvironment(options = {}) {
     prime: primeInstalled && primeAuthenticated,
     prime_installed: primeInstalled,
     prime_authenticated: primeAuthenticated,
-    uv: probe("uv")
+    uv: enablePrime && probe("uv")
   };
 
   agentEnvironmentCache = { at: Date.now(), value };
@@ -482,8 +508,8 @@ async function agentEnvironmentAsync(options = {}) {
       commandExists("codex"),
       commandExists("claude"),
       commandExists("kimi"),
-      commandExists("prime"),
-      commandExists("uv"),
+      enablePrime ? commandExists("prime") : Promise.resolve(false),
+      enablePrime ? commandExists("uv") : Promise.resolve(false),
       commandExists("docker")
     ]);
     const [codexResult, claudeResult, kimiResult, primeResult, dockerResult] = await Promise.all([
@@ -693,11 +719,23 @@ function sendFile(request, response, filePath, contentType) {
   fileStream.pipe(response);
 }
 
+const { ExternalPlayService } = require("./external-play");
+
+const externalPlay = new ExternalPlayService({
+  port: PORT,
+  host: HOST,
+  defaultDurationMs: Number(process.env.MAZEBENCH_DURATION_MS || 1800000),
+  defaultWinThreshold: Number(process.env.MAZEBENCH_WIN_THRESHOLD || 10),
+  worldBundleProvider: () => buildGameWorldBundle("maze")
+});
+
 const {
   renderAgentPage,
   renderAgentRunPage,
   renderAuthorPage,
   renderBuildPage,
+  renderExternalPlayLandingPage,
+  renderExternalPlayRunPage,
   renderFlyoverPage,
   renderGamePage,
   renderHomePage,
@@ -710,7 +748,9 @@ const {
   buildAuthorPageData,
   buildMazeWorldMapEditorData,
   buildWorlds,
+  capabilities,
   getGame,
+  getLevel,
   getLevelState,
   listGames,
   remote,
@@ -722,6 +762,8 @@ const { handleRequest } = createRequestRouter({
   buildMazePreviewData,
   buildMazeWorldMapEditorData,
   buildWorlds,
+  capabilities,
+  externalPlay,
   getContentType,
   getEditableLevel,
   getGame,
@@ -738,6 +780,8 @@ const { handleRequest } = createRequestRouter({
   renderAgentRunPage,
   renderAuthorPage,
   renderBuildPage,
+  renderExternalPlayLandingPage,
+  renderExternalPlayRunPage,
   renderFlyoverPage,
   renderGamePage,
   renderHomePage,
@@ -789,12 +833,112 @@ function createRequestHandler() {
   };
 }
 
+function createServerApp(options = {}) {
+  const customRootDir = options.rootDir || ROOT_DIR;
+  const customEnablePrime = typeof options.enablePrime === "boolean" ? options.enablePrime : enablePrime;
+  let customPrimeIntegration = null;
+  if (customEnablePrime) {
+    try {
+      const { createPrimeIntegration } = require("./integrations/prime");
+      customPrimeIntegration = createPrimeIntegration({ rootDir: customRootDir });
+    } catch (_error) {}
+  }
+  const customCapabilities = {
+    external_play: true,
+    local_mcp: true,
+    prime_integration: Boolean(customPrimeIntegration),
+    training: Boolean(customPrimeIntegration)
+  };
+  const customAgentRuns = createAgentRunService({
+    agentEnvironment,
+    agentEnvironmentAsync,
+    primeIntegration: customPrimeIntegration,
+    ensureDirectory,
+    getGame,
+    buildWorlds,
+    loadJson,
+    rootDir: customRootDir,
+    worldMaps
+  });
+  const customTraining = createTrainingService({
+    buildWorlds,
+    getGame,
+    rootDir: customRootDir,
+    worldMaps,
+    primeIntegration: customPrimeIntegration,
+    enabled: customEnablePrime
+  });
+  const pageRenderer = createPageRenderer({
+    agentEnvironment,
+    buildAuthorPageData,
+    buildMazeWorldMapEditorData,
+    buildWorlds,
+    capabilities: customCapabilities,
+    getGame,
+    getLevel,
+    getLevelState,
+    listGames,
+    remote,
+    worldMaps
+  });
+  const router = createRequestRouter({
+    agentRuns: customAgentRuns,
+    buildMazePreviewData,
+    buildMazeWorldMapEditorData,
+    buildWorlds,
+    capabilities: customCapabilities,
+    externalPlay,
+    getContentType,
+    getEditableLevel,
+    getGame,
+    getLevel,
+    getLevelEditorState,
+    getLevelFilePath,
+    getLevelState,
+    gamesDir: GAMES_DIR,
+    loadJson,
+    publicFileRoutes: PUBLIC_FILE_ROUTES,
+    readJsonBody,
+    remote,
+    ...pageRenderer,
+    resolveGameAssetPath,
+    sanitizeEditorPayload,
+    sendFile,
+    sendHtml,
+    sendJson,
+    sendRedirect,
+    solverExports,
+    training: customTraining,
+    worldMaps,
+    writeMazePreviewImageData
+  });
+  return {
+    capabilities: customCapabilities,
+    primeIntegration: customPrimeIntegration,
+    agentRuns: customAgentRuns,
+    training: customTraining,
+    handleRequest: router.handleRequest,
+    createRequestHandler: () => async (req, res) => {
+      try {
+        await router.handleRequest(req, res);
+      } catch (error) {
+        if (res.headersSent) { res.destroy(); return; }
+        const statusCode = isExpectedRequestError(error) ? (error.message === "Request body is too large." ? 413 : 400) : 500;
+        sendJson(res, statusCode, { error: isExpectedRequestError(error) ? error.message : "Something went wrong." });
+      }
+    }
+  };
+}
+
 module.exports = {
   HOST,
   PORT,
   buildGameWorldBundle,
+  capabilities,
   createRequestHandler,
+  createServerApp,
   defaultLevelIdForGame,
+  externalPlay,
   getGame,
   getLevel,
   getLevelState,

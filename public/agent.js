@@ -68,7 +68,8 @@
     codex: "OpenAI",
     claude: "Anthropic",
     kimi: "Moonshot AI",
-    prime: "Prime Intellect"
+    prime: "Prime Intellect",
+    local_mcp: "Local MCP"
   };
   const RUN_STATUS_LABELS = {
     waiting: "Waiting",
@@ -98,8 +99,15 @@
   let pendingLaunches = 0;
   let launchStatusHideTimer = null;
 
+  const capabilities = window.__AGENT_DATA__?.capabilities || window.__MAZEBENCH_CAPABILITIES__ || {
+    external_play: true,
+    local_mcp: true,
+    prime_integration: false,
+    training: false
+  };
+
   const state = {
-    execution: "prime",
+    execution: capabilities.prime_integration ? "prime" : "local",
     harness: null,
     customHarnesses: [],
     customHarnessId: "",
@@ -489,6 +497,10 @@
   function renderExecutionPicker() {
     const wrapper = document.getElementById("harness-execution");
     const picker = document.getElementById("execution-picker");
+    if (!capabilities.prime_integration) {
+      if (wrapper) wrapper.hidden = true;
+      return;
+    }
     const supportsLocal = Boolean(localProviderId());
     if (wrapper) tweenVisibility(wrapper, supportsLocal, 420);
     picker?.querySelectorAll("[data-execution]").forEach((option) => {
@@ -528,7 +540,8 @@
   }
 
   function setExecution(value) {
-    const next = value === "local" && localProviderId() ? "local" : "prime";
+    if (value === "prime" && !capabilities.prime_integration) return;
+    const next = value === "local" && localProviderId() ? "local" : (capabilities.prime_integration ? "prime" : "local");
     if (next === "prime" && !primeHarnessLaunchable()) {
       setStatus(selectedCustomHarness()?.reason || "This harness is not compatible with the isolated Prime game controls.", true);
       return;
@@ -842,6 +855,7 @@
   let primeAvailabilityRequest = 0;
 
   async function checkPrimeAvailability() {
+    if (!capabilities.prime_integration) return null;
     const requestId = ++primeAvailabilityRequest;
     setStatus("Checking Prime login…");
 
@@ -874,7 +888,7 @@
       if (requestId !== localAvailabilityRequest || state.harness !== harnessId) return;
       const availability = localRunAvailability(harnessId, env);
       if (!availability.available) {
-        if (state.execution === "local") setExecution("prime");
+        if (state.execution === "local" && capabilities.prime_integration) setExecution("prime");
         state.localAvailability = "inactive";
         renderExecutionPicker();
         setStatus(
@@ -896,7 +910,7 @@
       return availability;
     } catch (error) {
       if (requestId !== localAvailabilityRequest || state.harness !== harnessId) return;
-      if (state.execution === "local") setExecution("prime");
+      if (state.execution === "local" && capabilities.prime_integration) setExecution("prime");
       state.localAvailability = "inactive";
       renderExecutionPicker();
       setStatus(error.message, true);
@@ -919,13 +933,13 @@
 
   function selectHarness(harnessId) {
     if (state.harness === harnessId) {
-      if (state.execution === "prime") void checkPrimeAvailability();
+      if (state.execution === "prime" && capabilities.prime_integration) void checkPrimeAvailability();
       return;
     }
     const providerHost = document.getElementById("provider-picker");
     const providerSelectionFrom = selectedRect(providerHost, ".provider-card.is-selected");
     localAvailabilityRequest += 1;
-    state.execution = "prime";
+    state.execution = capabilities.prime_integration ? "prime" : "local";
     state.localAvailability = "idle";
     state.harness = harnessId;
     state.modelId = null;
@@ -962,7 +976,9 @@
     } else if (harnessId !== "custom" || selectedCustomHarness()?.launchable) {
       loadModels(harnessId, { fresh: !state.catalogs[catalogKey(harnessId)] });
     }
-    if (state.execution === "prime") void checkPrimeAvailability();
+    if (state.execution === "prime" && capabilities.prime_integration) void checkPrimeAvailability();
+    if (localProviderId(harnessId)) void checkLocalAvailability(harnessId);
+  }
     if (localProviderId(harnessId)) void checkLocalAvailability(harnessId);
   }
 
@@ -1940,7 +1956,9 @@
       ? (run.harness || "none") === "none"
         ? "Prime Intellect"
         : `${harnessName || "Prime Intellect"} via Prime`
-      : ({ codex: "Codex", claude: "Claude Code", kimi: "Kimi Code" }[run.provider || run.model] || run.model);
+      : run.provider === "local_mcp" || run.kind === "external"
+        ? `Local MCP (${harnessName || "stdio-mcp"})`
+        : ({ codex: "Codex", claude: "Claude Code", kimi: "Kimi Code" }[run.provider || run.model] || run.model);
     const reasoningEffort = String(run.reasoning || (run.provider === "prime" ? "off" : "auto")).toLowerCase();
     const showStartRoom = Boolean(run.level_id) && !run.start_room_is_default;
     const createdAt = escapeText(run.created_at ? new Date(run.created_at).toLocaleString() : "");
@@ -1982,9 +2000,12 @@
           <h3 title="${escapeText(modelName)}">${escapeText(modelName)}</h3>
           <div class="run-card__details">
             <span class="run-card__world">${escapeText(run.game_title || run.game_id)}</span>
+            ${run.unverified || run.kind === "external"
+              ? `<span class="run-card__badge" style="background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3);">UNVERIFIED · LOCAL MCP</span>`
+              : ""}
             ${showStartRoom ? `<span class="run-card__badge">Start ${escapeText(levelLabel(run.level_id))}</span>` : ""}
-            <span class="run-card__badge run-card__badge--reasoning">${escapeText(reasoningEffort)} reasoning</span>
-            <span class="run-card__badge run-card__badge--mode">${escapeText(runModeLabel(run.mode))}</span>
+            ${run.kind !== "external" ? `<span class="run-card__badge run-card__badge--reasoning">${escapeText(reasoningEffort)} reasoning</span>` : ""}
+            ${run.kind !== "external" ? `<span class="run-card__badge run-card__badge--mode">${escapeText(runModeLabel(run.mode))}</span>` : ""}
             ${Number(run.explorer_instances) > 0
               ? `<span class="run-card__badge">${escapeText(run.auxiliary_actions || 0)} auxiliary · ${escapeText(run.explorer_instances)} instance${Number(run.explorer_instances) === 1 ? "" : "s"}</span>`
               : ""}
@@ -2102,31 +2123,56 @@
       const runs = payload.runs || [];
       const total = payload.total ?? runs.length;
 
-      document.getElementById("runs-total").textContent = total ? `${total} run${total === 1 ? "" : "s"}` : "";
-      syncFilterSelect(
-        "runs-provider",
-        payload.providers || [],
-        runsView.provider,
-        "All",
-        (value) => RUN_COMPANY_NAMES[value] || value
-      );
-      syncFilterSelect("runs-model", payload.models || [], runsView.model, "All");
-      syncFilterSelect(
-        "runs-status",
-        payload.statuses || [],
-        runsView.status,
-        "All",
-        (value) => RUN_STATUS_LABELS[value] || value
-      );
+    function i18nText(key, fallback) {
+      return (window.MazeBenchI18n && typeof window.MazeBenchI18n.t === "function")
+        ? window.MazeBenchI18n.t(key)
+        : fallback;
+    }
 
-      tweenResize(runsEl, () => {
-        runsEl.innerHTML = runs.length
-          ? runs.map(runCard).join("")
-          : total
-            ? '<div class="empty-state"><span class="glyph">▤</span><p>No matching runs.</p></div>'
-            : '<div class="empty-state"><span class="glyph">▶</span><p>No runs yet.</p></div>';
-        wireRunActions();
+    const allLabel = i18nText("all", "All");
+    const noMatchingText = i18nText("no_matching_runs", "No matching runs.");
+    const noRunsYetText = i18nText("no_runs_yet", "No runs yet.");
+
+    document.getElementById("runs-total").textContent = total ? `${total} ${i18nText("actions", "runs")}` : "";
+    syncFilterSelect(
+      "runs-provider",
+      payload.providers || [],
+      runsView.provider,
+      allLabel,
+      (value) => RUN_COMPANY_NAMES[value] || value
+    );
+    syncFilterSelect("runs-model", payload.models || [], runsView.model, allLabel);
+    syncFilterSelect(
+      "runs-status",
+      payload.statuses || [],
+      runsView.status,
+      allLabel,
+      (value) => RUN_STATUS_LABELS[value] || value
+    );
+
+    // Update sort dropdown options text according to language
+    const sortSelect = document.getElementById("runs-sort");
+    if (sortSelect) {
+      const sortOpts = {
+        newest: i18nText("sort_newest", "Newest"),
+        oldest: i18nText("sort_oldest", "Oldest"),
+        actions: i18nText("sort_actions", "Most Actions"),
+        rooms: i18nText("sort_rooms", "Most Rooms"),
+        gems: i18nText("sort_gems", "Most Gems")
+      };
+      Array.from(sortSelect.options).forEach((opt) => {
+        if (sortOpts[opt.value]) opt.textContent = sortOpts[opt.value];
       });
+    }
+
+    tweenResize(runsEl, () => {
+      runsEl.innerHTML = runs.length
+        ? runs.map(runCard).join("")
+        : total
+          ? `<div class="empty-state"><span class="glyph">▤</span><p>${escapeText(noMatchingText)}</p></div>`
+          : `<div class="empty-state"><span class="glyph">▶</span><p>${escapeText(noRunsYetText)}</p></div>`;
+      wireRunActions();
+    });
       requestAnimationFrame(() => {
         runsEl.querySelectorAll(".run-card__progress-fill").forEach((bar) => {
           const card = bar.closest("[data-run-id]");
@@ -2354,6 +2400,9 @@
     if (event.key === "Escape" && document.getElementById("provider-setup-modal")?.classList.contains("open")) {
       closeProviderSetup();
     }
+  });
+  document.addEventListener("mazebench:langchange", () => {
+    refreshRuns();
   });
   syncComposerSteps(false);
 })();

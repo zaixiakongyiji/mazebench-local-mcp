@@ -162,7 +162,9 @@ async function main() {
     const linkedConfig = loadJson(path.join(rootDir, "data", "remote.json"), {});
     assert.equal(linkedConfig.pending_link, null);
     assert.equal(linkedConfig.session_token, "sess_111111111111111111111111");
-    assert.equal(fs.statSync(path.join(rootDir, "data", "remote.json")).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(path.join(rootDir, "data", "remote.json")).mode & 0o777, 0o600);
+    }
 
     const pushed = await remote.pushWorld("draft-local");
     assert.deepEqual(pushed, returnedDescription);

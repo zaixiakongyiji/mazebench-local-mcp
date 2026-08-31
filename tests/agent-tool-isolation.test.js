@@ -254,7 +254,8 @@ for (const feature of [
 }
 assert.match(codexArgs, /default_permissions="mazebench_agent"/);
 assert.match(codexArgs, /permissions\.mazebench_agent\.network\.enabled=false/);
-assert.match(codexArgs, new RegExp(`${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*deny`));
+const escapedRoot = root.replace(/\\/g, "\\\\").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+assert.match(codexArgs, new RegExp(`(?:${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|${escapedRoot}).*deny`));
 assert.equal(codex.argv.includes("--sandbox"), false, "permission profiles must not be mixed with legacy sandbox mode");
 assert.equal(codex.argv.includes("--add-dir"), false, "the repository must never be added to the agent workspace");
 assert.doesNotMatch(codexArgs, /sandbox_mode|sandbox_workspace_write/);
@@ -308,7 +309,7 @@ const isolatedCodexToolsConfig = {
 const isolatedCodexTools = agentCommand(isolatedCodexToolsConfig, buildMcpPrompt(isolatedCodexToolsConfig));
 assert.equal(assertLocalCodexCommandIsolation(isolatedCodexToolsConfig, isolatedCodexTools), true);
 assert.match(isolatedCodexTools.argv.join("\n"), /mcp_servers\.mazebench\.enabled_tools=.*python_exec/);
-assert.match(isolatedCodexTools.argv.join("\n"), /"\/app\/workspace"="write"/);
+assert.match(isolatedCodexTools.argv.join("\n"), /(?:"\/app\/workspace"|"C:\\\\app\\\\workspace")="write"/);
 for (const unsafeCommand of [
   { ...isolatedCodex, argv: [...isolatedCodex.argv, "--enable", "unified_exec"] },
   { ...isolatedCodex, argv: [...isolatedCodex.argv, "--add-dir", "/app"] },

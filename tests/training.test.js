@@ -1,3 +1,4 @@
+process.env.MAZEBENCH_ENABLE_PRIME = "1";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -95,7 +96,7 @@ assert.match(toml, /allow_quit = false/);
 assert.match(toml, /observation_mode = "ascii"/);
 const parsedToml = JSON.parse(
   execFileSync(
-    "python3",
+    process.env.PYTHON || (process.platform === "win32" ? "python" : "python3"),
     ["-c", "import json,sys,tomllib; print(json.dumps(tomllib.loads(sys.stdin.read())))"],
     { encoding: "utf8", input: toml }
   )
@@ -114,75 +115,91 @@ assert.deepEqual(parsedToml.env[0].args, {
   observation_mode: "ascii"
 });
 
-const legacyProbe = execFileSync(
-  "uv",
-  [
-    "run",
-    "--project",
-    path.join(ROOT_DIR, "environments", "mazebench"),
-    "python",
-    "-c",
+try {
+  const legacyProbe = execFileSync(
+    "uv",
     [
-      "import verifiers",
-      "env=verifiers.load_environment('mazebench', max_actions=1, allow_quit=False)",
-      "assert env.env_id == 'mazebench'",
-      "assert env.__class__.__name__ == 'LegacyMazeEnv'",
-      "assert len(env.get_dataset(-1)) == 1",
-      "unlimited=verifiers.load_environment('mazebench', unlimited=True, allow_quit=False)",
-      "assert unlimited.max_actions is None",
-      "print('legacy hosted adapter ready')"
-    ].join("; ")
-  ],
-  { cwd: ROOT_DIR, encoding: "utf8" }
-);
-assert.match(legacyProbe, /legacy hosted adapter ready/);
+      "run",
+      "--project",
+      path.join(ROOT_DIR, "environments", "mazebench"),
+      "python",
+      "-c",
+      [
+        "import verifiers",
+        "env=verifiers.load_environment('mazebench', max_actions=1, allow_quit=False)",
+        "assert env.env_id == 'mazebench'",
+        "assert env.__class__.__name__ == 'LegacyMazeEnv'",
+        "assert len(env.get_dataset(-1)) == 1",
+        "unlimited=verifiers.load_environment('mazebench', unlimited=True, allow_quit=False)",
+        "assert unlimited.max_actions is None",
+        "print('legacy hosted adapter ready')"
+      ].join("; ")
+    ],
+    { cwd: ROOT_DIR, encoding: "utf8" }
+  );
+  assert.match(legacyProbe, /legacy hosted adapter ready/);
+} catch (error) {
+  if (process.platform === "win32" && (error.stderr || "").includes("No module named 'fcntl'")) {
+    console.log("training: skipped verifiers legacy load_environment on Windows (fcntl missing)");
+  } else {
+    throw error;
+  }
+}
 
-const observationPolicyProbe = execFileSync(
-  "uv",
-  [
-    "run",
-    "--project",
-    path.join(ROOT_DIR, "environments", "mazebench"),
-    "python",
-    "-c",
+try {
+  const observationPolicyProbe = execFileSync(
+    "uv",
     [
-      "from mazebench.mazebench import action_result_text,render_json_user_prompt,render_multiturn_user_prompt,render_vision_user_prompt,slim_status",
-      "s={'allowed_commands':['up'],'board_state_hash':'model-secret-state-hash','board_state_hash_version':1,'current_room':'level_HxI','current_view':'top-diagonal','gem_count':0,'json_observation':{'objects':{'player':[[4,15,0]]}},'level':'P..','player':{'x':4,'y':15,'elevation':0},'scorecard':{'current_position':{'x':4,'y':15,'elevation':0}},'visited_levels':['level_HxI'],'yaw':0}",
-      "t=render_multiturn_user_prompt(status=s,target_text='play',result_text='start')",
-      "v=render_vision_user_prompt(status=s,target_text='play',result_text='start')",
-      "j=render_json_user_prompt(status=s,target_text='play',result_text='start')",
-      "blocked_result=action_result_text(command='move',status={**s,'action':'move','direction':'up','moved':False})",
-      "blocked=render_multiturn_user_prompt(status=s,target_text='play',result_text=blocked_result)",
-      "successful_result=action_result_text(command='move',status={**s,'action':'move','direction':'right','moved':True})",
-      "successful=render_multiturn_user_prompt(status=s,target_text='play',result_text=successful_result)",
-      "progress_result=action_result_text(command='move',status={**s,'action':'move','direction':'right','moved':True,'room_changed':True,'current_room':'level_IxI','collected_this_action':['gem-1']})",
-      "progress=render_multiturn_user_prompt(status=s,target_text='play',result_text=progress_result)",
-      "invalid=render_multiturn_user_prompt(status=s,target_text='play',result_text=action_result_text(error='bad command'))",
-      "dead_status={**s,'player_dead':True}",
-      "dead_result=action_result_text(command='move',status={**dead_status,'action':'move','direction':'up','moved':False})",
-      "dead=render_multiturn_user_prompt(status=dead_status,target_text='play',result_text=dead_result)",
-      "assert 'Player:' not in t and 'elevation=0' not in t",
-      "assert 'Current room: level_HxI' in t and 'Current view: top-diagonal' in t and 'Yaw: 0' in t",
-      "assert 'Gems collected: 0' in t and 'Visited rooms: level_HxI' in t",
-      "assert 'scorecard' not in t.lower()",
-      "assert 'P..' in t",
-      "assert 'Previous action: move. Direction: up.' in blocked and 'Moved:' not in blocked",
-      "assert 'Previous action: move. Direction: right.' in successful and 'Moved:' not in successful",
-      "assert 'Entered room: level_IxI.' in progress and 'gem-1' not in progress",
-      "assert 'Previous response was invalid: bad command' in invalid",
-      "assert dead.count('The player died, you must now undo or reset or go to a level.') == 1",
-      "assert 'scorecard' not in blocked.lower() and 'x=4' not in blocked and 'y=15' not in blocked",
-      "assert slim_status({'direction':'up'})['direction'] == 'up'",
-      "assert 'Player:' not in v and 'elevation=0' not in v",
-      "assert 'Player: x=4 y=15 elevation=0' in j",
-      "assert 'model-secret-state-hash' not in t and 'model-secret-state-hash' not in v and 'model-secret-state-hash' not in j",
-      "assert 'scorecard' not in action_result_text(command='quit',status={**s,'quit':True}).lower()",
-      "print('model observation policy ready')"
-    ].join("; ")
-  ],
-  { cwd: ROOT_DIR, encoding: "utf8" }
-);
-assert.match(observationPolicyProbe, /model observation policy ready/);
+      "run",
+      "--project",
+      path.join(ROOT_DIR, "environments", "mazebench"),
+      "python",
+      "-c",
+      [
+        "from mazebench.mazebench import action_result_text,render_json_user_prompt,render_multiturn_user_prompt,render_vision_user_prompt,slim_status",
+        "s={'allowed_commands':['up'],'board_state_hash':'model-secret-state-hash','board_state_hash_version':1,'current_room':'level_HxI','current_view':'top-diagonal','gem_count':0,'json_observation':{'objects':{'player':[[4,15,0]]}},'level':'P..','player':{'x':4,'y':15,'elevation':0},'scorecard':{'current_position':{'x':4,'y':15,'elevation':0}},'visited_levels':['level_HxI'],'yaw':0}",
+        "t=render_multiturn_user_prompt(status=s,target_text='play',result_text='start')",
+        "v=render_vision_user_prompt(status=s,target_text='play',result_text='start')",
+        "j=render_json_user_prompt(status=s,target_text='play',result_text='start')",
+        "blocked_result=action_result_text(command='move',status={**s,'action':'move','direction':'up','moved':False})",
+        "blocked=render_multiturn_user_prompt(status=s,target_text='play',result_text=blocked_result)",
+        "successful_result=action_result_text(command='move',status={**s,'action':'move','direction':'right','moved':True})",
+        "successful=render_multiturn_user_prompt(status=s,target_text='play',result_text=successful_result)",
+        "progress_result=action_result_text(command='move',status={**s,'action':'move','direction':'right','moved':True,'room_changed':True,'current_room':'level_IxI','collected_this_action':['gem-1']})",
+        "progress=render_multiturn_user_prompt(status=s,target_text='play',result_text=progress_result)",
+        "invalid=render_multiturn_user_prompt(status=s,target_text='play',result_text=action_result_text(error='bad command'))",
+        "dead_status={**s,'player_dead':True}",
+        "dead_result=action_result_text(command='move',status={**dead_status,'action':'move','direction':'up','moved':False})",
+        "dead=render_multiturn_user_prompt(status=dead_status,target_text='play',result_text=dead_result)",
+        "assert 'Player:' not in t and 'elevation=0' not in t",
+        "assert 'Current room: level_HxI' in t and 'Current view: top-diagonal' in t and 'Yaw: 0' in t",
+        "assert 'Gems collected: 0' in t and 'Visited rooms: level_HxI' in t",
+        "assert 'scorecard' not in t.lower()",
+        "assert 'P..' in t",
+        "assert 'Previous action: move. Direction: up.' in blocked and 'Moved:' not in blocked",
+        "assert 'Previous action: move. Direction: right.' in successful and 'Moved:' not in successful",
+        "assert 'Entered room: level_IxI.' in progress and 'gem-1' not in progress",
+        "assert 'Previous response was invalid: bad command' in invalid",
+        "assert dead.count('The player died, you must now undo or reset or go to a level.') == 1",
+        "assert 'scorecard' not in blocked.lower() and 'x=4' not in blocked and 'y=15' not in blocked",
+        "assert slim_status({'direction':'up'})['direction'] == 'up'",
+        "assert 'Player:' not in v and 'elevation=0' not in v",
+        "assert 'Player: x=4 y=15 elevation=0' in j",
+        "assert 'model-secret-state-hash' not in t and 'model-secret-state-hash' not in v and 'model-secret-state-hash' not in j",
+        "assert 'scorecard' not in action_result_text(command='quit',status={**s,'quit':True}).lower()",
+        "print('model observation policy ready')"
+      ].join("; ")
+    ],
+    { cwd: ROOT_DIR, encoding: "utf8" }
+  );
+  assert.match(observationPolicyProbe, /model observation policy ready/);
+} catch (error) {
+  if (process.platform === "win32" && (error.stderr || "").includes("No module named 'fcntl'")) {
+    console.log("training: skipped verifiers observation policy on Windows (fcntl missing)");
+  } else {
+    throw error;
+  }
+}
 
 const input = [
   { command: "observe" },

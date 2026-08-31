@@ -97,19 +97,37 @@ function inlinePermissionTable(entries) {
 function resolvedExecutable(command, label) {
   const value = String(command || "").trim();
   if (!value) throw new Error(`${label} executable is required.`);
-  if (value.includes(path.sep)) {
+  if (value.includes(path.sep) || (process.platform === "win32" && (value.includes("/") || value.includes("\\")))) {
     const absolute = path.resolve(value);
     if (!fs.existsSync(absolute)) throw new Error(`${label} executable does not exist.`);
     return absolute;
   }
-  const probe = spawnSync("which", [value], { encoding: "utf8" });
-  const found = String(probe.stdout || "").trim().split(/\r?\n/, 1)[0];
-  if (probe.status !== 0 || !found) throw new Error(`${label} executable was not found on PATH.`);
-  return path.resolve(found);
+  const lookupCmd = process.platform === "win32" ? "where" : "which";
+  const probe = spawnSync(lookupCmd, [value], { encoding: "utf8" });
+  const lines = String(probe.stdout || "").trim().split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (probe.status !== 0 || lines.length === 0) throw new Error(`${label} executable was not found on PATH.`);
+
+  if (process.platform === "win32") {
+    const exeMatch = lines.find((l) => l.toLowerCase().endsWith(".exe"));
+    if (exeMatch && fs.existsSync(exeMatch)) {
+      return path.resolve(exeMatch);
+    }
+
+    // Windows App Execution Aliases can be returned by `where` even though
+    // Node cannot stat or execute the reparse point.  Returning the unresolved
+    // command here also makes the later denied-path check resolve it relative
+    // to the repository.  Probe it before accepting it so callers can fall
+    // through to the next real interpreter on PATH.
+    const executableProbe = spawnSync(value, ["--version"], { encoding: "utf8" });
+    if (executableProbe.status === 0) return value;
+    throw new Error(`${label} executable was found on PATH but cannot be executed.`);
+  }
+
+  return path.resolve(lines[0]);
 }
 
 function findPythonExecutable(requested = "") {
-  const candidates = [requested, "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3", "python3"]
+  const candidates = [requested, "python3", "python", "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
     .map((value) => String(value || "").trim())
     .filter(Boolean);
   for (const candidate of candidates) {
@@ -127,12 +145,20 @@ function isWithin(candidate, parent) {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
 }
 
+function safeRealpathSync(filepath) {
+  try {
+    return fs.realpathSync(filepath);
+  } catch (_e) {
+    return path.resolve(filepath);
+  }
+}
+
 function canonicalPath(candidate) {
   const absolute = path.resolve(String(candidate));
   try {
     return fs.realpathSync(absolute);
   } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+    if (error?.code !== "ENOENT") return absolute;
     const parent = path.dirname(absolute);
     if (parent === absolute) return absolute;
     return path.join(canonicalPath(parent), path.basename(absolute));
@@ -141,7 +167,8 @@ function canonicalPath(candidate) {
 
 function runtimeReadRoots(pythonBin) {
   const roots = [];
-  for (const candidate of [path.resolve(pythonBin), fs.realpathSync(pythonBin)]) {
+  const realBin = safeRealpathSync(pythonBin);
+  for (const candidate of [path.resolve(pythonBin), realBin]) {
     if (candidate.startsWith("/opt/homebrew/")) roots.push("/opt/homebrew");
     else if (candidate.startsWith("/usr/local/")) roots.push("/usr/local");
     else if (candidate.startsWith("/Library/Frameworks/")) roots.push("/Library/Frameworks");
@@ -268,10 +295,11 @@ function runSandboxedPython(code, options = {}) {
     throw new Error(`timeout_seconds must be between 1 and ${MAX_TIMEOUT_SECONDS}.`);
   }
   const { config, argv } = pythonSandboxCommand({ ...options, timeoutSeconds });
+  const isPosix = process.platform !== "win32" && typeof process.getuid === "function";
   const result = spawnSync(config.codexBin, argv, {
     cwd: config.scratchDir,
     env: sandboxEnvironment(config),
-    ...(config.runUid === null ? {} : { uid: config.runUid, gid: config.runGid }),
+    ...(isPosix && config.runUid !== null ? { uid: config.runUid, gid: config.runGid } : {}),
     input: source,
     encoding: "utf8",
     timeout: (timeoutSeconds + 5) * 1000,

@@ -116,7 +116,16 @@ function createLocalBuildWorldService({
       const linkPath = path.join(localWorldDir(gameId), dirName);
 
       if (!fs.existsSync(linkPath)) {
-        fs.symlinkSync(path.join("..", "maze", dirName), linkPath, "dir");
+        try {
+          if (process.platform === "win32") {
+            const targetPath = path.join(localWorldDir("maze"), dirName);
+            fs.symlinkSync(targetPath, linkPath, "junction");
+          } else {
+            fs.symlinkSync(path.join("..", "maze", dirName), linkPath, "dir");
+          }
+        } catch (_err) {
+          /* ignore symlink restrictions on locked Windows environments */
+        }
       }
     });
   }

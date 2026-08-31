@@ -120,7 +120,7 @@ const activity = [
   { tool: "maze_action", status: "completed", moves_before: 1, moves_after: 2 }
 ].map(JSON.stringify).join("\n") + "\n";
 assert.equal(toolActivityPrefix(activity, 1).trim().split("\n").length, 2);
-assert.equal(claudeProjectKey("/app/workspace"), "-app-workspace");
+assert.equal(claudeProjectKey("/app/workspace"), path.resolve("/app/workspace").replace(/[^a-zA-Z0-9_-]/g, "-"));
 
 const inheritedUnlimited = branchLaunchParams(
   { unlimited: true, segment_move_budget: null },

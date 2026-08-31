@@ -1,3 +1,4 @@
+process.env.MAZEBENCH_ENABLE_PRIME = "1";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");

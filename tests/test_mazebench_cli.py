@@ -94,24 +94,80 @@ class CliCommandTests(TestCase):
     def test_prime_eval_uses_the_native_framework_harness(self, _require, run_command):
         root = Path("/maze")
 
-        result = mazebench_cli.run_prime(
-            root,
-            ["eval"],
-            {"model": "openai/test", "max_turns": "3"},
-            [],
+        with mock.patch.dict("os.environ", {"MAZEBENCH_ENABLE_PRIME": "1"}):
+            result = mazebench_cli.run_prime(
+                root,
+                ["eval"],
+                {"model": "openai/test", "max_turns": "3"},
+                [],
+            )
+
+            self.assertEqual(result, 0)
+            command = run_command.call_args.args[0]
+            self.assertIn("mazebench-tools", command)
+            self.assertEqual(
+                command[command.index("--env.agent.harness.id") + 1],
+                "null",
+            )
+            self.assertEqual(
+                command[command.index("--env.agent.runtime.type") + 1], "prime"
+            )
+            self.assertNotIn("--env.taskset.tools.colocated", command)
+            self.assertNotIn("--env.taskset.python-tools", command)
+            with self.assertRaisesRegex(mazebench_cli.CliError, "replace the approved"):
+                mazebench_cli.run_prime(root, ["eval"], {}, ["--harness.id", "bash"])
+
+    @mock.patch.object(mazebench_cli, "_require")
+    def test_prime_disabled_by_default(self, require_mock):
+        root = Path("/maze")
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(mazebench_cli.CliError, "Prime integration is disabled"):
+                mazebench_cli.run_prime(root, ["eval"], {}, [])
+        require_mock.assert_not_called()
+
+    @mock.patch.object(mazebench_cli, "run_mcp", return_value=0)
+    @mock.patch.object(mazebench_cli, "resolve_root", return_value=Path("/maze"))
+    def test_main_routes_mcp_command(self, _resolve_root, run_mcp):
+        result = mazebench_cli.main(["mcp"])
+        self.assertEqual(result, 0)
+        run_mcp.assert_called_once_with(Path("/maze"), [])
+
+    @mock.patch("subprocess.call", return_value=0)
+    @mock.patch.object(mazebench_cli, "_require")
+    @mock.patch.object(mazebench_cli, "_node_bin", return_value="node")
+    def test_run_mcp_invokes_adapter(self, _node_bin, _require, mock_call):
+        root = Path("/maze")
+        result = mazebench_cli.run_mcp(root, ["--debug"])
+        self.assertEqual(result, 0)
+        mock_call.assert_called_once_with(
+            ["node", str(root / "scripts" / "maze-external-mcp.js"), "--debug"],
+            cwd=str(root),
         )
 
+    @mock.patch("webbrowser.open")
+    @mock.patch.object(
+        mazebench_cli,
+        "_wait_for_state",
+        return_value={"url": "http://127.0.0.1:3000", "active_run_id": "ext-123"},
+    )
+    def test_open_when_ready_opens_standard_external_play_url(
+        self, _wait_for_state, mock_open
+    ):
+        mazebench_cli._open_when_ready(1234, "http://127.0.0.1:3000")
+        mock_open.assert_called_once_with("http://127.0.0.1:3000/external-play")
+
+    @mock.patch("webbrowser.open")
+    @mock.patch.object(
+        mazebench_cli,
+        "_read_state",
+        return_value={"url": "http://127.0.0.1:3000", "pid": 4321},
+    )
+    @mock.patch.object(mazebench_cli, "_require")
+    @mock.patch.object(mazebench_cli, "_node_bin", return_value="node")
+    def test_launch_already_running_opens_external_play(
+        self, _node_bin, _require, _read_state, mock_open
+    ):
+        root = Path("/maze")
+        result = mazebench_cli.run_launch(root, [], {"open": "true"}, [])
         self.assertEqual(result, 0)
-        command = run_command.call_args.args[0]
-        self.assertIn("mazebench-tools", command)
-        self.assertEqual(
-            command[command.index("--env.agent.harness.id") + 1],
-            "null",
-        )
-        self.assertEqual(
-            command[command.index("--env.agent.runtime.type") + 1], "prime"
-        )
-        self.assertNotIn("--env.taskset.tools.colocated", command)
-        self.assertNotIn("--env.taskset.python-tools", command)
-        with self.assertRaisesRegex(mazebench_cli.CliError, "replace the approved"):
-            mazebench_cli.run_prime(root, ["eval"], {}, ["--harness.id", "bash"])
+        mock_open.assert_called_once_with("http://127.0.0.1:3000/external-play")

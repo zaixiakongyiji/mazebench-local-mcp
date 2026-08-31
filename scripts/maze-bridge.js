@@ -712,7 +712,16 @@ function handleCommand(session, message) {
       moved: Boolean(result === true || result?.moved),
       novel_pushes_this_action: pushed.novel,
       pushes_this_action: pushed.pushes,
-      room_changed: roomChanged
+      room_changed: roomChanged,
+      _transition_source: {
+        action: "move",
+        direction: String(message.direction).toLowerCase(),
+        moves: result?.moves || [],
+        liftToggles: result?.liftToggles || [],
+        raisedOrangeWalls: result?.raisedOrangeWalls || [],
+        moved: Boolean(result === true || result?.moved),
+        room_changed: roomChanged
+      }
     });
   }
 
@@ -743,7 +752,11 @@ function handleCommand(session, message) {
     session.actionCount += 1;
     return sessionSnapshot(session, {
       action: "rotate_camera",
-      direction
+      direction,
+      _transition_source: {
+        action: "rotate_camera",
+        direction
+      }
     });
   }
 
@@ -757,7 +770,11 @@ function handleCommand(session, message) {
 
     return sessionSnapshot(session, {
       action: "undo",
-      undone
+      undone,
+      _transition_source: {
+        action: "undo",
+        undone: Boolean(undone)
+      }
     });
   }
 
@@ -767,7 +784,11 @@ function handleCommand(session, message) {
 
     return sessionSnapshot(session, {
       action: "reset_level",
-      reset
+      reset,
+      _transition_source: {
+        action: "reset",
+        reset: Boolean(reset)
+      }
     });
   }
 
@@ -803,7 +824,13 @@ function handleCommand(session, message) {
       action: "goto_level",
       destination_room: level,
       x: level.match(LEVEL_PATTERN)?.[1] || null,
-      y: level.match(LEVEL_PATTERN)?.[2] || null
+      y: level.match(LEVEL_PATTERN)?.[2] || null,
+      _transition_source: {
+        action: "goto_level",
+        destination_room: level,
+        room_changed: true,
+        moved: true
+      }
     });
   }
 
@@ -884,5 +911,6 @@ if (require.main === module) {
 module.exports = {
   createSession,
   handleCommand,
-  parseArgs
+  parseArgs,
+  sessionSnapshot
 };

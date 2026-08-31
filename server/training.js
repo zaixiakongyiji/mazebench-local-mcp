@@ -64,13 +64,17 @@ function tomlString(value) {
   return JSON.stringify(String(value));
 }
 
-function createTrainingService({ buildWorlds, getGame, rootDir, worldMaps }) {
+function createTrainingService({ buildWorlds, getGame, rootDir, worldMaps, primeIntegration = null, enabled = false }) {
+  const isEnabled = Boolean(enabled || primeIntegration || process.env.MAZEBENCH_ENABLE_PRIME === "1");
   const environmentId = process.env.MAZEBENCH_TRAIN_ENV_ID || "mazebench/mazebench";
   const environmentDir = path.join(rootDir, "environments", "mazebench");
   const generatedConfigDir = path.join(rootDir, "configs", "rl", "generated");
   let bootstrapCache = null;
 
   function runPrime(args, options = {}) {
+    if (!isEnabled) {
+      throw new Error("Prime integration is disabled.");
+    }
     const result = spawnSync("prime", ["--plain", ...args], {
       cwd: rootDir,
       encoding: "utf8",
@@ -243,6 +247,26 @@ function createTrainingService({ buildWorlds, getGame, rootDir, worldMaps }) {
   }
 
   function bootstrap(options = {}) {
+    if (!isEnabled) {
+      return {
+        readiness: {
+          cli: false,
+          account: false,
+          local_environment: false,
+          published_environment: false,
+          ready: false,
+          setup: "",
+          environment_id: environmentId,
+          version: "",
+          issue: "Prime integration is disabled."
+        },
+        models: [],
+        defaults: {
+          ...worldDefaults(),
+          ...HOSTED_TRAINING_DEFAULTS
+        }
+      };
+    }
     if (!options.fresh && bootstrapCache && Date.now() - bootstrapCache.at < CACHE_MS) {
       return bootstrapCache.value;
     }
@@ -269,6 +293,26 @@ function createTrainingService({ buildWorlds, getGame, rootDir, worldMaps }) {
   }
 
   async function bootstrapAsync(options = {}) {
+    if (!isEnabled) {
+      return {
+        readiness: {
+          cli: false,
+          account: false,
+          local_environment: false,
+          published_environment: false,
+          ready: false,
+          setup: "",
+          environment_id: environmentId,
+          version: "",
+          issue: "Prime integration is disabled."
+        },
+        models: [],
+        defaults: {
+          ...worldDefaults(),
+          ...HOSTED_TRAINING_DEFAULTS
+        }
+      };
+    }
     if (!options.fresh && bootstrapCache && Date.now() - bootstrapCache.at < CACHE_MS) {
       return bootstrapCache.value;
     }
@@ -292,11 +336,13 @@ function createTrainingService({ buildWorlds, getGame, rootDir, worldMaps }) {
   }
 
   function listRuns() {
+    if (!isEnabled) return { runs: [], total: 0 };
     const payload = parseJsonOutput(runPrime(["train", "list", "--num", "50", "--output", "json"]).stdout) || {};
     return { runs: payload.runs || [], total: Number(payload.total) || 0 };
   }
 
   async function listRunsAsync(options = {}) {
+    if (!isEnabled) return { runs: [], total: 0 };
     const limit = Math.max(1, Math.min(50, Math.floor(Number(options.limit) || 10)));
     const payload = parseJsonOutput((await runPrimeAsync(["train", "list", "--num", String(limit), "--output", "json"])).stdout) || {};
     return { runs: payload.runs || [], total: Number(payload.total) || 0 };

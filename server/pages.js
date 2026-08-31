@@ -52,7 +52,9 @@ function createPageRenderer({
   buildAuthorPageData,
   buildMazeWorldMapEditorData,
   buildWorlds,
+  capabilities = { external_play: true, local_mcp: true, prime_integration: false, training: false },
   getGame,
+  getLevel,
   getLevelState,
   listGames,
   remote,
@@ -91,11 +93,11 @@ function createPageRenderer({
     })}
   </head>
   <body class="${escapeHtml(bodyClass)}">
-    ${topbar({ rightHtml: accountActionsHtml(remoteStatusSafe()) })}
+    ${topbar({ rightHtml: accountActionsHtml(remoteStatusSafe()), capabilities })}
     <main class="page-shell">
       ${main}
     </main>
-    ${siteFooter()}
+    ${siteFooter({ capabilities })}
   </body>
 </html>`;
   }
@@ -190,12 +192,12 @@ function createPageRenderer({
         </section>`
       : "";
 
-    const modeCard = (href, mode, title, copy) => `<a class="world-card mode-card-link mode-card-link--${mode}" href="${href}">
+    const modeCard = (href, mode, titleKey, title, copyKey, copy) => `<a class="world-card mode-card-link mode-card-link--${mode}" href="${href}">
         <div class="card-body">
           <span class="mode-card-icon" aria-hidden="true">${HOME_MODE_ICONS[mode]}</span>
           <div class="mode-card-copy">
-            <h3 class="card-title">${title}</h3>
-            <p class="card-by">${copy}</p>
+            <h3 class="card-title" data-i18n="${titleKey}">${title}</h3>
+            <p class="card-by" data-i18n="${copyKey}">${copy}</p>
           </div>
         </div>
       </a>`;
@@ -203,9 +205,10 @@ function createPageRenderer({
     return renderSitePage({
       title: "Maze Bench",
       main: `<div class="world-grid home-mode-grid">
-          ${modeCard("/build", "build", "Build and Play", "Create, edit, and play the official Maze Bench environment or your local drafts.")}
-          ${modeCard("/agent", "agent", "Agent", "Run a model through isolated, named game controls and watch live.")}
-          ${modeCard("/train", "train", "Train", "Train models on Maze Bench with Prime Verifiers.")}
+          ${modeCard("/build", "build", "home_build_title", "Build and Play", "home_build_copy", "Create, edit, and play the official Maze Bench environment or your local drafts.")}
+          ${modeCard("/external-play", "play", "home_external_title", "External Play (Local MCP)", "home_external_copy", "Connect Codex, Claude Desktop, or local MCP to play and watch live in 3D (Unverified).")}
+          ${modeCard("/agent", "agent", "home_agent_title", "Agent", "home_agent_copy", "Run a model through isolated, named game controls and watch live.")}
+          ${capabilities.training ? modeCard("/train", "train", "home_train_title", "Train", "home_train_copy", "Train models on Maze Bench with Prime Verifiers.") : ""}
         </div>
         ${otherGamesSection}`
     });
@@ -841,15 +844,16 @@ function createPageRenderer({
       harnessesApiUrl: "/api/agent/harnesses",
       modelsApiBase: "/api/agent/models",
       worlds,
+      capabilities,
       environment: agentEnvironment({ cachedOnly: true }),
       remote: remoteStatusSafe()
     };
 
     return renderSitePage({
       title: "Agent — Maze Bench",
-      extraHeadHtml: `<link rel="preload" as="image" href="/logos/prime.png" type="image/png" fetchpriority="high">`,
+      extraHeadHtml: capabilities.prime_integration ? `<link rel="preload" as="image" href="/logos/prime.png" type="image/png" fetchpriority="high">` : "",
       main: `<div class="page-head agent-page-head">
-          <h1>Agent</h1>
+          <h1 data-i18n="agent_title">Agent</h1>
           <p id="agent-status" class="author-status" role="status" aria-live="polite"></p>
           <div id="agent-launch-status" class="agent-launch-status" role="status" aria-live="polite" aria-atomic="true" hidden>
             <span class="agent-launch-status__spinner" aria-hidden="true"></span>
@@ -858,13 +862,13 @@ function createPageRenderer({
         </div>
         <section class="panel agent-composer" aria-label="Launch a run">
           <div class="composer-head">
-            <h2>New run</h2>
+            <h2 data-i18n="agent_new_run">New run</h2>
           </div>
 
           <section class="composer-section composer-section--agent">
             <div class="composer-section-title">
               <span class="composer-step">01</span>
-              <div><h3>Harness</h3><p id="execution-note" class="muted">Choose a harness. Prime supplies inference by default.</p></div>
+              <div><h3 data-i18n="agent_step_harness">Harness</h3><p id="execution-note" class="muted" data-i18n="agent_harness_note">Choose a harness. Prime supplies inference by default.</p></div>
             </div>
             <div id="provider-picker" class="provider-grid" role="radiogroup" aria-label="Agent harness"></div>
             <div id="custom-harness-panel" class="custom-harness-panel" hidden>
@@ -882,7 +886,7 @@ function createPageRenderer({
               </div>
             </div>
             <div id="harness-execution" class="harness-execution" hidden>
-              <span class="harness-execution__label">Run through</span>
+              <span class="harness-execution__label" data-i18n="agent_run_through">Run through</span>
               <div id="execution-picker" class="execution-picker" role="radiogroup" aria-label="Execution provider">
                 <button type="button" class="execution-option is-selected" data-execution="prime" aria-pressed="true">
                   <span class="execution-option__logo"><img src="/logos/prime.png" alt="" width="128" height="128"></span>
@@ -902,7 +906,7 @@ function createPageRenderer({
             <div class="composer-section-head">
               <div class="composer-section-title">
                 <span class="composer-step">02</span>
-                <div><h3>Model</h3></div>
+                <div><h3 data-i18n="agent_step_model">Model</h3></div>
               </div>
               <div class="model-catalog-actions">
                 <span id="model-meta" class="model-meta" aria-live="polite"></span>
@@ -913,7 +917,7 @@ function createPageRenderer({
               <p id="model-note" class="muted picker-note" hidden></p>
               <label id="model-search" class="model-search" hidden>
                 <span class="model-search__label">Find a model</span>
-                <input id="model-search-input" type="search" placeholder="Search by provider or model name…" autocomplete="off" spellcheck="false">
+                <input id="model-search-input" type="search" data-i18n-placeholder="agent_search_model_placeholder" placeholder="Search by provider or model name…" autocomplete="off" spellcheck="false">
               </label>
               <div id="model-picker" class="chip-row" role="radiogroup" aria-label="Model"></div>
               <div id="model-custom" class="model-custom" hidden>
@@ -925,7 +929,7 @@ function createPageRenderer({
           <section class="composer-section composer-section--reasoning" hidden>
             <div class="composer-section-title">
               <span class="composer-step">03</span>
-              <div><h3>Reasoning effort</h3></div>
+              <div><h3 data-i18n="agent_step_reasoning">Reasoning effort</h3></div>
             </div>
             <div id="reasoning-row" class="model-tuning" hidden>
               <div id="reasoning-picker" class="chip-row chip-row--small" role="radiogroup" aria-label="Reasoning effort"></div>
@@ -940,7 +944,7 @@ function createPageRenderer({
           <section id="world-section" class="composer-section composer-section--target" hidden>
             <div class="composer-section-title">
               <span class="composer-step">04</span>
-              <div><h3>Target environment</h3></div>
+              <div><h3 data-i18n="agent_step_target">Target environment</h3></div>
             </div>
             <div class="target-grid">
               <div class="target-block">
@@ -958,7 +962,7 @@ function createPageRenderer({
           <section class="composer-section composer-section--settings" hidden>
             <div class="composer-section-title">
               <span class="composer-step">05</span>
-              <div><h3>Run settings</h3></div>
+              <div><h3 data-i18n="agent_step_settings">Run settings</h3></div>
             </div>
             <div class="settings-stage">
               <div id="local-settings" class="settings-deck">
@@ -1099,35 +1103,35 @@ function createPageRenderer({
           <section class="composer-section composer-section--run" hidden>
             <div class="composer-section-title">
               <span class="composer-step">06</span>
-              <div><h3>Run</h3></div>
+              <div><h3 data-i18n="agent_step_run">Run</h3></div>
             </div>
             <div class="launch-dock">
               <div class="launch-controls">
-                <button id="launch-run" class="button--primary launch-button" type="button"><span class="launch-button__label">Launch</span><span class="launch-button__arrow" aria-hidden="true">↗</span></button>
+                <button id="launch-run" class="button--primary launch-button" type="button"><span class="launch-button__label" data-i18n="agent_launch_btn">Launch</span><span class="launch-button__arrow" aria-hidden="true">↗</span></button>
               </div>
             </div>
           </section>
         </section>
         <section class="panel agent-runs-panel" aria-label="Runs">
           <div class="runs-head">
-            <div><h2>Recent runs</h2></div>
+            <div><h2 data-i18n="agent_recent_runs">Recent runs</h2></div>
             <span id="runs-total" class="runs-total"></span>
           </div>
           <div class="runs-toolbar">
-            <label class="runs-search"><span aria-hidden="true">⌕</span><input id="runs-search" type="search" placeholder="Search runs…" autocomplete="off" spellcheck="false"></label>
+            <label class="runs-search"><span aria-hidden="true">⌕</span><input id="runs-search" type="search" data-i18n-placeholder="agent_search_placeholder" placeholder="Search runs…" autocomplete="off" spellcheck="false"></label>
             <div class="runs-filters">
-              <label class="runs-filter"><span>Company</span><select id="runs-provider" aria-label="Filter by company"><option value="">All</option></select></label>
-              <label class="runs-filter"><span>Model</span><select id="runs-model" aria-label="Filter by model"><option value="">All</option></select></label>
-              <label class="runs-filter"><span>Status</span><select id="runs-status" aria-label="Filter by status"><option value="">All</option></select></label>
-              <label class="runs-filter"><span>Starred</span><select id="runs-starred" aria-label="Filter by starred runs"><option value="">All</option><option value="1">Starred</option></select></label>
-              <label class="runs-filter"><span>Sort</span><select id="runs-sort" aria-label="Sort">
+              <label class="runs-filter"><span data-i18n="filter_company">Company</span><select id="runs-provider" aria-label="Filter by company"><option value="">All</option></select></label>
+              <label class="runs-filter"><span data-i18n="filter_model">Model</span><select id="runs-model" aria-label="Filter by model"><option value="">All</option></select></label>
+              <label class="runs-filter"><span data-i18n="filter_status">Status</span><select id="runs-status" aria-label="Filter by status"><option value="">All</option></select></label>
+              <label class="runs-filter"><span data-i18n="filter_starred">Starred</span><select id="runs-starred" aria-label="Filter by starred runs"><option value="">All</option><option value="1">Starred</option></select></label>
+              <label class="runs-filter"><span data-i18n="filter_sort">Sort</span><select id="runs-sort" aria-label="Sort">
                 <option value="newest">Newest</option>
                 <option value="oldest">Oldest</option>
                 <option value="actions">Most Actions</option>
                 <option value="rooms">Most Rooms</option>
                 <option value="gems">Most Gems</option>
               </select></label>
-              <label class="runs-filter runs-filter--count"><span>Show</span><select id="runs-page-size" aria-label="Per page">
+              <label class="runs-filter runs-filter--count"><span data-i18n="filter_show">Show</span><select id="runs-page-size" aria-label="Per page">
                 <option value="5" selected>5</option>
                 <option value="10">10</option>
                 <option value="20">20</option>
@@ -1138,9 +1142,9 @@ function createPageRenderer({
           </div>
           <div id="agent-runs"></div>
           <div id="runs-pager" class="runs-pager" hidden>
-            <button id="runs-prev" class="button" type="button">← Prev</button>
+            <button id="runs-prev" class="button" type="button" data-i18n="pager_prev">← Prev</button>
             <span id="runs-page-label" class="muted"></span>
-            <button id="runs-next" class="button" type="button">Next →</button>
+            <button id="runs-next" class="button" type="button" data-i18n="pager_next">Next →</button>
           </div>
         </section>
         <div id="provider-setup-modal" class="build-modal provider-setup-modal" role="dialog" aria-modal="true" aria-labelledby="provider-setup-title" hidden>
@@ -1164,7 +1168,7 @@ function createPageRenderer({
   }
 
   function renderAgentRunPage(run) {
-    const isPrime = run.kind === "prime" || run.model === "prime";
+    const isPrime = Boolean(capabilities.prime_integration && (run.kind === "prime" || run.model === "prime"));
     const clientRun = run.mode !== "vision"
       ? {
           ...run,
@@ -1561,6 +1565,250 @@ function createPageRenderer({
     });
   }
 
+  function renderExternalPlayLandingPage(serviceData = {}) {
+    const activeRun = serviceData.activeRun || null;
+    const runsList = serviceData.runs || [];
+
+    const activeRunHtml = activeRun
+      ? `<section class="panel active-run-panel" style="border: 1px solid var(--accent, #7c3aed); padding: 18px; border-radius: 12px; margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+            <div>
+              <span class="badge" style="background: rgba(124, 58, 237, 0.2); color: #a78bfa; padding: 4px 8px; border-radius: 6px; font-weight: 600; font-size: 12px;">${escapeHtml(activeRun.status.toUpperCase())}</span>
+              <h2 style="margin: 8px 0 4px 0; font-size: 1.25rem;"><span data-i18n="ext_active_session">Active Session:</span> <code>${escapeHtml(activeRun.runId)}</code></h2>
+              <p style="margin: 0; color: #94a3b8; font-size: 0.875rem;"><span data-i18n="ext_created_at">Created:</span> ${escapeHtml(activeRun.manifest?.created_at || "just now")}</p>
+            </div>
+            <a class="button button--primary" href="/external-play/${encodeURIComponent(activeRun.runId)}" style="padding: 10px 20px;" data-i18n="ext_spectate_btn">Watch / Spectate 3D &rarr;</a>
+          </div>
+        </section>`
+      : `<p class="muted" style="margin-bottom: 24px;" data-i18n="ext_no_active_session">No active session right now. Create one below or launch MCP.</p>`;
+
+    return renderSitePage({
+      title: "External Play (Local MCP) — Maze Bench",
+      bodyClass: "external-play-landing-page",
+      main: `<div class="page-head">
+          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+            <span class="badge" style="background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); padding: 4px 8px; border-radius: 6px; font-size: 12px; font-weight: bold;" data-i18n="ext_badge_unverified">EXTERNAL / UNVERIFIED</span>
+          </div>
+          <h1 data-i18n="ext_landing_title">External Play — Local MCP</h1>
+          <p class="card-by" style="font-size: 1rem; color: #94a3b8; max-width: 720px;" data-i18n="ext_landing_subtitle">
+            Control the authoritative MazeBench game session locally via stdio MCP (Codex, Claude Desktop, etc.) and spectate the full 3D game in real time.
+          </p>
+        </div>
+
+        ${activeRunHtml}
+
+        <section class="panel" style="margin-bottom: 24px;">
+          <h2 data-i18n="ext_mcp_config_title">MCP Configuration</h2>
+          <p style="color: #94a3b8; font-size: 0.9rem;" data-i18n="ext_mcp_config_desc">Add the following to your Codex or Claude Desktop configuration:</p>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 12px;">
+            <div>
+              <h3 style="font-size: 0.9rem; margin-bottom: 6px; color: #cbd5e1;">Codex (config.toml)</h3>
+              <pre style="background: #0f172a; padding: 12px; border-radius: 8px; font-size: 0.85rem; overflow-x: auto;"><code>[mcp_servers.mazebench]
+command = "mazebench"
+args = ["mcp"]</code></pre>
+            </div>
+            <div>
+              <h3 style="font-size: 0.9rem; margin-bottom: 6px; color: #cbd5e1;">Claude Desktop (claude_desktop_config.json)</h3>
+              <pre style="background: #0f172a; padding: 12px; border-radius: 8px; font-size: 0.85rem; overflow-x: auto;"><code>{
+  "mcpServers": {
+    "mazebench": {
+      "command": "mazebench",
+      "args": ["mcp"]
+    }
+  }
+}</code></pre>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2 data-i18n="create_session_title">Create New Session</h2>
+          <form id="create-external-run-form" style="display: flex; flex-direction: column; gap: 14px; max-width: 480px; margin-top: 12px;">
+            <label class="field">
+              <span data-i18n="duration_label">Time Limit (minutes)</span>
+              <input type="number" id="ext-duration-min" min="1" max="360" value="30" required>
+            </label>
+            <label class="field">
+              <span data-i18n="win_threshold_label">Win Gem Threshold (default: 10, full maze: 100)</span>
+              <input type="number" id="ext-win-threshold" min="1" max="100" value="10" required>
+            </label>
+            <label class="field">
+              <span data-i18n="model_name_label">Model Name</span>
+              <input type="text" id="ext-model-name" data-i18n-placeholder="model_name_placeholder" placeholder="e.g. Gemini 2.5 Flash / Claude 3.7 Sonnet">
+            </label>
+            <label class="field">
+              <span data-i18n="harness_name_label">Harness Name</span>
+              <input type="text" id="ext-harness-name" data-i18n-placeholder="harness_name_placeholder" placeholder="e.g. antigravity-mcp / stdio-mcp">
+            </label>
+            <button class="button button--primary" type="submit" id="create-ext-run-btn" data-i18n="create_btn">Create Armed Session</button>
+            <p id="create-ext-status" class="author-status" role="status" aria-live="polite"></p>
+          </form>
+        </section>
+        <script src="/external-play.js" defer></script>`
+    });
+  }
+
+  function renderExternalPlayRunPage(run) {
+    const game = getGame("maze");
+    const defaultLevelId = defaultLevelIdForGame(game) || "level_HxI";
+    const level = getLevel ? getLevel(game, defaultLevelId) : { id: defaultLevelId, fileName: `${defaultLevelId}.json` };
+    const levelState = getLevelState(game, level);
+    const authorData = game.worldMap ? buildAuthorPageData(game, level) : null;
+    const playWorldData = authorData
+      ? {
+          blockAdder: authorData.blockAdder,
+          defaultFloorToken: authorData.defaultFloorToken,
+          existingLevels: authorData.existingLevels,
+          game: authorData.game,
+          palette: authorData.palette,
+          toolboxCatalog: authorData.toolboxCatalog,
+          playApiBaseUrl: `/api/play/${encodeURIComponent(game.id)}`,
+          worldColumns: authorData.worldColumns,
+          worldRows: authorData.worldRows
+        }
+      : {};
+
+    const clientRunData = {
+      run_id: run.runId,
+      status: run.status,
+      started_at: run.startedAt,
+      deadline_at: run.deadlineAt,
+      duration_ms: run.durationMs,
+      win_threshold: run.winThreshold,
+      model_name: run.modelName || "",
+      harness_name: run.harnessName || ""
+    };
+
+    const modelDisplay = run.modelName ? ` · Model: ${escapeHtml(run.modelName)}` : "";
+    const harnessDisplay = run.harnessName ? ` · Harness: ${escapeHtml(run.harnessName)}` : "";
+    const bannerTitle = `EXTERNAL PLAY — LOCAL MCP${modelDisplay}${harnessDisplay} (UNVERIFIED) · NOT A BENCHMARK RESULT`;
+
+    return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>External Play Spectator — ${escapeHtml(run.runId)}</title>
+    <meta name="theme-color" content="#070811">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script type="importmap">{"imports":{"three":"/vendor/three.module.js"}}</script>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/site.css">
+    <link rel="stylesheet" href="/play-theme.css?v=${PLAY_ASSET_VERSION}">
+    <link rel="stylesheet" href="/external-play.css">
+    <script src="/i18n.js"></script>
+  </head>
+  <body class="play-page external-spectator-body">
+    <div id="external-banner" class="external-unverified-banner">
+      <span id="external-banner-text">${bannerTitle}</span>
+      <span id="external-status-pill" class="status-pill status-pill--${escapeHtml(run.status)}">${escapeHtml(run.status.toUpperCase())}</span>
+    </div>
+    <main id="game-root" class="is-fullbleed is-loading spectator-root">
+      <div class="play-shell">
+        <div class="play-header" aria-hidden="true"></div>
+        <section class="play-stage" aria-label="External play board">
+          <div class="maze-frame is-loading">
+            <canvas
+              id="maze-canvas"
+              class="maze-canvas"
+              width="${levelState.width * 64}"
+              height="${levelState.height * 64}"
+              aria-label="Maze board"
+            ></canvas>
+            <div class="maze-load-art" aria-hidden="true"><span class="maze-load-label">Connecting</span><span class="maze-load-progress"><span></span></span></div>
+          </div>
+        </section>
+
+        <!-- Top HUD Data Pods (Centered At Top) -->
+        <nav id="spectator-top-hud" class="spectator-top-hud" aria-label="Spectator top stats">
+          <span id="spectator-timer" class="spectator-badge timer-badge">⏱️ <strong id="spectator-timer-val">Waiting for MCP</strong></span>
+          <span id="spectator-rooms-stat" class="spectator-badge">🏛️ <strong id="spectator-rooms-val">1</strong></span>
+          <span id="spectator-gems" class="spectator-badge">💎 <strong id="spectator-gems-val">0</strong></span>
+          <span id="spectator-actions" class="spectator-badge">👟 <strong id="spectator-actions-val">0</strong></span>
+          <span id="spectator-room-stat" class="spectator-badge">🚪 <strong id="spectator-room-val">level_HxI</strong></span>
+          <span id="controller-status" class="spectator-badge controller-badge">Controller: Disconnected</span>
+          <button id="cancel-run-btn" class="button--danger button--small" type="button" data-i18n="cancel_run">Cancel Run</button>
+        </nav>
+
+        <!-- Right Floating AI Action Feed Sidebar -->
+        <aside id="spectator-action-feed" class="spectator-action-feed" aria-label="AI Action Feed">
+          <div class="action-feed-header">
+            <div class="feed-header-title">🕹️ <span data-i18n="feed_title">AI Action Feed</span></div>
+            <button id="toggle-feed-btn" class="feed-collapse-btn" type="button" title="Collapse Feed">▶</button>
+          </div>
+          <div id="action-feed-list" class="action-feed-list">
+            <div class="feed-empty-tip" data-i18n="empty_feed">Waiting for MCP controller to call tools...</div>
+          </div>
+        </aside>
+
+        <!-- Bottom Playback Control Bar -->
+        <nav id="spectator-playback-bar" class="spectator-playback-bar" aria-label="Playback controls">
+          <div class="playback-controls-left">
+            <button id="playback-play-btn" class="playback-btn" type="button" title="Play / Pause">⏸️ Pause</button>
+            <button id="playback-prev-btn" class="playback-btn" type="button" title="Previous Step">⏮️</button>
+            <button id="playback-next-btn" class="playback-btn" type="button" title="Next Step">⏭️</button>
+            <span id="playback-step-label" class="playback-step-label">Step: <strong>0 / 0</strong></span>
+          </div>
+          <div class="playback-scrubber-container">
+            <input id="playback-scrubber" class="playback-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Playback step scrubber">
+          </div>
+          <div class="playback-controls-right">
+            <button id="playback-live-btn" class="playback-btn playback-btn--live is-active" type="button" title="Jump to Live">🔴 Live</button>
+          </div>
+        </nav>
+      </div>
+      <section id="summary-overlay" class="summary-overlay" hidden>
+        <div class="summary-card-dialog">
+          <div class="summary-header">
+            <h2>Game Summary</h2>
+            <span id="summary-outcome-badge" class="badge">WON</span>
+          </div>
+          <div class="summary-body">
+            <div class="summary-grid">
+              <div class="summary-stat"><label>Outcome</label><span id="summary-outcome">-</span></div>
+              <div class="summary-stat"><label>Duration</label><span id="summary-elapsed">-</span></div>
+              <div class="summary-stat"><label>Total Actions</label><span id="summary-actions">-</span></div>
+              <div class="summary-stat"><label>Gems Collected</label><span id="summary-gems">-</span></div>
+              <div class="summary-stat"><label>Rooms Visited</label><span id="summary-rooms">-</span></div>
+              <div class="summary-stat"><label>Declared CLI</label><span id="summary-cli">-</span></div>
+            </div>
+            <div class="summary-actions">
+              <button id="summary-replay-btn" class="button button--primary" type="button">Replay from Beginning</button>
+              <a id="summary-json-link" class="button" href="/api/external-play/runs/${encodeURIComponent(run.runId)}/summary" download="summary.json">Download summary.json</a>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+    <script>
+      window.__MAZEBENCH_INPUT_LOCKED__ = true;
+      window.__PLAY_DATA__ = ${serializeForScript({
+        ...levelState,
+        ...playWorldData,
+        externalSpectator: true,
+        ignoreSavedGemProgress: true,
+        hostOwnsWorldMapNavigation: true
+      })};
+      ${playWorldData ? `window.__PLAY_WORLD_DATA__ = ${serializeForScript(playWorldData)};` : ""}
+      window.__EXTERNAL_PLAY_RUN__ = ${serializeForScript(clientRunData)};
+    </script>
+    ${playWorldData ? `<script src="/maze-token-patterns.js" defer></script><script src="/author-play-data.js" defer></script>` : ""}
+    ${RUNTIME_SCRIPTS}
+    <script src="/play-movement.js" defer></script>
+    <script src="/play-world-transitions.js" defer></script>
+    <script src="/play-gameplay.js" defer></script>
+    <script src="/world-solver.js" defer></script>
+    <script src="/validators.standalone.js" defer></script>
+    <script src="/play.js?v=${PLAY_ASSET_VERSION}" defer></script>
+    <script src="/external-play-host.js" defer></script>
+    <script src="/external-play.js" defer></script>
+  </body>
+</html>`;
+  }
+
   function renderNotFound() {
     return renderSitePage({
       title: "Not Found — Maze Bench",
@@ -1573,6 +1821,8 @@ function createPageRenderer({
     renderAgentRunPage,
     renderAuthorPage,
     renderBuildPage,
+    renderExternalPlayLandingPage,
+    renderExternalPlayRunPage,
     renderFlyoverPage,
     renderGamePage,
     renderHomePage,

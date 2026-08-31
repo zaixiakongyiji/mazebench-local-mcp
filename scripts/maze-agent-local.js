@@ -1677,8 +1677,8 @@ function assertLocalCodexCommandIsolation(config, command) {
     throw new Error("Local Codex must use exactly one private HTTP MCP endpoint.");
   }
   const filesystemProfile = configValues.find((value) => value.startsWith("permissions.mazebench_agent.filesystem="));
-  const workspaceWrite = `"${canonicalPath(config.agentWorkspaceDir)}"="write"`;
-  const swarmWorkspaceWrite = `"${canonicalPath(config.agentSwarmWorkspaceDir)}"="write"`;
+  const workspaceWrite = `${tomlString(canonicalPath(config.agentWorkspaceDir))}="write"`;
+  const swarmWorkspaceWrite = `${tomlString(canonicalPath(config.agentSwarmWorkspaceDir))}="write"`;
   if (!filesystemProfile || !filesystemProfile.includes('":minimal"="read"') ||
       (offline
         ? !filesystemProfile.includes(workspaceWrite) || !filesystemProfile.includes(swarmWorkspaceWrite)

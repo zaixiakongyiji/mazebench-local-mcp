@@ -27,10 +27,10 @@ const {
 } = require("../scripts/maze-agent-local");
 
 assert.deepEqual(containerRuntimeMountArgs("/tmp/maze-current"), [
-  "-v", "/tmp/maze-current/scripts:/app/scripts:ro",
-  "-v", "/tmp/maze-current/server:/app/server:ro",
-  "-v", "/tmp/maze-current/public:/app/public:ro",
-  "-v", "/tmp/maze-current/games/maze:/app/games/maze:ro"
+  "-v", `${path.join("/tmp/maze-current", "scripts")}:/app/scripts:ro`,
+  "-v", `${path.join("/tmp/maze-current", "server")}:/app/server:ro`,
+  "-v", `${path.join("/tmp/maze-current", "public")}:/app/public:ro`,
+  "-v", `${path.join("/tmp/maze-current", "games", "maze")}:/app/games/maze:ro`
 ]);
 
 const lines = (...events) => events.map((event) => JSON.stringify(event)).join("\n");

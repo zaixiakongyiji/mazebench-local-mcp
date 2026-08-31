@@ -704,6 +704,7 @@
         ? incomingCell.rowIndex - outgoingCell.rowIndex
         : 0;
       const canAnimate =
+        options.immediate !== true &&
         (dx !== 0 || dy !== 0) &&
         typeof app.applyLevelState === "function" &&
         typeof app.renderCompositor?.startLevelTransition === "function";
@@ -777,6 +778,27 @@
   // Replay export uses the same world-map navigation path as the interactive
   // game so valid goto actions retain the full room-to-room camera tween.
   app.switchPlayWorldLevel = switchPlayWorldLevel;
+  app.setSpectatorCameraYaw = function (targetYawRad) {
+    if (cameraYawAnimation) {
+      cameraYawAnimation = null;
+    }
+    playCameraYaw = targetYawRad;
+    applyPlayCameraView();
+  };
+  app.setSpectatorCameraTilt = function (targetTilt) {
+    playCameraTilt = clampCameraTilt(Number(targetTilt) || 0);
+    applyPlayCameraView();
+  };
+  app.getSpectatorCameraTilt = function () {
+    return playCameraTilt;
+  };
+  app.getSpectatorCameraYaw = function () {
+    return playCameraYaw;
+  };
+  app.rotateCameraTo = function (quarterTurns) {
+    const rad = (Number(quarterTurns) || 0) * (Math.PI / 2);
+    app.setSpectatorCameraYaw(rad);
+  };
 
   function installPlayControls() {
     const controls = document.querySelector(".mazebench-controls");

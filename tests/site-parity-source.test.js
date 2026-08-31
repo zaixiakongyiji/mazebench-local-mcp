@@ -99,7 +99,9 @@ try {
     "the browser code must be bound to the verifier held only by the local server"
   );
   const remoteConfigMode = fs.statSync(path.join(remoteConfigRoot, "data", "remote.json")).mode & 0o777;
-  assert.equal(remoteConfigMode, 0o600, "the local hosted-session cache must be owner-readable only");
+  if (process.platform !== "win32") {
+    assert.equal(remoteConfigMode, 0o600, "the local hosted-session cache must be owner-readable only");
+  }
 } finally {
   fs.rmSync(remoteConfigRoot, { recursive: true, force: true });
 }
@@ -157,7 +159,7 @@ assert.match(pages, /data-execution="local"/);
 assert.match(pages, /id="local-run-status"/);
 assert.match(pages, /Local isolated[\s\S]*?Docker · game \+ optional Python/);
 assert.doesNotMatch(agentScript, /provider-card__avail/);
-assert.match(pages, /<h3>Harness<\/h3>/);
+assert.match(pages, /<h3[^>]*>Harness<\/h3>/);
 assert.match(pages, /window\.__PLAY_WORLD_DATA__/);
 assert.match(pages, /maze-frame is-loading/);
 assert.match(pages, /class="maze-load-label">Loading</);

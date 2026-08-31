@@ -4,6 +4,7 @@ const { URL } = require("url");
 const { isLoopbackHost, isLoopbackPeer } = require("./network");
 
 const PREVIEW_REQUEST_BODY_MAX_BYTES = 20 * 1024 * 1024;
+const EXTERNAL_PLAY_BLOB_MAX_BYTES = 10 * 1024 * 1024;
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 function createRequestRouter({
@@ -11,6 +12,8 @@ function createRequestRouter({
   buildMazePreviewData,
   buildMazeWorldMapEditorData,
   buildWorlds,
+  capabilities = { external_play: true, local_mcp: true, prime_integration: false, training: false },
+  externalPlay,
   getContentType,
   getEditableLevel,
   getGame,
@@ -27,6 +30,8 @@ function createRequestRouter({
   renderAgentRunPage,
   renderAuthorPage,
   renderBuildPage,
+  renderExternalPlayLandingPage,
+  renderExternalPlayRunPage,
   renderFlyoverPage,
   renderGamePage,
   renderHomePage,
@@ -97,6 +102,526 @@ function createRequestRouter({
       return;
     }
 
+    if (url.pathname === "/external-play" || (segments.length === 1 && segments[0] === "external-play")) {
+      if (externalPlay) {
+        sendHtml(
+          response,
+          200,
+          renderExternalPlayLandingPage({
+            activeRun: externalPlay.getRun(externalPlay.activeRunId),
+            runs: Array.from(externalPlay.runs.values())
+          })
+        );
+        return;
+      }
+      sendHtml(response, 404, renderNotFound());
+      return;
+    }
+
+    if (segments.length === 2 && segments[0] === "external-play") {
+      const runId = segments[1];
+      const run = externalPlay ? externalPlay.getRun(runId) : null;
+      if (!run) {
+        sendHtml(response, 404, renderNotFound());
+        return;
+      }
+      sendHtml(response, 200, renderExternalPlayRunPage(run));
+      return;
+    }
+
+    // External Play APIs
+    if (segments[0] === "api" && segments[1] === "external-play") {
+      if (!externalPlay) {
+        sendJson(response, 503, { error: "External play service not initialized", code: "SERVICE_UNAVAILABLE" });
+        return;
+      }
+
+      // 1. Health
+      if (segments.length === 3 && segments[2] === "health") {
+        if (request.method !== "GET") {
+          response.writeHead(405, { Allow: "GET" });
+          response.end();
+          return;
+        }
+        sendJson(response, 200, {
+          status: "ok",
+          service_state: externalPlay.serviceState,
+          instance_id: externalPlay.instanceId,
+          active_run_id: externalPlay.activeRunId
+        });
+        return;
+      }
+
+      // Check INITIALIZING state for all other external API calls
+      if (externalPlay.serviceState === "INITIALIZING") {
+        sendJson(response, 503, { error: "Service is initializing", code: "INITIALIZING" });
+        return;
+      }
+
+      // 2. Controller Session
+      if (segments.length === 4 && segments[2] === "controller" && segments[3] === "session") {
+        if (request.method !== "POST") {
+          response.writeHead(405, { Allow: "POST" });
+          response.end();
+          return;
+        }
+        const payload = await readJsonBody(request);
+        try {
+          const nonce = payload.mcp_bootstrap_nonce || payload.nonce;
+          const res = await externalPlay.handleControllerSession(nonce, payload.clientInfo);
+          sendJson(response, 200, res);
+        } catch (err) {
+          sendJson(response, err.status || 403, { error: err.message, code: err.code || "FORBIDDEN" });
+        }
+        return;
+      }
+
+      // 4. MCP Proxy
+      if (segments.length === 3 && segments[2] === "mcp") {
+        if (request.method !== "POST") {
+          response.writeHead(405, { Allow: "POST" });
+          response.end();
+          return;
+        }
+        const controllerInfo = externalPlay.validateControllerToken(request.headers.authorization);
+        if (!controllerInfo) {
+          sendJson(response, 401, { error: "Unauthorized controller token", code: "UNAUTHORIZED" });
+          return;
+        }
+        const payload = await readJsonBody(request);
+        const run = externalPlay.getRun(payload.run_id);
+        if (!run) {
+          sendJson(response, 404, { error: `Run not found: ${payload.run_id}`, code: "NOT_FOUND" });
+          return;
+        }
+
+        const requestAbort = new AbortController();
+        let requestFinished = false;
+        const abortOnDisconnect = () => {
+          if (!requestFinished) requestAbort.abort();
+        };
+        response.once("close", abortOnDisconnect);
+
+        try {
+          let res;
+          if (payload.tool === "start") {
+            res = await run.startOrAttach(controllerInfo, payload.operation_id, requestAbort.signal);
+          } else if (payload.tool === "observe") {
+            const obs = await run.observe();
+            res = {
+              result: {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(obs)
+                  }
+                ],
+                isError: false
+              },
+              ...obs
+            };
+          } else {
+            res = await run.executeAction(
+              controllerInfo,
+              payload.lease_id,
+              payload.lease_epoch,
+              payload.tool,
+              payload.arguments,
+              payload.operation_id,
+              requestAbort.signal
+            );
+          }
+          if (!requestAbort.signal.aborted) sendJson(response, 200, res);
+        } catch (err) {
+          if (!requestAbort.signal.aborted) {
+            sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+          }
+        } finally {
+          requestFinished = true;
+          response.off("close", abortOnDisconnect);
+        }
+        return;
+      }
+
+      // 5. Lease Heartbeat
+      if (segments.length === 4 && segments[2] === "lease" && segments[3] === "heartbeat") {
+        if (request.method !== "POST") {
+          response.writeHead(405, { Allow: "POST" });
+          response.end();
+          return;
+        }
+        const controllerInfo = externalPlay.validateControllerToken(request.headers.authorization);
+        if (!controllerInfo) {
+          sendJson(response, 401, { error: "Unauthorized controller token", code: "UNAUTHORIZED" });
+          return;
+        }
+        const payload = await readJsonBody(request);
+        const run = externalPlay.getRun(payload.run_id);
+        if (!run) {
+          sendJson(response, 404, { error: `Run not found: ${payload.run_id}`, code: "NOT_FOUND" });
+          return;
+        }
+        try {
+          const res = await run.heartbeat(controllerInfo, payload.lease_id, payload.lease_epoch);
+          sendJson(response, 200, res);
+        } catch (err) {
+          sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+        }
+        return;
+      }
+
+      // 6. Lease Detach
+      if (segments.length === 4 && segments[2] === "lease" && segments[3] === "detach") {
+        if (request.method !== "POST") {
+          response.writeHead(405, { Allow: "POST" });
+          response.end();
+          return;
+        }
+        const controllerInfo = externalPlay.validateControllerToken(request.headers.authorization);
+        if (!controllerInfo) {
+          sendJson(response, 401, { error: "Unauthorized controller token", code: "UNAUTHORIZED" });
+          return;
+        }
+        const payload = await readJsonBody(request);
+        const run = externalPlay.getRun(payload.run_id);
+        if (!run) {
+          sendJson(response, 404, { error: `Run not found: ${payload.run_id}`, code: "NOT_FOUND" });
+          return;
+        }
+        try {
+          const res = await run.detach(controllerInfo, payload.lease_id, payload.lease_epoch);
+          sendJson(response, 200, res);
+        } catch (err) {
+          sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+        }
+        return;
+      }
+
+      // 7. Runs Collection: GET /runs & POST /runs
+      if (segments.length === 3 && segments[2] === "runs") {
+        if (request.method === "GET") {
+          const runsList = Array.from(externalPlay.runs.values()).map((r) => ({
+            run_id: r.runId,
+            status: r.status,
+            started_at: r.startedAt,
+            deadline_at: r.deadlineAt,
+            duration_ms: r.durationMs,
+            win_threshold: r.winThreshold,
+            manifest: r.manifest
+          }));
+          sendJson(response, 200, { runs: runsList, active_run_id: externalPlay.activeRunId });
+          return;
+        }
+        if (request.method === "POST") {
+          const payload = await readJsonBody(request);
+          try {
+            const run = await externalPlay.createRun({
+              durationMs: payload.duration_ms !== undefined ? payload.duration_ms : undefined,
+              winThreshold: payload.win_threshold !== undefined ? payload.win_threshold : undefined,
+              modelName: payload.model_name || undefined,
+              harnessName: payload.harness_name || undefined
+            });
+            sendJson(response, 201, { run_id: run.runId, status: run.status });
+          } catch (err) {
+            sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+          }
+          return;
+        }
+        response.writeHead(405, { Allow: "GET, POST" });
+        response.end();
+        return;
+      }
+
+      // 8. Individual Run Operations / Data
+      if (segments.length >= 4 && segments[2] === "runs") {
+        const runId = segments[3];
+        const run = externalPlay.getRun(runId);
+        if (!run) {
+          sendJson(response, 404, { error: `Run not found: ${runId}`, code: "NOT_FOUND" });
+          return;
+        }
+
+        // Cancel: POST /api/external-play/runs/:runId/cancel
+        if (segments.length === 5 && segments[4] === "cancel") {
+          if (request.method !== "POST") {
+            response.writeHead(405, { Allow: "POST" });
+            response.end();
+            return;
+          }
+          const res = await run.cancelRun();
+          sendJson(response, 200, res);
+          return;
+        }
+
+        // Viewer Token: POST /api/external-play/runs/:runId/viewer-token
+        if (segments.length === 5 && segments[4] === "viewer-token") {
+          if (request.method !== "POST") {
+            response.writeHead(405, { Allow: "POST" });
+            response.end();
+            return;
+          }
+          const viewerToken = externalPlay.generateViewerToken(runId);
+          sendJson(response, 200, { viewer_token: viewerToken });
+          return;
+        }
+
+        // Helper for viewer auth
+        const authHeader = request.headers.authorization || "";
+        const tokenMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+        const token = tokenMatch ? tokenMatch[1] : null;
+        const hasViewerToken = externalPlay.validateViewerToken(token, runId);
+
+        if (!hasViewerToken) {
+          sendJson(response, 401, { error: "Viewer token required", code: "UNAUTHORIZED" });
+          return;
+        }
+
+        // Snapshot: GET /api/external-play/runs/:runId/snapshot
+        if (segments.length === 5 && segments[4] === "snapshot") {
+          if (request.method !== "GET") {
+            response.writeHead(405, { Allow: "GET" });
+            response.end();
+            return;
+          }
+          sendJson(response, 200, {
+            base_viewer_state: run.baseViewerState,
+            world_bundle_digest: run.worldBundleDigest,
+            action_seq: run.lastActionSeq,
+            as_of_event_id: run.lastEventId,
+            status: run.status,
+            started_at: run.startedAt,
+            deadline_at: run.deadlineAt,
+            duration_ms: run.durationMs,
+            win_threshold: run.winThreshold,
+            model_name: run.modelName,
+            harness_name: run.harnessName,
+            viewer_state_hash: run.currentViewerStateHash
+          });
+          return;
+        }
+
+        // Actions: GET /api/external-play/runs/:runId/actions
+        if (segments.length === 5 && segments[4] === "actions") {
+          if (request.method !== "GET") {
+            response.writeHead(405, { Allow: "GET" });
+            response.end();
+            return;
+          }
+          const fromSeq = Number(url.searchParams.get("from_seq") || 1);
+          const toSeq = url.searchParams.has("to_seq")
+            ? Number(url.searchParams.get("to_seq"))
+            : run.lastActionSeq;
+          const limit = Number(url.searchParams.get("limit") || 500);
+          if (
+            !Number.isInteger(fromSeq) || fromSeq < 1
+            || !Number.isInteger(toSeq) || toSeq < 0 || toSeq < fromSeq - 1
+            || !Number.isInteger(limit) || limit < 1 || limit > 500
+          ) {
+            sendJson(response, 400, { error: "Invalid actions pagination parameters", code: "INVALID_ARGUMENT" });
+            return;
+          }
+
+          const actions = [];
+          if (run.actionsPath && fs.existsSync(run.actionsPath)) {
+            const content = fs.readFileSync(run.actionsPath, "utf8");
+            const lines = content.split("\n").filter((l) => l.trim().length > 0);
+            for (const line of lines) {
+              const act = JSON.parse(line);
+              if (act.seq >= fromSeq && act.seq <= toSeq) {
+                actions.push(act);
+                if (actions.length >= limit) break;
+              }
+            }
+          }
+
+          const lastReturnedSeq = actions.length > 0 ? actions[actions.length - 1].seq : fromSeq - 1;
+          const hasMore = lastReturnedSeq < toSeq && lastReturnedSeq < run.lastActionSeq;
+          const nextSeq = hasMore ? lastReturnedSeq + 1 : null;
+
+          sendJson(response, 200, {
+            ok: true,
+            run_id: run.runId,
+            from_seq: fromSeq,
+            to_seq: toSeq,
+            limit,
+            count: actions.length,
+            has_more: hasMore,
+            next_seq: nextSeq,
+            actions
+          });
+          return;
+        }
+
+        // Events (SSE): GET /api/external-play/runs/:runId/events
+        if (segments.length === 5 && segments[4] === "events") {
+          if (request.method !== "GET") {
+            response.writeHead(405, { Allow: "GET" });
+            response.end();
+            return;
+          }
+
+          const afterEventIdStr = url.searchParams.get("after_event_id") || request.headers["last-event-id"];
+          const afterEventId = afterEventIdStr !== undefined && afterEventIdStr !== null ? Number(afterEventIdStr) : 0;
+
+          if (afterEventIdStr !== undefined && afterEventIdStr !== null && afterEventIdStr !== "") {
+            if (!Number.isInteger(afterEventId) || afterEventId < 0) {
+              sendJson(response, 410, {
+                error: "Event cursor expired or invalid",
+                code: "CURSOR_EXPIRED",
+                latest_event_id: run.lastEventId
+              });
+              return;
+            }
+            if (afterEventId > run.lastEventId) {
+              sendJson(response, 409, {
+                error: "Event ID gap detected",
+                code: "EVENT_GAP",
+                latest_event_id: run.lastEventId
+              });
+              return;
+            }
+          }
+
+          response.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive"
+          });
+          response.flushHeaders?.();
+
+          // Replay past events from journal
+          let replayActionSeq = 0;
+          if (fs.existsSync(run.journalPath)) {
+            const content = fs.readFileSync(run.journalPath, "utf8");
+            const lines = content.split("\n").filter((l) => l.trim().length > 0);
+            for (const line of lines) {
+              const rec = JSON.parse(line);
+              let sseData = null;
+              if (rec.type === "action_committed") {
+                replayActionSeq = rec.action_seq;
+                if (rec.event_id > afterEventId) {
+                  sseData = {
+                    event_id: rec.event_id,
+                    type: "action",
+                    action_seq: rec.action_seq,
+                    tool: rec.action_record.tool,
+                    action_record: rec.action_record
+                  };
+                }
+              } else if (rec.type === "action_rejected" && rec.event_id > afterEventId) {
+                sseData = {
+                  event_id: rec.event_id,
+                  type: "action_rejected",
+                  action_seq: replayActionSeq,
+                  tool: rec.tool,
+                  error: rec.error_payload.message
+                };
+              } else if ((rec.type === "run_finalized" || rec.type === "run_failed") && rec.ended_event_id > afterEventId) {
+                sseData = {
+                  event_id: rec.ended_event_id,
+                  type: "ended",
+                  action_seq: run.lastActionSeq,
+                  outcome: rec.outcome,
+                  summary_digest: rec.summary_digest || rec.partial_summary_digest || null,
+                  summary_url: rec.final_response?.summary_url || null
+                };
+              }
+              if (sseData) {
+                response.write(`id: ${sseData.event_id}\nevent: ${sseData.type}\ndata: ${JSON.stringify(sseData)}\n\n`);
+              }
+            }
+          }
+
+          // Register subscriber for live fanout if run is not terminal
+          if (["armed", "active", "finalizing"].includes(run.status)) {
+            run.subscribers.add(response);
+          } else {
+            response.end();
+            return;
+          }
+
+          const heartbeatInterval = setInterval(() => {
+            try {
+              response.write(": heartbeat\n\n");
+            } catch (_e) {
+              clearInterval(heartbeatInterval);
+              run.subscribers.delete(response);
+            }
+          }, 15000);
+
+          request.on("close", () => {
+            clearInterval(heartbeatInterval);
+            run.subscribers.delete(response);
+          });
+          return;
+        }
+
+        // Blobs: GET /api/external-play/runs/:runId/blobs/:digest
+        if (segments.length === 6 && segments[4] === "blobs") {
+          if (request.method !== "GET") {
+            response.writeHead(405, { Allow: "GET" });
+            response.end();
+            return;
+          }
+          const digest = segments[5];
+          if (!/^[0-9a-f]{64}$/.test(digest)) {
+            sendJson(response, 400, { error: "Invalid digest format", code: "INVALID_ARGUMENT" });
+            return;
+          }
+          const blobPath = path.join(run.blobsDir, `${digest}.json`);
+          if (!fs.existsSync(blobPath)) {
+            sendJson(response, 404, { error: "Blob not found", code: "NOT_FOUND" });
+            return;
+          }
+          if (fs.statSync(blobPath).size > EXTERNAL_PLAY_BLOB_MAX_BYTES) {
+            sendJson(response, 413, { error: "Blob exceeds the 10MB response limit", code: "PAYLOAD_TOO_LARGE" });
+            return;
+          }
+          response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+          sendFile(request, response, blobPath, "application/json");
+          return;
+        }
+
+        // World bundle: GET /api/external-play/runs/:runId/world-bundle
+        if (segments.length === 5 && segments[4] === "world-bundle") {
+          if (request.method !== "GET") {
+            response.writeHead(405, { Allow: "GET" });
+            response.end();
+            return;
+          }
+          if (fs.existsSync(run.worldBundlePath)) {
+            sendFile(request, response, run.worldBundlePath, "application/json");
+            return;
+          }
+          sendJson(response, 404, { error: "Frozen world bundle is unavailable", code: "NOT_FOUND" });
+          return;
+        }
+
+        // Summary: GET /api/external-play/runs/:runId/summary
+        if (segments.length === 5 && segments[4] === "summary") {
+          if (request.method !== "GET") {
+            response.writeHead(405, { Allow: "GET" });
+            response.end();
+            return;
+          }
+          if (!fs.existsSync(run.summaryPath)) {
+            sendJson(response, 404, { error: "Summary not available yet", code: "NOT_FOUND" });
+            return;
+          }
+          sendFile(request, response, run.summaryPath, "application/json");
+          return;
+        }
+      }
+
+      sendJson(response, 404, { error: "Endpoint not found", code: "NOT_FOUND" });
+      return;
+    }
+
+    if (url.pathname === "/api/capabilities" && request.method === "GET") {
+      sendJson(response, 200, { capabilities });
+      return;
+    }
+
     if (url.pathname === "/agent") {
       sendHtml(response, 200, renderAgentPage());
       return;
@@ -113,11 +638,19 @@ function createRequestRouter({
         response.end();
         return;
       }
+      if (!capabilities.training) {
+        sendJson(response, 400, { error: "Prime training integration is disabled.", code: "INTEGRATION_DISABLED" });
+        return;
+      }
       sendJson(response, 200, await training.bootstrapAsync({ fresh: url.searchParams.get("refresh") === "1" }));
       return;
     }
 
     if (url.pathname === "/api/train/runs") {
+      if (!capabilities.training) {
+        sendJson(response, 400, { error: "Prime training integration is disabled.", code: "INTEGRATION_DISABLED" });
+        return;
+      }
       if (request.method === "GET") {
         sendJson(response, 200, await training.listRunsAsync({
           limit: Number(url.searchParams.get("limit")) || 10
@@ -384,6 +917,10 @@ function createRequestRouter({
       }
 
       if (segments[4] === "prime-sync" && request.method === "POST") {
+        if (!capabilities.prime_integration) {
+          sendJson(response, 400, { error: "Prime integration is disabled.", code: "INTEGRATION_DISABLED" });
+          return;
+        }
         const run = agentRuns.syncPrimeEvaluation(runId);
         sendJson(response, 202, { run, message: "Prime evaluation sync started." });
         return;

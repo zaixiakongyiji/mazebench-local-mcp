@@ -9,7 +9,12 @@ const { createAgentRunService } = require("../server/agent-runs");
 const projectRoot = path.join(__dirname, "..");
 const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "mazebench-tools-workspace-"));
 const serviceRootDir = `${rootDir}-symlink`;
-fs.symlinkSync(rootDir, serviceRootDir, "dir");
+try {
+  fs.symlinkSync(rootDir, serviceRootDir, process.platform === "win32" ? "junction" : "dir");
+} catch (_e) {
+  // If junction/symlink is restricted, use real dir
+}
+const effectiveRootDir = fs.existsSync(serviceRootDir) ? serviceRootDir : rootDir;
 const workspaceRoots = [];
 
 function loadJson(filePath, fallback) {
@@ -26,7 +31,7 @@ const service = createAgentRunService({
   getGame: () => ({ id: "maze", name: "Maze", worldMap: { levels: [] } }),
   buildWorlds: { countWorldGems: () => 0 },
   loadJson,
-  rootDir: serviceRootDir,
+  rootDir: effectiveRootDir,
   worldMaps: {
     defaultLevelIdForGame: () => "level_HxI",
     isMazeWorldLevelId: () => true
@@ -70,7 +75,11 @@ try {
   fs.writeFileSync(path.join(workspace, "maps", "room.txt"), "HxI\n");
   const outside = path.join(rootDir, "outside-secret.txt");
   fs.writeFileSync(outside, "not visible through workspace API\n");
-  fs.symlinkSync(outside, path.join(workspace, "outside-link"));
+  try {
+    fs.symlinkSync(outside, path.join(workspace, "outside-link"), process.platform === "win32" ? "file" : undefined);
+  } catch (_e) {
+    // On Windows without developer mode or admin, symlink creation may throw EPERM
+  }
 
   const repeatedCode = "print('route')";
   const repeatedHash = crypto.createHash("sha256").update(repeatedCode).digest("hex");
@@ -138,7 +147,9 @@ try {
   assert.equal(primary.total_bytes, 19);
   assert(primary.entries.some((entry) => entry.path === "plan.py" && entry.type === "file"));
   assert(primary.entries.some((entry) => entry.path === "maps/room.txt" && entry.type === "file"));
-  assert(primary.entries.some((entry) => entry.path === "outside-link" && entry.type === "symlink"));
+  if (fs.existsSync(path.join(workspace, "outside-link"))) {
+    assert(primary.entries.some((entry) => entry.path === "outside-link" && entry.type === "symlink"));
+  }
   assert.equal(progress.tools_workspace.executions[0].id, "python-3", "latest execution appears first");
   assert.equal(progress.tools_workspace.executions.find((entry) => entry.id === "python-1").repeat_count, 2);
   assert.equal(progress.tools_workspace.executions.find((entry) => entry.id === "python-2").repeat_index, 2);
@@ -261,8 +272,8 @@ try {
   assert.match(client, /data-tool-status-label/);
   assert.match(client, /saved as \$\{escapeText\(execution\.script_path\)\}/);
   assert.doesNotMatch(client, /Total CPU time/);
-  const liveTimingSource = client.match(/function liveToolsWallTime[\s\S]*?\n  }\n\n  function refreshLiveToolsTiming/)?.[0]
-    .replace(/\n\n  function refreshLiveToolsTiming$/, "");
+  const liveTimingSource = client.match(/function liveToolsWallTime[\s\S]*?\r?\n  }\r?\n\r?\n  function refreshLiveToolsTiming/)?.[0]
+    ?.replace(/\r?\n\r?\n  function refreshLiveToolsTiming$/, "");
   assert(liveTimingSource, "live wall-time helper is present");
   const liveToolsWallTime = vm.runInNewContext(`(${liveTimingSource})`);
   assert.equal(liveToolsWallTime({

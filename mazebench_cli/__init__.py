@@ -57,10 +57,13 @@ Interactive ASCII game (arrow-key controls):
 Model-facing JSON observation (literal names by default):
   mazebench json [--level CxD] [--omniscient] [--hide-names]
 
+Local stdio MCP server for Codex & Claude Desktop:
+  mazebench mcp
+
 Interactive command REPL:
   mazebench play [level=HxI view=top-diagonal]
 
-Prime Intellect Verifiers:
+Prime Intellect Verifiers (requires MAZEBENCH_ENABLE_PRIME=1):
   mazebench prime install
   mazebench prime eval   [model=openai/gpt-5-nano n=1 r=1 max_turns=8]
   mazebench prime vision [model=openai/gpt-4.1-mini width=512 height=512 max_turns=8]
@@ -365,9 +368,22 @@ def _wait_for_state(pid: int, timeout: float = 6.0) -> dict | None:
     return None
 
 
+def run_mcp(root: Path, flags: list[str]) -> int:
+    """Run the local stdio MCP server adapter for Codex / Claude Desktop."""
+    _require(_node_bin(), "Install Node.js (the MCP adapter runs on Node).")
+    cmd = [_node_bin(), str(root / "scripts" / "maze-external-mcp.js"), *flags]
+    return subprocess.call(cmd, cwd=str(root))
+
+
 def _open_when_ready(pid: int, fallback_url: str) -> None:
     state = _wait_for_state(pid)
-    webbrowser.open(state["url"] if state and state.get("url") else fallback_url)
+    if state and state.get("url"):
+        url = state["url"]
+        target = f"{url}/external-play"
+        webbrowser.open(target)
+    else:
+        target = f"{fallback_url}/external-play" if not fallback_url.endswith("/external-play") else fallback_url
+        webbrowser.open(target)
 
 
 def _is_on(value: str) -> bool:
@@ -397,26 +413,29 @@ def run_launch(
             file=sys.stderr,
         )
         if open_browser and url:
-            webbrowser.open(url)
+            webbrowser.open(f"{url}/external-play")
         return 0
 
     try:
-        preferred = int(pairs.get("port", "3000") or "3000")
+        port = int(pairs.get("port", "3000") or "3000")
     except ValueError:
-        preferred = 3000
-    port = _find_free_port(host, preferred)
-    if port != preferred:
-        print(
-            f"mazebench: port {preferred} is busy — using {port} instead.",
-            file=sys.stderr,
-        )
+        port = 3000
 
     state_file = _state_file()
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    _clear_state()
+    duration = pairs.get("duration", pairs.get("duration_ms", ""))
+    win_threshold = pairs.get("win_threshold", pairs.get("win-threshold", ""))
     env = dict(
-        os.environ, PORT=str(port), HOST=host, MAZEBENCH_STATE_FILE=str(state_file)
+        os.environ,
+        PORT=str(port),
+        HOST=host,
+        MAZEBENCH_HOME=str(_mazebench_home()),
+        MAZEBENCH_STATE_FILE=str(state_file),
     )
+    if duration:
+        env["MAZEBENCH_DURATION_MS"] = str(duration)
+    if win_threshold:
+        env["MAZEBENCH_WIN_THRESHOLD"] = str(win_threshold)
     display_host = "localhost" if host in ("0.0.0.0", "::") else host
     url = f"http://{display_host}:{port}"
     cmd = [_node_bin(), str(root / "server.js"), *flags]
@@ -448,7 +467,7 @@ def run_launch(
             file=sys.stderr,
         )
         if open_browser:
-            webbrowser.open(state["url"])
+            webbrowser.open(f"{state['url']}/external-play")
         return 0
 
     print(
@@ -541,6 +560,10 @@ def run_build(root: Path, pairs: dict[str, str], flags: list[str]) -> int:
 def run_prime(
     root: Path, words: list[str], pairs: dict[str, str], flags: list[str]
 ) -> int:
+    if os.environ.get("MAZEBENCH_ENABLE_PRIME") != "1":
+        raise CliError(
+            "Prime integration is disabled. Set MAZEBENCH_ENABLE_PRIME=1 to enable."
+        )
     action = (words[0] if words else pairs.get("action") or "help").lower()
     env_dir = root / "environments" / "mazebench"
 
@@ -632,6 +655,8 @@ def main(argv: list[str] | None = None) -> int:
         root = resolve_root()
         command = words[0].lower() if words else ""
 
+        if command == "mcp":
+            return run_mcp(root, flags)
         if command in ("launch", "serve", "site", "web"):
             return run_launch(root, words[1:], pairs, flags)
         if command in ("stop", "shutdown", "kill"):

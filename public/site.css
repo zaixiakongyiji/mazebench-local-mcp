@@ -716,3 +716,27 @@ body.play-mode .build-stamp {
   }
 
 }
+
+.lang-toggle-btn {
+  background: rgba(52, 231, 240, 0.08);
+  border: 1px solid rgba(52, 231, 240, 0.25);
+  color: var(--cyan);
+  border-radius: 20px;
+  padding: 5px 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s ease;
+  user-select: none;
+  margin-left: 8px;
+}
+
+.lang-toggle-btn:hover {
+  background: rgba(52, 231, 240, 0.18);
+  border-color: rgba(52, 231, 240, 0.5);
+  box-shadow: 0 0 12px rgba(52, 231, 240, 0.3);
+  color: #fff;
+}
