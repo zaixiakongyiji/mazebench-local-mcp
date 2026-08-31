@@ -281,6 +281,62 @@ async function runMcpTests() {
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(activeRun.lastActionSeq, actionSeqBeforeActiveCancel, "cancelled pre-WAL action must not commit");
 
+    // 11. Reconfigured run auto-recovery: cancel current run and create a new armed run
+    console.log("  [Test 11] Reconfigured run auto-recovery on start");
+    await activeRun._startFinalize("cancelled", "reconfigured_before_start");
+    while (activeRun.status === "finalizing") {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const replacementRun = await externalPlay.createRun({ durationMs: 1800000 });
+    assert.equal(externalPlay.activeRunId, replacementRun.runId);
+
+    // Call start on MCP client without arguments; MCP should auto-sync and start the replacement run
+    const reconfigStartRes = await client.sendRequest(15, "tools/call", {
+      name: "start",
+      arguments: {}
+    });
+    assert.ok(reconfigStartRes.result);
+    assert.equal(reconfigStartRes.result.isError, false);
+    const reconfigPayload = JSON.parse(reconfigStartRes.result.content[0].text);
+    assert.equal(reconfigPayload.run_id, replacementRun.runId);
+    assert.equal(reconfigPayload.status, "active");
+
+    // 12. Explicit run_id argument support
+    console.log("  [Test 12] Explicit run_id argument support for start");
+    // Finalize replacement run
+    await replacementRun._startFinalize("won", "test completed");
+    while (replacementRun.status === "finalizing") {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // Create new armed run
+    const explicitRun = await externalPlay.createRun({ durationMs: 1800000 });
+    const explicitStartRes = await client.sendRequest(16, "tools/call", {
+      name: "start",
+      arguments: { run_id: explicitRun.runId }
+    });
+    assert.ok(explicitStartRes.result);
+    assert.equal(explicitStartRes.result.isError, false);
+    const explicitPayload = JSON.parse(explicitStartRes.result.content[0].text);
+    assert.equal(explicitPayload.run_id, explicitRun.runId);
+    assert.equal(explicitPayload.status, "active");
+
+    // 13. Auto-creation of armed run when all runs are terminal
+    console.log("  [Test 13] Auto-create armed run when starting on terminal state");
+    await explicitRun._startFinalize("cancelled", "User requested manual cancellation");
+    while (explicitRun.status === "finalizing") {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const autoCreateStartRes = await client.sendRequest(17, "tools/call", {
+      name: "start",
+      arguments: {}
+    });
+    assert.ok(autoCreateStartRes.result);
+    assert.equal(autoCreateStartRes.result.isError, false);
+    const autoCreatePayload = JSON.parse(autoCreateStartRes.result.content[0].text);
+    assert.ok(autoCreatePayload.run_id);
+    assert.notEqual(autoCreatePayload.run_id, explicitRun.runId);
+    assert.equal(autoCreatePayload.status, "active");
+
     console.log("All maze-external-mcp stdio adapter tests PASSED!");
   } finally {
     if (child) {

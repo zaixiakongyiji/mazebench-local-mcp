@@ -33,7 +33,13 @@ const TOOLS_MANIFEST = [
   {
     name: "start",
     description: "Claim and start the currently armed MazeBench game session, starting the timer.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "Optional specific run ID to start or claim." }
+      },
+      additionalProperties: false
+    }
   },
   {
     name: "observe",
@@ -477,15 +483,26 @@ class StdioMcpAdapter {
 
       try {
         let proxyRes;
+        let targetRunId = toolArgs?.run_id || null;
+
+        if (toolName === "start" && !targetRunId) {
+          try {
+            const health = await this.httpRequest("GET", "/api/external-play/health");
+            if (health?.active_run_id) {
+              this.activeRunId = health.active_run_id;
+            }
+          } catch (_e) {}
+        }
+
         try {
-          if (!this.activeRunId) {
+          if (!this.activeRunId && !targetRunId) {
             await this.connectServer(true);
           }
           proxyRes = await this.httpRequest(
             "POST",
             "/api/external-play/mcp",
             {
-              run_id: this.activeRunId,
+              run_id: targetRunId || this.activeRunId,
               tool: toolName,
               arguments: toolArgs,
               lease_id: this.leaseId,
@@ -499,16 +516,20 @@ class StdioMcpAdapter {
           if (
             requestErr.statusCode === 401 ||
             requestErr.statusCode === 403 ||
-            requestErr.statusCode === 404
+            requestErr.statusCode === 404 ||
+            (toolName === "start" && requestErr.statusCode === 409)
           ) {
             logStderr(`Request failed with status ${requestErr.statusCode}. Attempting to reconnect...`);
-            this.controllerToken = null;
+            if (requestErr.statusCode === 401 || requestErr.statusCode === 403) {
+              this.controllerToken = null;
+            }
             await this.connectServer(true);
+            targetRunId = toolArgs?.run_id || this.activeRunId;
             proxyRes = await this.httpRequest(
               "POST",
               "/api/external-play/mcp",
               {
-                run_id: this.activeRunId,
+                run_id: targetRunId || this.activeRunId,
                 tool: toolName,
                 arguments: toolArgs,
                 lease_id: this.leaseId,
@@ -537,6 +558,9 @@ class StdioMcpAdapter {
         }
 
         if (toolName === "start") {
+          if (proxyRes.run_id) {
+            this.activeRunId = proxyRes.run_id;
+          }
           if (proxyRes.lease_id && proxyRes.lease_epoch) {
             this.leaseId = proxyRes.lease_id;
             this.leaseEpoch = proxyRes.lease_epoch;

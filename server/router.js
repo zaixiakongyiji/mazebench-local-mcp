@@ -189,7 +189,20 @@ function createRequestRouter({
           return;
         }
         const payload = await readJsonBody(request);
-        const run = externalPlay.getRun(payload.run_id);
+        let run = payload.run_id ? externalPlay.getRun(payload.run_id) : null;
+
+        if (payload.tool === "start") {
+          const isTerminal = !run || ["won", "timed_out", "cancelled", "failed"].includes(run.status);
+          if (isTerminal) {
+            const activeRun = externalPlay.getRun(externalPlay.activeRunId);
+            if (activeRun && ["armed", "active"].includes(activeRun.status)) {
+              run = activeRun;
+            } else {
+              run = await externalPlay.createRun();
+            }
+          }
+        }
+
         if (!run) {
           sendJson(response, 404, { error: `Run not found: ${payload.run_id}`, code: "NOT_FOUND" });
           return;
