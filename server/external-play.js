@@ -142,8 +142,7 @@ class ExternalPlayService {
 
     this.serverPort = options.port || 3000;
     this.serverHost = options.host || "127.0.0.1";
-    this.defaultDurationMs = options.defaultDurationMs || 1800000;
-    this.defaultWinThreshold = options.defaultWinThreshold || 10;
+    this.defaultMaxActions = options.defaultMaxActions || 256;
   }
 
   async initialize() {
@@ -310,8 +309,7 @@ class ExternalPlayService {
     } else {
       // No non-terminal runs -> create default armed run
       const newRun = await this._createArmedRunInternal({
-        durationMs: this.defaultDurationMs,
-        winThreshold: this.defaultWinThreshold
+        maxActions: this.defaultMaxActions
       });
       this.activeRunId = newRun.runId;
     }
@@ -323,8 +321,10 @@ class ExternalPlayService {
     fs.mkdirSync(runDir, { recursive: true });
     fs.mkdirSync(path.join(runDir, "blobs"), { recursive: true });
 
-    const durationMs = options.durationMs || this.defaultDurationMs;
-    const winThreshold = options.winThreshold || this.defaultWinThreshold;
+    const usesLegacyDuration = options.durationMs !== undefined && options.maxActions === undefined;
+    const durationMs = usesLegacyDuration ? options.durationMs : null;
+    const maxActions = usesLegacyDuration ? null : (options.maxActions || this.defaultMaxActions);
+    const winThreshold = options.winThreshold || null;
     const modelName = options.modelName || null;
     const harnessName = options.harnessName || null;
 
@@ -340,8 +340,8 @@ class ExternalPlayService {
       execution_class: "external-unverified",
       benchmark_eligible: false,
       created_at: new Date().toISOString(),
-      duration_ms: durationMs,
-      win_threshold: winThreshold
+      ...(maxActions ? { max_actions: maxActions } : { duration_ms: durationMs }),
+      ...(winThreshold ? { win_threshold: winThreshold } : {})
     };
 
     if (!validateManifest(manifest)) {
@@ -355,7 +355,7 @@ class ExternalPlayService {
     // Create base session to get base viewer state
     const baseBridgeSession = getBridge().createSession({
       gameId: "maze",
-      gameWonGemCount: winThreshold,
+      gameWonGemCount: 100,
       levelId: "level_HxI",
       pitch: 1,
       yaw: 0,
@@ -373,6 +373,7 @@ class ExternalPlayService {
       baseViewerStateDigest: baseViewerStateHash,
       baseViewerState,
       durationMs,
+      maxActions,
       winThreshold,
       modelName,
       harnessName
@@ -389,8 +390,8 @@ class ExternalPlayService {
       manifest_digest: manifestDigest,
       world_bundle_digest: worldDigest,
       base_viewer_state_digest: baseViewerStateHash,
-      duration_ms: durationMs,
-      win_threshold: winThreshold,
+      ...(maxActions ? { max_actions: maxActions } : { duration_ms: durationMs }),
+      ...(winThreshold ? { win_threshold: winThreshold } : {}),
       model_name: modelName,
       harness_name: harnessName
     };
@@ -475,7 +476,7 @@ class ExternalPlayService {
   }
 
   async createRun(options = {}) {
-    let durationMs = this.defaultDurationMs;
+    let durationMs;
     if (options.durationMs !== undefined) {
       if (!Number.isSafeInteger(options.durationMs) || options.durationMs < 60000 || options.durationMs > 21600000) {
         throw { status: 400, code: "INVALID_ARGUMENT", message: "duration_ms must be an integer between 60000 and 21600000 (60s to 6h)" };
@@ -483,7 +484,18 @@ class ExternalPlayService {
       durationMs = options.durationMs;
     }
 
-    let winThreshold = this.defaultWinThreshold;
+    let maxActions = this.defaultMaxActions;
+    if (options.maxActions !== undefined) {
+      if (!Number.isSafeInteger(options.maxActions) || options.maxActions < 1 || options.maxActions > 100000) {
+        throw { status: 400, code: "INVALID_ARGUMENT", message: "max_actions must be an integer between 1 and 100000" };
+      }
+      maxActions = options.maxActions;
+    } else if (durationMs !== undefined) {
+      // Backward-compatible service API for persisted legacy timed runs and old callers.
+      maxActions = undefined;
+    }
+
+    let winThreshold;
     if (options.winThreshold !== undefined) {
       if (!Number.isSafeInteger(options.winThreshold) || options.winThreshold < 1 || options.winThreshold > 100) {
         throw { status: 400, code: "INVALID_ARGUMENT", message: "win_threshold must be an integer between 1 and 100" };
@@ -493,7 +505,7 @@ class ExternalPlayService {
 
     return await this.admissionMutex.withLock(async () => {
       for (const [, run] of this.runs.entries()) {
-        if (run.finalizeReason === "reconfigured_before_start" || ["won", "timed_out", "cancelled", "failed"].includes(run.status)) {
+        if (run.finalizeReason === "reconfigured_before_start" || ["won", "action_limit", "timed_out", "cancelled", "failed"].includes(run.status)) {
           continue;
         }
         if (["active", "finalizing"].includes(run.status)) {
@@ -512,6 +524,7 @@ class ExternalPlayService {
 
       const run = await this._createArmedRunInternal({
         durationMs,
+        maxActions,
         winThreshold,
         modelName: options.modelName || null,
         harnessName: options.harnessName || null
@@ -566,14 +579,15 @@ class RunInstance {
     this.worldBundlePath = path.join(runDir, "world-bundle.json");
     this.blobsDir = path.join(runDir, "blobs");
 
-    this.status = "armed"; // armed | active | finalizing | won | timed_out | cancelled | failed
+    this.status = "armed"; // armed | active | finalizing | won | action_limit | timed_out | cancelled | failed
     this.outcome = null;
     this.startedAt = null;
     this.deadlineAt = null;
     this.deadlineMonotonicMs = null;
     this.endedAt = null;
-    this.durationMs = manifest.duration_ms || 1800000;
-    this.winThreshold = manifest.win_threshold || 10;
+    this.durationMs = manifest.duration_ms || null;
+    this.maxActions = manifest.max_actions || null;
+    this.winThreshold = manifest.win_threshold || null;
     this.declaredCli = null;
     this.modelName = initialOpts.modelName || null;
     this.harnessName = initialOpts.harnessName || null;
@@ -693,14 +707,15 @@ class RunInstance {
         this.status = "armed";
         this.worldBundleDigest = record.world_bundle_digest;
         this.baseViewerStateDigest = record.base_viewer_state_digest;
-        this.durationMs = record.duration_ms;
-        this.winThreshold = record.win_threshold;
+        this.durationMs = record.duration_ms || null;
+        this.maxActions = record.max_actions || null;
+        this.winThreshold = record.win_threshold || null;
         break;
 
       case "run_started":
         this.status = "active";
         this.startedAt = record.started_at;
-        this.deadlineAt = record.deadline_at;
+        this.deadlineAt = record.deadline_at || null;
         this.maxLeaseEpoch = record.lease_epoch;
         this.declaredCli = record.declared_cli || record.controller_id?.split("-")[0] || "stdio-mcp";
         this.currentLease = {
@@ -798,8 +813,9 @@ class RunInstance {
         event_id: this.lastEventId || 1,
         type: "started",
         started_at: record.started_at,
-        deadline_at: record.deadline_at,
-        duration_ms: this.durationMs,
+        ...(this.maxActions
+          ? { max_actions: this.maxActions }
+          : { deadline_at: record.deadline_at, duration_ms: this.durationMs }),
         controller_id: record.controller_id,
         declared_cli: record.declared_cli
       };
@@ -1095,15 +1111,17 @@ class RunInstance {
           await this.appendJournalRecord(revokeRecord);
         }
 
-        // Check if deadline already passed during downtime
-        if (this.deadlineAt && Date.now() >= Date.parse(this.deadlineAt)) {
+        // Complete a run that crashed after committing its final allowed action.
+        if (this.maxActions && this.lastActionSeq >= this.maxActions) {
+          await this._startFinalize("action_limit", `Run reached the ${this.maxActions}-action limit`);
+        } else if (this.deadlineAt && Date.now() >= Date.parse(this.deadlineAt)) {
           await this._startFinalize("timed_out", "Deadline passed during server downtime");
         } else {
           this._armDeadlineTimer();
         }
       } else if (this.status === "finalizing") {
         // Resume finalize worker with preserved target outcome
-        this._runFinalizeWorker(this.targetOutcome || "timed_out");
+        this._runFinalizeWorker(this.targetOutcome || (this.maxActions ? "action_limit" : "timed_out"));
       }
     });
   }
@@ -1128,7 +1146,7 @@ class RunInstance {
           lease_epoch: cached.lease_epoch,
           lease_expires_at: cached.lease_expires_at,
           started_at: this.startedAt,
-          deadline_at: this.deadlineAt,
+          ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
           observation: cached.observation || currentObs,
           sanitized_result: cached.initial_sanitized_result || cached.sanitized_result
         };
@@ -1137,7 +1155,7 @@ class RunInstance {
       if (this.status === "armed") {
         const leaseId = `lease-${crypto.randomUUID()}`;
         const startedAt = new Date().toISOString();
-        const deadlineAt = new Date(Date.now() + this.durationMs).toISOString();
+        const deadlineAt = this.maxActions ? null : new Date(Date.now() + this.durationMs).toISOString();
         const expiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
         const declaredCli = controllerInfo?.declaredCli || controllerInfo?.name || "stdio-mcp";
         this.declaredCli = declaredCli;
@@ -1153,7 +1171,9 @@ class RunInstance {
                 status: "active",
                 action_seq: 0,
                 observation: initialObs,
-                game_won: false
+                game_won: false,
+                ended: false,
+                ...(this.maxActions ? { max_actions: this.maxActions, actions_remaining: this.maxActions } : {})
               })
             }
           ],
@@ -1172,7 +1192,7 @@ class RunInstance {
           lease_id: leaseId,
           lease_epoch: 1,
           started_at: startedAt,
-          deadline_at: deadlineAt,
+          ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: deadlineAt }),
           lease_expires_at: expiresAt,
           initial_sanitized_result: sanitizedResult
         };
@@ -1186,7 +1206,7 @@ class RunInstance {
           lease_epoch: 1,
           lease_expires_at: expiresAt,
           started_at: startedAt,
-          deadline_at: deadlineAt,
+          ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: deadlineAt }),
           observation: initialObs,
           sanitized_result: sanitizedResult
         };
@@ -1207,7 +1227,7 @@ class RunInstance {
             lease_epoch: this.currentLease.leaseEpoch,
             lease_expires_at: new Date(this.currentLease.expiresAt).toISOString(),
             started_at: this.startedAt,
-            deadline_at: this.deadlineAt,
+            ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
             observation: currentObs
           };
         }
@@ -1273,7 +1293,7 @@ class RunInstance {
           lease_epoch: nextEpoch,
           lease_expires_at: expiresAt,
           started_at: this.startedAt,
-          deadline_at: this.deadlineAt,
+          ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
           observation: currentObs
         };
       }
@@ -1359,6 +1379,10 @@ class RunInstance {
         run_id: this.runId,
         status: this.status,
         action_seq: this.lastActionSeq,
+        ended: this.status !== "active",
+        ...(this.maxActions
+          ? { max_actions: this.maxActions, actions_remaining: Math.max(0, this.maxActions - this.lastActionSeq) }
+          : {}),
         viewer_state_hash: this.currentViewerStateHash,
         observation: sanitizeObservationForMcp(snap)
       };
@@ -1391,11 +1415,19 @@ class RunInstance {
         throw { status: 409, code: "CONFLICT", message: "Invalid lease credentials or epoch" };
       }
 
-      // Check Deadline Timeout
+      if (this.maxActions && this.lastActionSeq >= this.maxActions) {
+        await this._startFinalize("action_limit", `Run reached the ${this.maxActions}-action limit`);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ outcome: "action_limit", ended: true, action_seq: this.lastActionSeq }) }],
+          isError: false
+        };
+      }
+
+      // Legacy timed runs retain their persisted deadline behavior.
       if (this.deadlineAt && Date.now() >= Date.parse(this.deadlineAt)) {
         await this._startFinalize("timed_out", "Deadline reached before action execution");
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: "Session timed out", outcome: "timed_out" }) }],
+          content: [{ type: "text", text: JSON.stringify({ error: "Session timed out", outcome: "timed_out", ended: true }) }],
           isError: true
         };
       }
@@ -1427,7 +1459,7 @@ class RunInstance {
         await this.appendJournalRecord(rejectedRecord);
 
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: mapped.error, ok: false }) }],
+          content: [{ type: "text", text: JSON.stringify({ error: mapped.error, ok: false, ended: false }) }],
           isError: true
         };
       }
@@ -1461,7 +1493,7 @@ class RunInstance {
         await this.appendJournalRecord(rejectedRecord);
 
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: err.message, ok: false }) }],
+          content: [{ type: "text", text: JSON.stringify({ error: err.message, ok: false, ended: false }) }],
           isError: true
         };
       }
@@ -1514,6 +1546,8 @@ class RunInstance {
         after_state_hash: afterStateHash
       };
 
+      const reachedActionLimit = Boolean(this.maxActions && nextActionSeq >= this.maxActions);
+      const ended = reachedActionLimit;
       const mcpResult = {
         resultType: "complete",
         content: [
@@ -1521,10 +1555,14 @@ class RunInstance {
             type: "text",
             text: JSON.stringify({
               run_id: this.runId,
-              status: "active",
+              status: ended ? "finalizing" : "active",
               action_seq: nextActionSeq,
               observation: sanitizeObservationForMcp(bridgeResult),
-              game_won: Boolean(sanitizedStatus.game_won)
+              game_won: false,
+              ended,
+              ...(this.maxActions
+                ? { max_actions: this.maxActions, actions_remaining: Math.max(0, this.maxActions - nextActionSeq) }
+                : {})
             })
           }
         ],
@@ -1550,9 +1588,8 @@ class RunInstance {
 
       await this.appendJournalRecord(committedRecord);
 
-      // Check Win Condition
-      if (sanitizedStatus.game_won) {
-        await this._startFinalize("won", "Player collected target gems and won the game");
+      if (reachedActionLimit) {
+        await this._startFinalize("action_limit", `Run reached the ${this.maxActions}-action limit`);
       }
 
       return mcpResult;
@@ -1565,8 +1602,8 @@ class RunInstance {
 
   async cancelRun() {
     return await this.sessionMutex.withLock(async () => {
-      if (["won", "timed_out", "cancelled", "failed"].includes(this.status)) {
-        return this.finalResponse || { run_id: this.runId, outcome: this.status };
+      if (["won", "action_limit", "timed_out", "cancelled", "failed"].includes(this.status)) {
+        return this.finalResponse || { run_id: this.runId, outcome: this.status, ended: true };
       }
       if (this.status === "finalizing") {
         return { run_id: this.runId, status: "finalizing" };
@@ -1617,12 +1654,13 @@ class RunInstance {
         const finalResponse = {
           run_id: this.runId,
           outcome,
+          ended: true,
           summary_digest: summaryDigest,
           summary_url: `/api/external-play/runs/${encodeURIComponent(this.runId)}/summary`
         };
 
         await this.sessionMutex.withLock(async () => {
-          if (["won", "timed_out", "cancelled", "failed"].includes(this.status)) return;
+          if (["won", "action_limit", "timed_out", "cancelled", "failed"].includes(this.status)) return;
 
           const endedEventId = this.lastEventId + 1;
           const opId = `finalize-${outcome}-${this.finalizeSeq}`;
@@ -1668,7 +1706,7 @@ class RunInstance {
             ended_at: this.finalizeStartedAt || new Date().toISOString(),
             elapsed_seconds: Math.max(0, (Date.parse(this.finalizeStartedAt || new Date().toISOString()) - Date.parse(this.startedAt)) / 1000),
             gems_collected: 0,
-            gems_total: Math.max(1, Number(this.winThreshold) || 1),
+            gems_total: 100,
             rooms_visited: 1,
             rooms_total: 100,
             actions_total: 0,
@@ -1687,13 +1725,14 @@ class RunInstance {
       }
 
       await this.sessionMutex.withLock(async () => {
-        if (["won", "timed_out", "cancelled", "failed"].includes(this.status)) return;
+        if (["won", "action_limit", "timed_out", "cancelled", "failed"].includes(this.status)) return;
         const failedAt = new Date().toISOString();
         const endedEventId = this.lastEventId + 1;
         const opId = `finalize-failed-${this.finalizeSeq}`;
         const finalResponse = {
           run_id: this.runId,
           outcome: "failed",
+          ended: true,
           summary_digest: partialSummaryDigest,
           summary_url: summaryAvailable
             ? `/api/external-play/runs/${encodeURIComponent(this.runId)}/summary`
@@ -1750,7 +1789,7 @@ class SummaryBuilder {
 
     const session = run.gameSession;
     const gemsCollected = !startedAt ? 0 : (session?.collectedGemIds ? session.collectedGemIds.size : 0);
-    const gemsTotal = run.winThreshold || 10;
+    const gemsTotal = 100;
     const roomsVisited = !startedAt ? 0 : (session?.visitedLevels ? session.visitedLevels.size : 1);
     const roomsTotal = 100;
     const actionsTotal = run.lastActionSeq || 0;
@@ -1885,7 +1924,7 @@ function sanitizeObservationForMcp(obs) {
     gem_count: Math.max(0, Number(gem_count) || 0),
     visited_levels: Array.isArray(visited_levels) ? visited_levels.map(String) : [],
     player_dead: Boolean(player_dead),
-    game_won: Boolean(game_won),
+    game_won: false,
     game_lost: Boolean(game_lost)
   };
 
@@ -2240,7 +2279,7 @@ function buildSanitizedStatus(session) {
     action_count: session.actionCount || 0,
     current_room: context.level.id,
     collected_gems_count: session.collectedGemIds ? session.collectedGemIds.size : 0,
-    game_won: Boolean(context.gameWon),
+    game_won: false,
     player_dead: Boolean(context.state.playerDead)
   };
 }
@@ -2295,6 +2334,7 @@ module.exports = {
   resolveDataHome,
   assertIsolation,
   mapToolToMessage,
+  sanitizeObservationForMcp,
   extractViewerState,
   buildViewerTransition,
   buildSanitizedStatus

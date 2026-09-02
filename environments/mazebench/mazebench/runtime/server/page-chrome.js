@@ -90,6 +90,7 @@ function topbar({ rightHtml = "", extraNavHtml = "", extraHtml = "", capabilitie
       <a class="brand-link" href="/"><span class="brand-mark" aria-hidden="true">${BRAND_MARK_SVG}</span>Maze Bench</a>
       <nav class="topbar-nav" aria-label="Site">
         <a class="nav-link" href="/build" data-i18n="nav_build">Build</a>
+        <a class="nav-link" href="/external-play" data-i18n="nav_external">External Play</a>
         <a class="nav-link" href="/agent" data-i18n="nav_agent">Agent</a>
         ${showTrain ? '<a class="nav-link" href="/train" data-i18n="nav_train">Train</a>' : ""}
         ${extraNavHtml}
@@ -108,6 +109,7 @@ function siteFooter({ capabilities = null } = {}) {
   return `<footer class="site-footer">
       <span>Maze Bench (local)</span>
       <a class="text-link" href="/build" data-i18n="nav_build">Build</a>
+      <a class="text-link" href="/external-play" data-i18n="nav_external">External Play</a>
       <a class="text-link" href="/agent" data-i18n="nav_agent">Agent</a>
       ${showTrain ? '<a class="text-link" href="/train" data-i18n="nav_train">Train</a>' : ""}
       <a class="text-link" href="https://mazebench.com">mazebench.com</a>

@@ -158,11 +158,11 @@ async function runMcpTests() {
     assert.ok(pingRes.result);
 
     // 5. Tools List verification
-    console.log("  [Test 5] Tools list contains all 13 tools");
+    console.log("  [Test 5] Tools list contains all 14 tools");
     const toolsRes = await client.sendRequest(5, "tools/list", {});
     assert.ok(toolsRes.result);
     assert.ok(Array.isArray(toolsRes.result.tools));
-    assert.equal(toolsRes.result.tools.length, 13);
+    assert.equal(toolsRes.result.tools.length, 14);
 
     const toolNames = toolsRes.result.tools.map((t) => t.name);
     const expected = [
@@ -178,7 +178,8 @@ async function runMcpTests() {
       "rotate_camera_right",
       "undo",
       "reset",
-      "go_to_level"
+      "go_to_level",
+      "action_sequence"
     ];
     assert.deepEqual(toolNames.sort(), expected.sort());
 
@@ -201,6 +202,8 @@ async function runMcpTests() {
     assert.equal(startCallRes.result.isError, false);
     const startPayload = JSON.parse(startCallRes.result.content[0].text);
     assert.equal(startPayload.status, "active");
+    assert.equal(startPayload.ended, false);
+    assert.equal(startPayload.max_actions, 256);
     assert.ok(startPayload.observation, "start must return observation");
     assert.ok(startPayload.observation.player, "start observation must include player");
     assert.ok(startPayload.observation.current_room, "start observation must include current_room");
@@ -214,6 +217,7 @@ async function runMcpTests() {
     assert.equal(obsCallRes.result.isError, false);
     const obsPayload = JSON.parse(obsCallRes.result.content[0].text);
     assert.equal(obsPayload.status, "active");
+    assert.equal(obsPayload.ended, false);
     assert.ok(obsPayload.observation?.level, "observe observation must include room ASCII map in level");
 
     const downCallRes = await client.sendContentLengthRequest(9, "tools/call", {
@@ -228,6 +232,7 @@ async function runMcpTests() {
     assert.ok(downPayload.observation.level, "down observation must include room ASCII map in level");
     assert.ok(downPayload.observation.level.length > 1000, "level map must be full rendered ASCII grid (>1000 chars)");
     assert.equal(typeof downPayload.observation.current_room, "string");
+    assert.equal(downPayload.ended, false);
     assert.equal(downPayload.observation.moved, true);
     assert.equal(downPayload.observation._transition_source, undefined, "internal transition source must not leak to AI");
     assert.equal(downPayload.observation.board_state_hash, undefined, "internal board state hash must not leak to AI");
@@ -256,6 +261,23 @@ async function runMcpTests() {
     });
     assert.ok(extraPropRes.error);
     assert.equal(extraPropRes.error.code, -32602);
+
+    const badSequenceRes = await client.sendRequest(121, "tools/call", {
+      name: "action_sequence",
+      arguments: { actions: ["up", "fly"] }
+    });
+    assert.equal(badSequenceRes.error?.code, -32602);
+
+    const sequenceRes = await client.sendRequest(122, "tools/call", {
+      name: "action_sequence",
+      arguments: { actions: ["rotate camera left", "rotate_camera_right"] }
+    });
+    assert.equal(sequenceRes.result?.isError, false);
+    const sequencePayload = JSON.parse(sequenceRes.result.content[0].text);
+    assert.equal(sequencePayload.requested_count, 2);
+    assert.equal(sequencePayload.completed_count, 2);
+    assert.equal(sequencePayload.ended, false);
+    assert.ok(sequencePayload.final_observation?.level);
 
     // 10. Cancel notification handling
     console.log("  [Test 10] notifications/cancelled handling");
@@ -335,6 +357,7 @@ async function runMcpTests() {
     while (explicitRun.status === "finalizing") {
       await new Promise((r) => setTimeout(r, 10));
     }
+    externalPlay.defaultMaxActions = 2;
     const autoCreateStartRes = await client.sendRequest(17, "tools/call", {
       name: "start",
       arguments: {}
@@ -345,6 +368,22 @@ async function runMcpTests() {
     assert.ok(autoCreatePayload.run_id);
     assert.notEqual(autoCreatePayload.run_id, explicitRun.runId);
     assert.equal(autoCreatePayload.status, "active");
+    assert.equal(autoCreatePayload.max_actions, 2);
+
+    // 14. action_sequence stops exactly at the run action limit and returns ended=true.
+    console.log("  [Test 14] action_sequence stops at action limit with ended=true");
+    const terminalSequenceRes = await client.sendRequest(18, "tools/call", {
+      name: "action_sequence",
+      arguments: { actions: ["rotate camera left", "rotate camera right", "down"] }
+    });
+    assert.equal(terminalSequenceRes.result?.isError, false);
+    const terminalSequencePayload = JSON.parse(terminalSequenceRes.result.content[0].text);
+    assert.equal(terminalSequencePayload.requested_count, 3);
+    assert.equal(terminalSequencePayload.completed_count, 2);
+    assert.equal(terminalSequencePayload.stopped_early, true);
+    assert.equal(terminalSequencePayload.stop_reason, "action_limit");
+    assert.equal(terminalSequencePayload.ended, true);
+    assert.equal(terminalSequencePayload.steps.at(-1)?.action_seq, 2);
 
     console.log("All maze-external-mcp stdio adapter tests PASSED!");
   } finally {

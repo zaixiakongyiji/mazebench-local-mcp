@@ -18,8 +18,7 @@
     const form = document.getElementById("create-external-run-form");
     if (!form) return;
 
-    const durationInput = document.getElementById("ext-duration-min");
-    const winThresholdInput = document.getElementById("ext-win-threshold");
+    const maxActionsInput = document.getElementById("ext-max-actions");
     const modelNameInput = document.getElementById("ext-model-name");
     const harnessNameInput = document.getElementById("ext-harness-name");
     const statusText = document.getElementById("create-ext-status");
@@ -31,9 +30,7 @@
       statusText.textContent = "Creating armed session...";
 
       try {
-        const durationMin = parseInt(durationInput.value, 10) || 30;
-        const winThreshold = parseInt(winThresholdInput.value, 10) || 10;
-        const duration_ms = durationMin * 60000;
+        const maxActions = parseInt(maxActionsInput.value, 10) || 256;
         const model_name = modelNameInput?.value?.trim() || undefined;
         const harness_name = harnessNameInput?.value?.trim() || undefined;
 
@@ -41,8 +38,7 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            duration_ms,
-            win_threshold: winThreshold,
+            max_actions: maxActions,
             model_name,
             harness_name
           })
@@ -72,8 +68,8 @@
     const host = window.__MAZEBENCH_SPECTATOR_HOST__;
 
     const statusPill = document.getElementById("external-status-pill");
-    const timerElem = document.getElementById("spectator-timer");
-    const timerValElem = document.getElementById("spectator-timer-val");
+    const budgetElem = document.getElementById("spectator-budget");
+    const budgetValElem = document.getElementById("spectator-budget-val");
     const roomsElem = document.getElementById("spectator-rooms-stat");
     const roomsValElem = document.getElementById("spectator-rooms-val");
     const gemsElem = document.getElementById("spectator-gems");
@@ -122,7 +118,7 @@
     let gemCount = 0;
     let currentRoom = "level_HxI";
     let visitedRooms = new Set(["level_HxI"]);
-    let isEnded = ["won", "timed_out", "cancelled", "failed", "ended"].includes(runData.status);
+    let isEnded = ["won", "action_limit", "timed_out", "cancelled", "failed", "ended"].includes(runData.status);
     let lastEventTimestamp = Date.now();
     let lastEventId = 0;
     let dynamicStepDelayMs = 200;
@@ -388,33 +384,23 @@
       });
     }
 
-    // Timer loop
-    function updateTimer() {
+    // Action budget and controller liveness display.
+    function updateRunStatus() {
       if (isEnded) return;
 
       if (!runData.started_at) {
-        if (timerElem) timerElem.innerHTML = `⏱️ <strong id="spectator-timer-val">Waiting for MCP</strong>`;
+        if (budgetValElem) budgetValElem.textContent = "Waiting for MCP";
         return;
       }
 
       const now = Date.now();
-      const started = new Date(runData.started_at).getTime();
-      const deadline = runData.deadline_at ? new Date(runData.deadline_at).getTime() : started + (runData.duration_ms || 1800000);
-      const remainingMs = Math.max(0, deadline - now);
-
-      const mins = Math.floor(remainingMs / 60000);
-      const secs = Math.floor((remainingMs % 60000) / 1000);
-      const timeStr = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-
-      if (remainingMs <= 0) {
-        if (timerElem) {
-          timerElem.innerHTML = `⏱️ <strong id="spectator-timer-val">00:00</strong>`;
-          timerElem.style.color = "#f87171";
-        }
-      } else {
-        if (timerElem) {
-          timerElem.innerHTML = `⏱️ <strong id="spectator-timer-val">${timeStr}</strong>`;
-        }
+      const maxActions = Number(runData.max_actions) || 256;
+      const remainingActions = Math.max(0, maxActions - totalActions);
+      if (budgetValElem) {
+        budgetValElem.textContent = `${remainingActions} actions left`;
+      }
+      if (budgetElem) {
+        budgetElem.style.color = remainingActions <= 0 ? "#f87171" : "";
       }
 
       // Controller heartbeat check
@@ -424,7 +410,7 @@
       }
     }
 
-    const timerInterval = setInterval(updateTimer, 250);
+    const statusInterval = setInterval(updateRunStatus, 1000);
 
     // Cancel Button
     if (cancelBtn) {
@@ -606,15 +592,14 @@
           baseViewerState = snapshot.base_viewer_state;
         }
 
-        // Sync lifecycle & timer timestamps
+        // Sync lifecycle and action budget.
         if (snapshot.started_at) runData.started_at = snapshot.started_at;
-        if (snapshot.deadline_at) runData.deadline_at = snapshot.deadline_at;
-        if (snapshot.duration_ms) runData.duration_ms = snapshot.duration_ms;
+        if (snapshot.max_actions) runData.max_actions = snapshot.max_actions;
         if (snapshot.status === "active") {
           statusPill.textContent = "ACTIVE";
           statusPill.className = "status-pill status-pill--running";
         }
-        updateTimer();
+        updateRunStatus();
 
         // Apply initial base viewer state to 3D scene
         if (baseViewerState && host) {
@@ -682,7 +667,7 @@
         updateScrubberUI();
 
         // Check if run is in a terminal state
-        if (["won", "timed_out", "cancelled", "failed"].includes(snapshot.status)) {
+        if (["won", "action_limit", "timed_out", "cancelled", "failed"].includes(snapshot.status)) {
           isEnded = true;
           statusPill.textContent = snapshot.status.toUpperCase();
           statusPill.className = "status-pill status-pill--ended";
@@ -830,13 +815,12 @@
     async function handleSSEMessage(type, record, genId) {
       if (type === "started" || record.type === "started") {
         if (record.started_at) runData.started_at = record.started_at;
-        if (record.deadline_at) runData.deadline_at = record.deadline_at;
-        if (record.duration_ms) runData.duration_ms = record.duration_ms;
+        if (record.max_actions) runData.max_actions = record.max_actions;
         statusPill.textContent = "ACTIVE";
         statusPill.className = "status-pill status-pill--running";
         controllerStatusElem.textContent = "Live Stream Connected";
         controllerStatusElem.className = "spectator-badge controller-badge is-connected";
-        updateTimer();
+        updateRunStatus();
       } else if (type === "action" || record.type === "action") {
         let transition = record.action_record?.viewer_transition || record.transition;
         if (!transition && record.action_record?.transition_digest) {
@@ -896,7 +880,7 @@
       if (!summary) {
         summary = {
           outcome: runData.status || "CANCELLED",
-          duration_ms: runData.duration_ms || 0,
+          elapsed_seconds: runData.started_at ? Math.max(0, Math.round((Date.now() - Date.parse(runData.started_at)) / 1000)) : 0,
           actions_total: totalActions,
           gems_collected: gemCount,
           rooms_visited: 1,
@@ -909,7 +893,7 @@
       summaryOutcomeBadge.className = `badge badge--${outcome.toLowerCase()}`;
       summaryOutcome.textContent = outcome;
 
-      const durationSec = summary.elapsed_seconds || Math.round((summary.duration_ms || 0) / 1000);
+      const durationSec = summary.elapsed_seconds || 0;
       summaryElapsed.textContent = `${durationSec}s`;
       summaryActions.textContent = summary.actions_total ?? summary.action_count ?? totalActions;
       summaryGems.textContent = summary.gems_collected ?? gemCount;
@@ -920,9 +904,50 @@
       summaryOverlay.removeAttribute("hidden");
       summaryOverlay.hidden = false;
       summaryOverlay.style.display = "flex";
+      const summaryBarBtn = document.getElementById("playback-summary-btn");
+      if (summaryBarBtn) {
+        summaryBarBtn.removeAttribute("hidden");
+        summaryBarBtn.hidden = false;
+        summaryBarBtn.style.display = "inline-flex";
+      }
       if (window.MazeBenchI18n?.applyI18n) {
         window.MazeBenchI18n.applyI18n();
       }
+    }
+
+    function dismissSummaryModal() {
+      summaryOverlay.hidden = true;
+      summaryOverlay.style.display = "none";
+      isLiveMode = false;
+      isPaused = true;
+      updateScrubberUI();
+    }
+
+    const summaryDismissBtn = document.getElementById("summary-dismiss-btn");
+    if (summaryDismissBtn) {
+      summaryDismissBtn.addEventListener("click", dismissSummaryModal);
+    }
+    const summaryCloseBtn = document.getElementById("summary-close-btn");
+    if (summaryCloseBtn) {
+      summaryCloseBtn.addEventListener("click", dismissSummaryModal);
+    }
+    const summaryBarBtn = document.getElementById("playback-summary-btn");
+    if (summaryBarBtn) {
+      summaryBarBtn.addEventListener("click", () => {
+        summaryOverlay.removeAttribute("hidden");
+        summaryOverlay.hidden = false;
+        summaryOverlay.style.display = "flex";
+        if (window.MazeBenchI18n?.applyI18n) {
+          window.MazeBenchI18n.applyI18n();
+        }
+      });
+    }
+    if (summaryOverlay) {
+      summaryOverlay.addEventListener("click", (e) => {
+        if (e.target === summaryOverlay) {
+          dismissSummaryModal();
+        }
+      });
     }
 
     if (summaryReplayBtn) {

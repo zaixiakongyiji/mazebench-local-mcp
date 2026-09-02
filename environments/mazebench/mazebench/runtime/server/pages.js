@@ -860,7 +860,7 @@ function createPageRenderer({
             <span>Launching run</span>
           </div>
         </div>
-        <section class="panel agent-composer" aria-label="Launch a run">
+        <section class="panel agent-composer" aria-label="Launch a run" hidden style="display: none;">
           <div class="composer-head">
             <h2 data-i18n="agent_new_run">New run</h2>
           </div>
@@ -1625,12 +1625,8 @@ args = ["mcp"]</code></pre>
           <h2 data-i18n="create_session_title">Create New Session</h2>
           <form id="create-external-run-form" style="display: flex; flex-direction: column; gap: 14px; max-width: 480px; margin-top: 12px;">
             <label class="field">
-              <span data-i18n="duration_label">Time Limit (minutes)</span>
-              <input type="number" id="ext-duration-min" min="1" max="360" value="30" required>
-            </label>
-            <label class="field">
-              <span data-i18n="win_threshold_label">Win Gem Threshold (default: 10, full maze: 100)</span>
-              <input type="number" id="ext-win-threshold" min="1" max="100" value="10" required>
+              <span data-i18n="max_actions_label">Action Limit</span>
+              <input type="number" id="ext-max-actions" min="1" max="100000" value="256" required>
             </label>
             <label class="field">
               <span data-i18n="model_name_label">Model Name</span>
@@ -1672,9 +1668,7 @@ args = ["mcp"]</code></pre>
       run_id: run.runId,
       status: run.status,
       started_at: run.startedAt,
-      deadline_at: run.deadlineAt,
-      duration_ms: run.durationMs,
-      win_threshold: run.winThreshold,
+      max_actions: run.maxActions,
       model_name: run.modelName || "",
       harness_name: run.harnessName || ""
     };
@@ -1724,7 +1718,7 @@ args = ["mcp"]</code></pre>
 
         <!-- Top HUD Data Pods (Centered At Top) -->
         <nav id="spectator-top-hud" class="spectator-top-hud" aria-label="Spectator top stats">
-          <span id="spectator-timer" class="spectator-badge timer-badge">⏱️ <strong id="spectator-timer-val">Waiting for MCP</strong></span>
+          <span id="spectator-budget" class="spectator-badge timer-badge">🎯 <strong id="spectator-budget-val">256 actions left</strong></span>
           <span id="spectator-rooms-stat" class="spectator-badge">🏛️ <strong id="spectator-rooms-val">1</strong></span>
           <span id="spectator-gems" class="spectator-badge">💎 <strong id="spectator-gems-val">0</strong></span>
           <span id="spectator-actions" class="spectator-badge">👟 <strong id="spectator-actions-val">0</strong></span>
@@ -1756,6 +1750,7 @@ args = ["mcp"]</code></pre>
             <input id="playback-scrubber" class="playback-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Playback step scrubber">
           </div>
           <div class="playback-controls-right">
+            <button id="playback-summary-btn" class="playback-btn" type="button" title="View Summary" data-i18n="summary_btn" hidden>📊 Summary</button>
             <button id="playback-live-btn" class="playback-btn playback-btn--live is-active" type="button" title="Jump to Live">🔴 Live</button>
           </div>
         </nav>
@@ -1765,6 +1760,7 @@ args = ["mcp"]</code></pre>
           <div class="summary-header">
             <h2 data-i18n="summary_title">Game Summary</h2>
             <span id="summary-outcome-badge" class="badge">WON</span>
+            <button id="summary-close-btn" class="modal-close-btn" type="button" aria-label="Close" title="Close">✕</button>
           </div>
           <div class="summary-body">
             <div class="summary-grid">
@@ -1776,8 +1772,9 @@ args = ["mcp"]</code></pre>
               <div class="summary-stat"><label>Declared CLI</label><span id="summary-cli">-</span></div>
             </div>
             <div class="summary-actions">
-              <a id="summary-home-btn" class="button" href="/" data-i18n="summary_home">Back to Home</a>
               <button id="summary-replay-btn" class="button button--primary" type="button" data-i18n="summary_replay">Replay from Beginning</button>
+              <button id="summary-dismiss-btn" class="button" type="button" data-i18n="summary_dismiss">View Board</button>
+              <a id="summary-home-btn" class="button" href="/" data-i18n="summary_home">Back to Home</a>
               <a id="summary-json-link" class="button" href="/api/external-play/runs/${encodeURIComponent(run.runId)}/summary" download="summary.json" data-i18n="summary_download">Download summary.json</a>
             </div>
           </div>

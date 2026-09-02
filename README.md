@@ -2,7 +2,7 @@
 
 MazeBench Local MCP 是基于 MazeBenchEngine 改造的本地游戏控制与实时观战版本。
 
-本地 CLI 或桌面端（Gemini、Antigravity、Codex、Claude Code、Claude Desktop 等）通过 `stdio` MCP 控制同一套 MazeBench JavaScript 游戏引擎；浏览器实时显示 3D 游戏画面、动作时间线和当前状态，并在通关或超时后展示总结与回放。
+本地 CLI 或桌面端（Gemini、Antigravity、Codex、Claude Code、Claude Desktop 等）通过 `stdio` MCP 控制同一套 MazeBench JavaScript 游戏引擎；浏览器实时显示 3D 游戏画面、动作时间线和当前状态，并在达到动作上限或场次结束后展示总结与回放。
 
 该模式的核心特点：
 
@@ -56,13 +56,21 @@ where.exe mazebench
 
 ## 启动本地服务
 
-前台启动：
+在当前源码仓库中前台启动：
+
+```bash
+npm run start
+```
+
+该命令直接运行当前仓库的 `server.js`，适合开发和本地调试。服务启动后需要手动打开终端输出的地址。
+
+通过已安装的 `mazebench` CLI 前台启动：
 
 ```bash
 mazebench launch
 ```
 
-后台启动：
+CLI 会运行其已安装 runtime 中的 `server.js`，并默认打开浏览器。需要后台运行时使用：
 
 ```bash
 mazebench launch bg
@@ -92,7 +100,7 @@ mazebench stop
 
 ## 配置本地 MCP
 
-MazeBench 服务和 MCP adapter 是两个独立进程：先运行 `mazebench launch`，再让 CLI 或桌面端启动 `mazebench mcp`。
+MazeBench 服务和 MCP adapter 是两个独立进程：先在源码仓库运行 `npm run start`，或使用已安装的 CLI 运行 `mazebench launch`；再让 CLI 或桌面端启动 `mazebench mcp`。
 
 ### Gemini / Antigravity / Claude Desktop 等 JSON 配置
 
@@ -138,19 +146,19 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 
 ## 开始一局
 
-1. 执行 `mazebench launch`。
+1. 在源码仓库执行 `npm run start`，或执行 `mazebench launch`。
 2. 在浏览器打开 External Play 页面。
-3. 创建场次，设置时间上限、通关 gems 数量，并可选填写模型名称和 harness 名称。
+3. 创建场次，设置游戏 actions 上限，并可选填写模型名称和 harness 名称。
 4. 启动或重启已经配置 MCP 的 CLI/桌面端。
 5. 让模型先调用 `start`，然后通过 `observe` 和动作工具游玩。
 6. 在浏览器中实时观看 3D 画面、动作记录、房间和 gems 状态。
-7. 达到通关条件或时间上限后，在同一页面查看总结和回放。
+7. 达到 actions 上限后，在同一页面查看总结和回放。
 
 服务启动时会准备一个默认的 `armed` 场次。只要该场次尚未被 MCP claim，网页创建的新场次会安全替换它；已经开始的场次不会被覆盖。
 
 ## MCP 工具
 
-当前提供 13 个工具：
+当前提供 14 个工具：
 
 - `start`
 - `observe`
@@ -160,15 +168,35 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 - `undo`
 - `reset`
 - `go_to_level`
+- `action_sequence`
 
 `start` 用于 claim 当前场次并建立控制 lease。之后的游戏操作必须使用同一个 MCP 会话，不能直接调用或修改游戏引擎状态。
+
+`action_sequence` 接受 1 到 1,000 个有序 action 字符串。它逐步执行并保留实时观战与动作记录；默认返回紧凑步骤摘要和 `final_observation`。遇到 `ended: true`、玩家死亡或动作错误时会提前停止，以便模型恢复或重新规划。
+
+### 推荐的自主游玩提示词
+
+```text
+Use the configured `mazebench` MCP server to play the hidden 3D grid game. All game interaction must go through the tools supplied by that MCP server.
+
+Call the `mazebench` MCP tool `start` exactly once first and inspect its sanitized ASCII observation. Then use its named action tools `up`, `down`, `left`, `right`, `rotate_camera_up`, `rotate_camera_down`, `rotate_camera_left`, `rotate_camera_right`, `undo`, `reset`, and `go_to_level`. A saved solver may instead call its `action_sequence` tool with an ordered `actions` array of at most 1,000 items. By default the sequence result contains compact step summaries plus `final_observation`. Use the `observe` tool only when you need to inspect the current state without consuming an action. `go_to_level` accepts the two world-coordinate letters for a previously visited room.
+
+The controls do not report whether a movement was blocked; infer its effect only from the returned observation.
+
+Explore as many rooms as possible and collect as many gems as possible. You may use at most 256 game actions. Quit is disabled; recover with undo or reset after a death and keep playing.
+
+Finish with a short route summary only after a game result says `ended: true`. A belief that no useful move remains is not a stop condition: while `ended: false`, never provide a final response and continue using the game controls.
+
+The game implementation, session, checkpoints, and scoring are evaluator-only. Do not try to locate or access them. Do not claim moves or scores that were not returned by the game controls.
+```
+
+如果创建场次时把 actions 上限改成其他数值，请同步替换提示词中的 `256`。
 
 ## 结束条件与运行产物
 
 场次在以下条件之一满足时结束：
 
-- 收集到创建场次时设定的 gems 数量；
-- 达到 wall-clock 时间上限；
+- 达到创建场次时设定的 game actions 上限（默认 256）；
 - 用户在本地网页明确取消；
 - 服务或运行发生不可恢复错误。
 

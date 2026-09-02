@@ -131,6 +131,29 @@ function resolveAgentRunsDir(rootDir, env = process.env) {
   return path.join(sharedRoot, "outputs", "maze-local", "site");
 }
 
+function resolveExternalDataHome(env = process.env) {
+  const custom = String(env.MAZEBENCH_DATA_HOME || env.MAZEBENCH_HOME || "").trim();
+  if (custom) {
+    return path.resolve(custom.replace(/^~(?=$|\/|\\)/, os.homedir()));
+  }
+  return path.join(os.homedir(), ".mazebench");
+}
+
+function resolveExternalRunsDir(runsDir, env = process.env) {
+  const custom = String(env.MAZEBENCH_DATA_HOME || env.MAZEBENCH_HOME || "").trim();
+  if (custom) {
+    return path.join(resolveExternalDataHome(env), "external-runs");
+  }
+  const isTemp = Boolean(runsDir && path.resolve(runsDir).startsWith(path.resolve(os.tmpdir())));
+  if (!isTemp) {
+    const dataHomeDir = path.join(resolveExternalDataHome(env), "external-runs");
+    if (fs.existsSync(dataHomeDir)) return dataHomeDir;
+  }
+  const legacyRunsDir = path.join(runsDir, "external");
+  if (fs.existsSync(legacyRunsDir)) return legacyRunsDir;
+  return isTemp ? legacyRunsDir : path.join(resolveExternalDataHome(env), "external-runs");
+}
+
 function getPrimeCatalog() {
   return require("./integrations/prime/catalog");
 }
@@ -657,6 +680,13 @@ function createAgentRunService({
   }
 
   function runFavoritePath(runId) {
+    if (String(runId || "").toLowerCase().startsWith("ext-")) {
+      const extDir = resolveExternalRunsDir(runsDir);
+      const targetDir = fs.existsSync(path.join(extDir, runId))
+        ? path.join(extDir, runId)
+        : path.join(runsDir, "external", runId);
+      return path.join(targetDir, RUN_FAVORITE_FILE);
+    }
     return path.join(runDirFor(runId), RUN_FAVORITE_FILE);
   }
 
@@ -701,7 +731,10 @@ function createAgentRunService({
 
   function isRunFavorite(runId) {
     const markerPath = runFavoritePath(runId);
-    if (!fs.existsSync(markerPath)) return fs.existsSync(path.join(runDirFor(runId), "favorite"));
+    if (!fs.existsSync(markerPath)) {
+      if (String(runId || "").toLowerCase().startsWith("ext-")) return false;
+      return fs.existsSync(path.join(runDirFor(runId), "favorite"));
+    }
     const marker = loadJson(markerPath, null);
     return marker === null || marker.favorite === true || marker.favorited === true || marker.is_favorite === true;
   }
@@ -709,6 +742,28 @@ function createAgentRunService({
   function setRunFavorite(runId, favorite) {
     if (typeof favorite !== "boolean") {
       throw new Error("Favorite must be true or false.");
+    }
+
+    if (String(runId || "").toLowerCase().startsWith("ext-")) {
+      const summary = summarizeExternalRun(runId);
+      if (!summary) throw new Error(`Unknown run "${runId}".`);
+      const markerPath = runFavoritePath(runId);
+      if (favorite) {
+        const previous = loadJson(markerPath, null);
+        const now = new Date().toISOString();
+        const marker = {
+          schema_version: 1,
+          favorite: true,
+          favorited_at: previous?.favorited_at || now,
+          updated_at: now
+        };
+        const temporary = `${markerPath}.${process.pid}.${crypto.randomBytes(3).toString("hex")}.tmp`;
+        fs.writeFileSync(temporary, `${JSON.stringify(marker, null, 2)}\n`, "utf8");
+        fs.renameSync(temporary, markerPath);
+      } else {
+        fs.rmSync(markerPath, { force: true });
+      }
+      return summarizeExternalRun(runId);
     }
 
     const meta = readRunMeta(runId);
@@ -2273,7 +2328,94 @@ function createAgentRunService({
     return readClaudeRunModelId(runId, requested) || resolveClaudeCatalogModelId(requested) || modelName;
   }
 
+  function summarizeExternalRun(entryName, itemDir = null) {
+    if (!entryName || typeof entryName !== "string") return null;
+    const extDir = resolveExternalRunsDir(runsDir);
+    const candidateDirs = itemDir
+      ? [itemDir]
+      : [
+          path.join(extDir, entryName),
+          path.join(runsDir, "external", entryName)
+        ];
+    const runDir = candidateDirs.find((dir) => fs.existsSync(dir));
+    if (!runDir) return null;
+
+    const manifestPath = path.join(runDir, "manifest.json");
+    const summaryPath = path.join(runDir, "summary.json");
+    let manifest = {};
+    let summary = null;
+    try {
+      if (fs.existsSync(manifestPath)) manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    } catch (_e) {}
+    try {
+      if (fs.existsSync(summaryPath)) summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+    } catch (_e) {}
+
+    const modelName =
+      manifest.model_name ||
+      summary?.model_name ||
+      summary?.declared_model ||
+      summary?.declared_cli ||
+      "External MCP";
+    const harnessName =
+      manifest.harness_name ||
+      summary?.harness_name ||
+      summary?.declared_cli ||
+      "stdio-mcp";
+    const createdAt = manifest.created_at || summary?.started_at || entryName;
+
+    let status = "waiting";
+    if (summary) {
+      if (summary.outcome === "won") status = "finished";
+      else if (["action_limit", "timed_out", "cancelled"].includes(summary.outcome)) status = "stopped";
+      else if (summary.outcome === "failed") status = "failed";
+      else status = "finished";
+    } else if (manifest.claimed_at) {
+      status = "running";
+    }
+
+    const turns = summary?.actions_total ?? summary?.turns ?? summary?.actions ?? 0;
+    const gemCount = summary?.gems_collected ?? summary?.gem_count ?? summary?.gems ?? 0;
+    const gemTotal = summary?.gems_total ?? manifest.win_threshold ?? 100;
+    const roomCount =
+      summary?.rooms_visited ??
+      summary?.room_count ??
+      summary?.rooms ??
+      (Array.isArray(summary?.route) ? summary.route.length : 1);
+    const roomTotal = summary?.rooms_total ?? 100;
+
+    return {
+      id: entryName,
+      created_at: createdAt,
+      game_id: "world_41b30cd9e1b5",
+      game_title: "Maze Bench (3D)",
+      model: modelName,
+      model_name: modelName,
+      harness: harnessName,
+      harness_label: harnessName,
+      provider: "local_mcp",
+      kind: "external",
+      unverified: true,
+      status,
+      turns,
+      moves: turns,
+      unlimited: true,
+      gem_count: gemCount,
+      gem_total: gemTotal,
+      room_count: roomCount,
+      room_total: roomTotal,
+      favorited: isRunFavorite(entryName),
+      deletable: true,
+      url: `/external-play/${encodeURIComponent(entryName)}`
+    };
+  }
+
   function summarizeRun(runId) {
+    if (String(runId || "").toLowerCase().startsWith("ext-")) {
+      const extSummary = summarizeExternalRun(runId);
+      if (extSummary) return extSummary;
+    }
+
     let meta = finalizeStatus(runId, readRunMeta(runId));
 
     if (!meta) {
@@ -2433,68 +2575,30 @@ function createAgentRunService({
   }
 
   function listExternalRunRecords() {
-    const extDir = path.join(runsDir, "external");
-    if (!fs.existsSync(extDir)) return [];
+    const extDirs = [
+      resolveExternalRunsDir(runsDir),
+      path.join(runsDir, "external")
+    ].filter((dir, idx, arr) => arr.indexOf(dir) === idx && fs.existsSync(dir));
 
-    return fs
-      .readdirSync(extDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && entry.name.startsWith("EXT-"))
-      .flatMap((entry) => {
-        const itemDir = path.join(extDir, entry.name);
-        const manifestPath = path.join(itemDir, "manifest.json");
-        const summaryPath = path.join(itemDir, "summary.json");
-        let manifest = {};
-        let summary = null;
-        try {
-          if (fs.existsSync(manifestPath)) manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-        } catch (_e) {}
-        try {
-          if (fs.existsSync(summaryPath)) summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
-        } catch (_e) {}
+    if (extDirs.length === 0) return [];
 
-        const modelName = manifest.model_name || summary?.model_name || "External MCP";
-        const harnessName = manifest.harness_name || summary?.harness_name || "stdio-mcp";
-        const createdAt = manifest.created_at || summary?.started_at || entry.name;
+    const records = [];
+    const seen = new Set();
 
-        let status = "waiting";
-        if (summary) {
-          if (summary.outcome === "won") status = "finished";
-          else if (["timed_out", "cancelled"].includes(summary.outcome)) status = "stopped";
-          else if (summary.outcome === "failed") status = "failed";
-          else status = "finished";
-        } else if (manifest.claimed_at) {
-          status = "running";
+    for (const dir of extDirs) {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && /^ext-/i.test(entry.name) && !seen.has(entry.name)) {
+            seen.add(entry.name);
+            const item = summarizeExternalRun(entry.name, path.join(dir, entry.name));
+            if (item) records.push(item);
+          }
         }
+      } catch (_error) {}
+    }
 
-        const turns = summary?.turns ?? summary?.actions ?? 0;
-        const gemCount = summary?.gem_count ?? summary?.gems ?? 0;
-        const roomCount = summary?.room_count ?? summary?.rooms ?? 1;
-
-        return [{
-          id: entry.name,
-          created_at: createdAt,
-          game_id: "world_41b30cd9e1b5",
-          game_title: "Maze Bench (3D)",
-          model: modelName,
-          model_name: modelName,
-          harness: harnessName,
-          harness_label: harnessName,
-          provider: "local_mcp",
-          kind: "external",
-          unverified: true,
-          status,
-          turns,
-          moves: turns,
-          unlimited: true,
-          gem_count: gemCount,
-          gem_total: 100,
-          room_count: roomCount,
-          room_total: 100,
-          favorited: isRunFavorite(entry.name),
-          deletable: true,
-          url: `/external-play/${encodeURIComponent(entry.name)}`
-        }];
-      });
+    return records;
   }
 
   function allRunSummaries() {
@@ -2618,7 +2722,7 @@ function createAgentRunService({
     const pageRows = filtered.slice(start, start + pageSize);
     const runs = metricSort
       ? pageRows
-      : pageRows.map((record) => summarizeRun(record.id)).filter(Boolean);
+      : pageRows.map((record) => (record.kind === "external" ? record : summarizeRun(record.id))).filter(Boolean);
 
     return {
       runs,
@@ -6673,10 +6777,15 @@ function createAgentRunService({
   }
 
   function deleteRun(runId) {
-    if (String(runId || "").startsWith("EXT-")) {
-      const extRunDir = path.join(runsDir, "external", runId);
+    if (String(runId || "").toLowerCase().startsWith("ext-")) {
+      const extDir = resolveExternalRunsDir(runsDir);
+      const extRunDir = path.join(extDir, runId);
+      const legacyRunDir = path.join(runsDir, "external", runId);
       if (fs.existsSync(extRunDir)) {
         fs.rmSync(extRunDir, { recursive: true, force: true });
+      }
+      if (fs.existsSync(legacyRunDir)) {
+        fs.rmSync(legacyRunDir, { recursive: true, force: true });
       }
       return { id: runId, deleted: true };
     }

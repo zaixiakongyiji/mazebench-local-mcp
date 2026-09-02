@@ -32,7 +32,7 @@ function sendStdout(jsonRpcObj) {
 const TOOLS_MANIFEST = [
   {
     name: "start",
-    description: "Claim and start the currently armed MazeBench game session, starting the timer.",
+    description: "Claim and start the currently armed MazeBench game session and its action budget.",
     inputSchema: {
       type: "object",
       properties: {
@@ -108,6 +108,24 @@ const TOOLS_MANIFEST = [
       },
       additionalProperties: false
     }
+  },
+  {
+    name: "action_sequence",
+    description: "Apply up to 1,000 game actions in order. Returns compact step summaries and the final observation by default.",
+    inputSchema: {
+      type: "object",
+      required: ["actions"],
+      properties: {
+        actions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 1000,
+          items: { type: "string", minLength: 1, maxLength: 64 }
+        },
+        include_intermediate_observations: { type: "boolean", default: false }
+      },
+      additionalProperties: false
+    }
   }
 ];
 
@@ -145,7 +163,47 @@ function validateToolArguments(toolName, args = {}) {
     }
   }
 
+  if (toolName === "action_sequence") {
+    if (!Array.isArray(args.actions) || args.actions.length < 1 || args.actions.length > 1000) {
+      return { valid: false, error: "action_sequence actions must contain between 1 and 1000 items" };
+    }
+    for (let index = 0; index < args.actions.length; index += 1) {
+      if (typeof args.actions[index] !== "string" || !args.actions[index].trim() || args.actions[index].trim().length > 64) {
+        return { valid: false, error: `actions[${index}] must be a non-empty string of at most 64 characters` };
+      }
+      const parsed = parseSequenceAction(args.actions[index]);
+      if (!parsed.ok) return { valid: false, error: `actions[${index}]: ${parsed.error}` };
+    }
+    if (args.include_intermediate_observations !== undefined && typeof args.include_intermediate_observations !== "boolean") {
+      return { valid: false, error: "include_intermediate_observations must be a boolean" };
+    }
+  }
+
   return { valid: true };
+}
+
+function parseSequenceAction(rawAction) {
+  const action = String(rawAction || "").trim().toLowerCase().replaceAll("_", " ").replace(/\s+/g, " ");
+  const direct = new Map([
+    ["up", "up"], ["down", "down"], ["left", "left"], ["right", "right"],
+    ["rotate camera up", "rotate_camera_up"], ["rotate camera down", "rotate_camera_down"],
+    ["rotate camera left", "rotate_camera_left"], ["rotate camera right", "rotate_camera_right"],
+    ["undo", "undo"], ["reset", "reset"]
+  ]);
+  if (direct.has(action)) return { ok: true, tool: direct.get(action), arguments: {} };
+  const goto = action.match(/^go to level ([a-z]) ([a-z])$/i);
+  if (goto) return { ok: true, tool: "go_to_level", arguments: { x: goto[1].toUpperCase(), y: goto[2].toUpperCase() } };
+  return { ok: false, error: `unsupported action '${rawAction}'` };
+}
+
+function parseToolResultPayload(result) {
+  const text = result?.content?.find((item) => item?.type === "text")?.text;
+  if (typeof text !== "string") return {};
+  try {
+    return JSON.parse(text);
+  } catch (_e) {
+    return { message: text };
+  }
 }
 
 class StdioMcpAdapter {
@@ -485,6 +543,90 @@ class StdioMcpAdapter {
         let proxyRes;
         let targetRunId = toolArgs?.run_id || null;
 
+        if (toolName === "action_sequence") {
+          if (!this.activeRunId || !this.leaseId || !this.leaseEpoch) {
+            throw new Error("Call start before action_sequence.");
+          }
+          const includeIntermediate = toolArgs.include_intermediate_observations === true;
+          const steps = [];
+          let finalObservation = null;
+          let ended = false;
+          let stopReason = null;
+
+          for (let index = 0; index < toolArgs.actions.length; index += 1) {
+            if (this.cancelledRequests.has(id)) {
+              const cancelled = new Error("Request cancelled by client");
+              cancelled.code = "CANCELLED";
+              throw cancelled;
+            }
+            const action = toolArgs.actions[index];
+            const parsedAction = parseSequenceAction(action);
+            const stepResponse = await this.httpRequest(
+              "POST",
+              "/api/external-play/mcp",
+              {
+                run_id: this.activeRunId,
+                tool: parsedAction.tool,
+                arguments: parsedAction.arguments,
+                lease_id: this.leaseId,
+                lease_epoch: this.leaseEpoch,
+                operation_id: `mcp-sequence-${id}-${index}-${Date.now()}`
+              },
+              {},
+              id
+            );
+            const stepResult = stepResponse?.result || stepResponse;
+            const payload = parseToolResultPayload(stepResult);
+            finalObservation = payload.observation || finalObservation;
+            const playerDead = Boolean(payload.player_dead || payload.observation?.player_dead);
+            ended = Boolean(payload.ended);
+            steps.push({
+              index,
+              action,
+              action_seq: payload.action_seq ?? null,
+              accepted: !stepResult?.isError,
+              player_dead: playerDead,
+              ended,
+              ...(includeIntermediate ? { observation: payload.observation || null } : {})
+            });
+            if (stepResult?.isError) {
+              stopReason = payload.error || "action_error";
+              break;
+            }
+            if (ended) {
+              stopReason = payload.outcome || "action_limit";
+              break;
+            }
+            if (playerDead) {
+              stopReason = "player_dead";
+              break;
+            }
+          }
+
+          if (ended) this.stopHeartbeat();
+          sendStdout({
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  requested_count: toolArgs.actions.length,
+                  attempted_count: steps.length,
+                  completed_count: steps.filter((step) => step.accepted).length,
+                  stopped_early: steps.length < toolArgs.actions.length,
+                  stop_reason: stopReason,
+                  steps,
+                  final_observation: finalObservation,
+                  ended
+                })
+              }],
+              isError: false
+            }
+          });
+          return;
+        }
+
         if (toolName === "start" && !targetRunId) {
           try {
             const health = await this.httpRequest("GET", "/api/external-play/health");
@@ -590,6 +732,8 @@ class StdioMcpAdapter {
                     action_seq: 0,
                     observation,
                     game_won: false,
+                    ended: false,
+                    ...(proxyRes.max_actions ? { max_actions: proxyRes.max_actions, actions_remaining: proxyRes.max_actions } : {}),
                     message: "MazeBench session armed and ready"
                   })
                 }
@@ -600,10 +744,12 @@ class StdioMcpAdapter {
           return;
         }
 
+        const result = proxyRes.result || proxyRes;
+        if (parseToolResultPayload(result).ended) this.stopHeartbeat();
         sendStdout({
           jsonrpc: "2.0",
           id,
-          result: proxyRes.result || proxyRes
+          result
         });
       } catch (err) {
         if (err.code === "CANCELLED" || this.cancelledRequests.has(id)) {

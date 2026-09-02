@@ -12,6 +12,7 @@ const {
   resolveDataHome,
   assertIsolation,
   mapToolToMessage,
+  sanitizeObservationForMcp,
   extractViewerState,
   buildViewerTransition,
   buildSanitizedStatus
@@ -46,7 +47,7 @@ async function runTests() {
     assert.equal(preStartSummary.rooms_visited, 0);
     assert.deepEqual(preStartSummary.progress_curve, [{ action_seq: 0, gems: 0, rooms: 0 }]);
     assert.throws(
-      () => assertSummaryInvariants({ ...preStartSummary, gems_collected: 11 }),
+      () => assertSummaryInvariants({ ...preStartSummary, gems_collected: 101 }),
       /gems_collected/
     );
     assert.throws(
@@ -73,7 +74,7 @@ async function runTests() {
 
     // 2. Initialize service and default armed run creation
     console.log("  [Test 2] Service initialization and default armed run creation");
-    const service = new ExternalPlayService({ port: 3001 });
+    const service = new ExternalPlayService({ port: 3001, defaultMaxActions: 3 });
     await service.initialize();
 
     assert.equal(service.serviceState, "READY");
@@ -125,8 +126,10 @@ async function runTests() {
     assert.ok(startRes.lease_id);
     assert.equal(initialRun.status, "active");
     assert.ok(initialRun.startedAt);
-    assert.ok(initialRun.deadlineAt);
-    assert.ok(Number.isFinite(initialRun.deadlineMonotonicMs));
+    assert.equal(initialRun.deadlineAt, null);
+    assert.equal(initialRun.deadlineMonotonicMs, null);
+    assert.equal(initialRun.maxActions, 3);
+    assert.equal(startRes.max_actions, 3);
     assert.equal(initialRun.lastJournalSeq, 2);
 
     // Deduplication test: re-calling start with same op-id returns cached response
@@ -161,6 +164,7 @@ async function runTests() {
       "op-move-1"
     );
     assert.equal(moveRes.isError, false);
+    assert.equal(JSON.parse(moveRes.content[0].text).ended, false);
     assert.equal(initialRun.lastActionSeq, 1);
     assert.equal(initialRun.lastJournalSeq, 3);
     const firstActionRecord = JSON.parse(fs.readFileSync(initialRun.actionsPath, "utf8").trim().split("\n")[0]);
@@ -169,6 +173,9 @@ async function runTests() {
       "all actor deltas, including the player, must use canonical viewer actor IDs"
     );
 
+    // External Play treats gems as score only. Its sanitized observation does
+    // not expose the engine's legacy 100-gem terminal signal.
+    assert.equal(sanitizeObservationForMcp({ game_won: true }).game_won, false);
     const rotateRes = await initialRun.executeAction(
       controllerInfo,
       startRes.lease_id,
@@ -178,6 +185,9 @@ async function runTests() {
       "op-cam-1"
     );
     assert.equal(rotateRes.isError, false);
+    const rotatePayload = JSON.parse(rotateRes.content[0].text);
+    assert.equal(rotatePayload.game_won, false);
+    assert.equal(rotatePayload.ended, false);
     assert.equal(initialRun.lastActionSeq, 2);
     assert.equal(initialRun.lastJournalSeq, 4);
 
@@ -237,18 +247,29 @@ async function runTests() {
     };
     initialRun.subscribers.add(mockSubscriber);
 
-    // 10. Finalize / Won or Timed out & Invariants
-    console.log("  [Test 10] Finalize run and summary invariants");
-    await initialRun._startFinalize("timed_out", "Test timeout");
+    // 10. The final allowed action returns ended=true and finalizes the run.
+    console.log("  [Test 10] Action limit finalization and summary invariants");
+    const limitRes = await initialRun.executeAction(
+      controllerInfo,
+      startRes.lease_id,
+      startRes.lease_epoch,
+      "rotate_camera_left",
+      {},
+      "op-action-limit"
+    );
+    const limitPayload = JSON.parse(limitRes.content[0].text);
+    assert.equal(limitPayload.ended, true);
+    assert.equal(limitPayload.action_seq, 3);
+    assert.equal(limitPayload.actions_remaining, 0);
     // Wait briefly for finalize worker
     await new Promise((r) => setTimeout(r, 150));
 
-    assert.equal(initialRun.status, "timed_out");
+    assert.equal(initialRun.status, "action_limit");
     assert.ok(deliveredEnded, "ended SSE event must be delivered to subscriber before connection close");
     assert.ok(fs.existsSync(initialRun.summaryPath));
 
     const summaryContent = JSON.parse(fs.readFileSync(initialRun.summaryPath, "utf8"));
-    assert.equal(summaryContent.outcome, "timed_out");
+    assert.equal(summaryContent.outcome, "action_limit");
     assert.equal(summaryContent.run_id, initialRun.runId);
     assert.ok(validateSummary(summaryContent));
 
@@ -331,7 +352,7 @@ async function runTests() {
     const raceService = new ExternalPlayService({ dataHome: raceDataHome, port: 3003 });
     await raceService.initialize();
     try {
-      const raceRun = raceService.getRun(raceService.activeRunId);
+      const raceRun = await raceService.createRun({ durationMs: 60000 });
       const raceControllerSession = await raceService.handleControllerSession(
         raceService.mcpBootstrapNonce,
         { name: "deadline-race-client" }
@@ -424,8 +445,8 @@ async function runTests() {
       failureService.shutdown();
     }
 
-    // 14. Duration & win_threshold parameter contract and boundary checks
-    console.log("  [Test 14] Duration & win_threshold strict bounds validation");
+    // 14. max_actions, legacy duration, and win_threshold parameter bounds
+    console.log("  [Test 14] Action, legacy duration, and win_threshold strict bounds validation");
     const paramDataHome = path.join(testDataHome, "param-validation");
     const paramService = new ExternalPlayService({ dataHome: paramDataHome, port: 3006 });
     await paramService.initialize();
@@ -436,6 +457,14 @@ async function runTests() {
           paramService.createRun({ durationMs: invalidDuration }),
           (err) => err?.status === 400 && err?.code === "INVALID_ARGUMENT",
           `durationMs ${invalidDuration} must be rejected with 400 INVALID_ARGUMENT`
+        );
+      }
+
+      for (const invalidMaxActions of [0, -1, 100001, 10.5, "256", NaN, null, false]) {
+        await assert.rejects(
+          paramService.createRun({ maxActions: invalidMaxActions }),
+          (err) => err?.status === 400 && err?.code === "INVALID_ARGUMENT",
+          `maxActions ${invalidMaxActions} must be rejected with 400 INVALID_ARGUMENT`
         );
       }
 

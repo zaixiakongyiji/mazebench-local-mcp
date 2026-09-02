@@ -724,8 +724,7 @@ const { ExternalPlayService } = require("./external-play");
 const externalPlay = new ExternalPlayService({
   port: PORT,
   host: HOST,
-  defaultDurationMs: Number(process.env.MAZEBENCH_DURATION_MS || 1800000),
-  defaultWinThreshold: Number(process.env.MAZEBENCH_WIN_THRESHOLD || 10),
+  defaultMaxActions: Number(process.env.MAZEBENCH_MAX_ACTIONS || 256),
   worldBundleProvider: () => buildGameWorldBundle("maze")
 });
 

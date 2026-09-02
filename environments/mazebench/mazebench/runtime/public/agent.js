@@ -979,8 +979,6 @@
     if (state.execution === "prime" && capabilities.prime_integration) void checkPrimeAvailability();
     if (localProviderId(harnessId)) void checkLocalAvailability(harnessId);
   }
-    if (localProviderId(harnessId)) void checkLocalAvailability(harnessId);
-  }
 
   // ---- model picker ---------------------------------------------------------
 
@@ -2133,7 +2131,7 @@
     const noMatchingText = i18nText("no_matching_runs", "No matching runs.");
     const noRunsYetText = i18nText("no_runs_yet", "No runs yet.");
 
-    document.getElementById("runs-total").textContent = total ? `${total} ${i18nText("actions", "runs")}` : "";
+    document.getElementById("runs-total").textContent = total ? `${total} ${i18nText("runs_count_label", "runs")}` : "";
     syncFilterSelect(
       "runs-provider",
       payload.providers || [],

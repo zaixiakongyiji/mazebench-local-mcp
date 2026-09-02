@@ -30,11 +30,12 @@ const bundleSchema = {
             "world_bundle_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "base_viewer_state_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "duration_ms": { "type": "integer", "minimum": 1000 },
+            "max_actions": { "type": "integer", "minimum": 1 },
             "win_threshold": { "type": "integer", "minimum": 1 },
             "model_name": { "type": ["string", "null"], "maxLength": 128 },
             "harness_name": { "type": ["string", "null"], "maxLength": 128 }
           },
-          "required": ["journal_seq", "timestamp", "run_id", "type", "manifest", "manifest_digest", "world_bundle_digest", "base_viewer_state_digest", "duration_ms", "win_threshold"],
+          "required": ["journal_seq", "timestamp", "run_id", "type", "manifest", "manifest_digest", "world_bundle_digest", "base_viewer_state_digest"],
           "additionalProperties": false
         },
         {
@@ -51,10 +52,11 @@ const bundleSchema = {
             "lease_epoch": { "type": "integer", "const": 1 },
             "started_at": { "type": "string", "format": "date-time" },
             "deadline_at": { "type": "string", "format": "date-time" },
+            "max_actions": { "type": "integer", "minimum": 1 },
             "lease_expires_at": { "type": "string", "format": "date-time" },
             "initial_sanitized_result": { "$ref": "#/$defs/mcp_call_result" }
           },
-          "required": ["journal_seq", "timestamp", "run_id", "type", "operation_id", "request_fingerprint", "controller_id", "lease_id", "lease_epoch", "started_at", "deadline_at", "lease_expires_at", "initial_sanitized_result"],
+          "required": ["journal_seq", "timestamp", "run_id", "type", "operation_id", "request_fingerprint", "controller_id", "lease_id", "lease_epoch", "started_at", "lease_expires_at", "initial_sanitized_result"],
           "additionalProperties": false
         },
         {
@@ -139,7 +141,7 @@ const bundleSchema = {
             "type": { "const": "finalize_intent" },
             "operation_id": { "type": "string", "maxLength": 128 },
             "request_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-            "target_outcome": { "type": "string", "enum": ["won", "timed_out", "cancelled"] },
+            "target_outcome": { "type": "string", "enum": ["won", "action_limit", "timed_out", "cancelled"] },
             "finalize_seq": { "type": "integer", "minimum": 1 },
             "finalize_started_at": { "type": "string", "format": "date-time" },
             "reason": { "type": "string", "maxLength": 256 }
@@ -153,7 +155,7 @@ const bundleSchema = {
             "timestamp": { "type": "string", "format": "date-time" },
             "run_id": { "type": "string", "pattern": "^ext-[0-9a-fA-F-]+$" },
             "type": { "const": "run_finalized" },
-            "outcome": { "type": "string", "enum": ["won", "timed_out", "cancelled"] },
+            "outcome": { "type": "string", "enum": ["won", "action_limit", "timed_out", "cancelled"] },
             "ended_event_id": { "type": "integer", "minimum": 1 },
             "summary_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "operation_id": { "type": "string", "maxLength": 128 },
@@ -415,7 +417,7 @@ const bundleSchema = {
       "properties": {
         "summary_schema_version": { "type": "integer", "const": 1 },
         "run_id": { "type": "string", "pattern": "^ext-[0-9a-fA-F-]+$" },
-        "outcome": { "type": "string", "enum": ["won", "timed_out", "cancelled", "failed"] },
+        "outcome": { "type": "string", "enum": ["won", "action_limit", "timed_out", "cancelled", "failed"] },
         "is_partial": { "type": "boolean" },
         "started_at": { "type": ["string", "null"], "format": "date-time" },
         "ended_at": { "type": "string", "format": "date-time" },
@@ -446,7 +448,7 @@ const bundleSchema = {
       "oneOf": [
         {
           "properties": {
-            "outcome": { "enum": ["won", "timed_out"] },
+            "outcome": { "enum": ["won", "action_limit", "timed_out"] },
             "is_partial": { "const": false },
             "started_at": { "type": "string", "format": "date-time" },
             "elapsed_seconds": { "type": "number", "minimum": 0 }
@@ -482,7 +484,7 @@ const bundleSchema = {
     },
     "manifest_payload": {
       "type": "object",
-      "required": ["run_id", "run_kind", "execution_class", "benchmark_eligible", "created_at", "duration_ms", "win_threshold"],
+      "required": ["run_id", "run_kind", "execution_class", "benchmark_eligible", "created_at"],
       "properties": {
         "run_id": { "type": "string", "pattern": "^ext-[0-9a-fA-F-]+$" },
         "run_kind": { "type": "string", "const": "external_play" },
@@ -490,6 +492,7 @@ const bundleSchema = {
         "benchmark_eligible": { "type": "boolean", "const": false },
         "created_at": { "type": "string", "format": "date-time" },
         "duration_ms": { "type": "integer", "minimum": 1000 },
+        "max_actions": { "type": "integer", "minimum": 1 },
         "win_threshold": { "type": "integer", "minimum": 1 }
       },
       "additionalProperties": false
@@ -591,7 +594,8 @@ const bundleSchema = {
       "required": ["run_id", "outcome", "summary_digest", "summary_url"],
       "properties": {
         "run_id": { "type": "string", "pattern": "^ext-[0-9a-fA-F-]+$" },
-        "outcome": { "type": "string", "enum": ["won", "timed_out", "cancelled", "failed"] },
+        "outcome": { "type": "string", "enum": ["won", "action_limit", "timed_out", "cancelled", "failed"] },
+        "ended": { "type": "boolean", "const": true },
         "summary_digest": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
         "summary_url": { "type": ["string", "null"], "maxLength": 256 }
       },
@@ -608,10 +612,11 @@ const bundleSchema = {
             "started_at": { "type": "string", "format": "date-time" },
             "deadline_at": { "type": "string", "format": "date-time" },
             "duration_ms": { "type": "integer", "minimum": 1000 },
+            "max_actions": { "type": "integer", "minimum": 1 },
             "controller_id": { "type": ["string", "null"], "maxLength": 128 },
             "declared_cli": { "type": ["string", "null"], "maxLength": 128 }
           },
-          "required": ["event_id", "type", "started_at", "deadline_at", "duration_ms"],
+          "required": ["event_id", "type", "started_at"],
           "additionalProperties": false
         },
         {
@@ -641,7 +646,7 @@ const bundleSchema = {
             "event_id": { "type": "integer", "minimum": 1 },
             "type": { "const": "ended" },
             "action_seq": { "type": "integer", "minimum": 0 },
-            "outcome": { "type": "string", "enum": ["won", "timed_out", "cancelled", "failed"] },
+            "outcome": { "type": "string", "enum": ["won", "action_limit", "timed_out", "cancelled", "failed"] },
             "summary_digest": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
             "summary_url": { "type": ["string", "null"], "maxLength": 256 }
           },

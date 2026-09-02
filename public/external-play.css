@@ -526,6 +526,23 @@ body.external-spectator-body {
   color: #f8fafc;
 }
 
+.modal-close-btn {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  font-size: 1.25rem;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  line-height: 1;
+  transition: all 0.2s ease;
+}
+
+.modal-close-btn:hover {
+  color: #f8fafc;
+  background: rgba(255, 255, 255, 0.1);
+}
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

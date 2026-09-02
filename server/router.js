@@ -192,7 +192,7 @@ function createRequestRouter({
         let run = payload.run_id ? externalPlay.getRun(payload.run_id) : null;
 
         if (payload.tool === "start") {
-          const isTerminal = !run || ["won", "timed_out", "cancelled", "failed"].includes(run.status);
+          const isTerminal = !run || ["won", "action_limit", "timed_out", "cancelled", "failed"].includes(run.status);
           if (isTerminal) {
             const activeRun = externalPlay.getRun(externalPlay.activeRunId);
             if (activeRun && ["armed", "active"].includes(activeRun.status)) {
@@ -317,9 +317,9 @@ function createRequestRouter({
             run_id: r.runId,
             status: r.status,
             started_at: r.startedAt,
-            deadline_at: r.deadlineAt,
-            duration_ms: r.durationMs,
-            win_threshold: r.winThreshold,
+            max_actions: r.maxActions,
+            ...(r.maxActions ? {} : { deadline_at: r.deadlineAt, duration_ms: r.durationMs }),
+            ...(r.winThreshold ? { win_threshold: r.winThreshold } : {}),
             manifest: r.manifest
           }));
           sendJson(response, 200, { runs: runsList, active_run_id: externalPlay.activeRunId });
@@ -329,7 +329,8 @@ function createRequestRouter({
           const payload = await readJsonBody(request);
           try {
             const run = await externalPlay.createRun({
-              durationMs: payload.duration_ms !== undefined ? payload.duration_ms : undefined,
+              maxActions: payload.max_actions !== undefined ? payload.max_actions : undefined,
+              durationMs: payload.max_actions === undefined && payload.duration_ms !== undefined ? payload.duration_ms : undefined,
               winThreshold: payload.win_threshold !== undefined ? payload.win_threshold : undefined,
               modelName: payload.model_name || undefined,
               harnessName: payload.harness_name || undefined
@@ -403,9 +404,9 @@ function createRequestRouter({
             as_of_event_id: run.lastEventId,
             status: run.status,
             started_at: run.startedAt,
-            deadline_at: run.deadlineAt,
-            duration_ms: run.durationMs,
-            win_threshold: run.winThreshold,
+            max_actions: run.maxActions,
+            ...(run.maxActions ? {} : { deadline_at: run.deadlineAt, duration_ms: run.durationMs }),
+            ...(run.winThreshold ? { win_threshold: run.winThreshold } : {}),
             model_name: run.modelName,
             harness_name: run.harnessName,
             viewer_state_hash: run.currentViewerStateHash

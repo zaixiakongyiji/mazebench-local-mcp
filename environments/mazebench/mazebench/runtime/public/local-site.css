@@ -5410,6 +5410,7 @@ button.run-tools__file:focus-visible {
 }
 
 .agent-composer {
+  display: none !important;
   background: rgba(7, 10, 24, 0.64);
   border: 1px solid rgba(124, 143, 255, 0.2);
   border-radius: 16px;

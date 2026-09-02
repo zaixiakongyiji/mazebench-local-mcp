@@ -5,6 +5,7 @@
     zh: {
       brand: "迷宫基准 (Maze Bench)",
       nav_build: "构建与游玩",
+      nav_external: "外部 MCP 游玩",
       nav_agent: "智能体评测",
       nav_train: "模型训练",
       home_build_title: "构建与游玩",
@@ -68,6 +69,7 @@
       agent_step_run: "启动评测",
       agent_launch_btn: "启动运行",
       agent_recent_runs: "评测运行历史 (Recent Runs)",
+      runs_count_label: "条记录",
       agent_search_placeholder: "搜索运行记录（模型、框架、状态）...",
       filter_company: "厂商 / 框架",
       filter_model: "模型",
@@ -92,6 +94,7 @@
     en: {
       brand: "Maze Bench",
       nav_build: "Build and Play",
+      nav_external: "External Play",
       nav_agent: "Agent",
       nav_train: "Train",
       home_build_title: "Build and Play",
@@ -155,6 +158,7 @@
       agent_step_run: "Run",
       agent_launch_btn: "Launch",
       agent_recent_runs: "Recent runs",
+      runs_count_label: "runs",
       agent_search_placeholder: "Search runs…",
       filter_company: "Company",
       filter_model: "Model",

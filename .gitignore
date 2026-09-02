@@ -20,3 +20,7 @@ __pycache__/
 # staged by scripts/build-python-runtime.js before building the wheel
 /mazebench_cli/_runtime/
 /dist/
+
+# local IDE and agent workspaces
+.idea/
+.agents/
