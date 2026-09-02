@@ -163,6 +163,47 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 
 `start` 用于 claim 当前场次并建立控制 lease。之后的游戏操作必须使用同一个 MCP 会话，不能直接调用或修改游戏引擎状态。
 
+## 推荐提示词
+
+下面的提示词与当前 External Play MCP 的 13 个工具及返回字段一致，可直接交给支持 MCP 工具调用的模型。当前 External Play MCP 不提供 `action_sequence`、`python_exec` 或 `quit`，因此不要在提示词中要求模型调用这些工具。
+
+```text
+Play the hidden 3D grid game using only the supplied MazeBench game controls.
+
+Call `start` exactly once first and inspect its sanitized observation. Continue in
+the same MCP session. Use the named action tools `up`, `down`, `left`, `right`,
+`rotate_camera_up`, `rotate_camera_down`, `rotate_camera_left`,
+`rotate_camera_right`, `undo`, `reset`, and `go_to_level`. Use `observe` only when
+you need to inspect the current state without consuming an action. `go_to_level`
+accepts the two world-coordinate letters for a previously visited room.
+
+The controls do not explicitly report whether a movement was blocked. Infer its
+effect only from the returned observation. Track visited rooms, attempted exits,
+failed moves, collected gems, and the current route from the observations returned
+during this run.
+
+Explore as many distinct rooms as possible and collect as many gems as possible
+before the session ends. Make every route, recovery, and exploration decision
+autonomously. Do not ask the user where to move, whether to continue, or whether
+to undo or reset. If `player_dead` is true, recover with `undo`, `reset`, or
+`go_to_level` as permitted by `allowed_commands`, then continue playing.
+
+Every tool result is an intermediate game state. While the result status remains
+`active` and `game_won` is not true, do not provide a final response, progress
+report, question, or request for confirmation. Immediately choose and call the
+next game tool. A belief that no useful move remains is not a stop condition.
+
+Stop only when a result reports `game_won: true`, or when MazeBench explicitly
+reports that the session has timed out, been cancelled, failed, or can no longer
+accept actions. Then provide a short route summary using only rooms, gems, actions,
+and the ending reason returned by the game controls.
+
+The game implementation, level files, world map, session, run artifacts, logs,
+checkpoints, and scoring are service-only. Do not try to locate or access them.
+Do not claim moves, rooms, gems, or scores that were not returned by the game
+controls.
+```
+
 ## 结束条件与运行产物
 
 场次在以下条件之一满足时结束：
