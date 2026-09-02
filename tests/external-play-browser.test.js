@@ -281,6 +281,9 @@ async function runBrowserTest() {
     const summaryCli = await page.$eval("#summary-cli", (el) => el.textContent);
     assert.ok(summaryCli.includes("browser-test-cli"), `Expected declared_cli browser-test-cli, got: ${summaryCli}`);
 
+    const homeBtnHref = await page.$eval("#summary-home-btn", (el) => el.getAttribute("href"));
+    assert.equal(homeBtnHref, "/", "Summary modal must provide a link back to homepage");
+
     // 7. Test Terminal Spectator (Joining already finalized run with fast-forward)
     console.log("  [Step 7] Testing spectator joining an already finalized run...");
     const terminalPage = await context.newPage();

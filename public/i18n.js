@@ -51,6 +51,7 @@
       outcome_cancelled: "已取消",
       outcome_failed: "失败",
       summary_title: "游戏结算概览",
+      summary_home: "返回首页",
       summary_replay: "从头回放",
       summary_download: "下载结算数据 (JSON)",
 
@@ -137,6 +138,7 @@
       outcome_cancelled: "CANCELLED",
       outcome_failed: "FAILED",
       summary_title: "Game Summary",
+      summary_home: "Back to Home",
       summary_replay: "Replay from Beginning",
       summary_download: "Download summary.json",
 

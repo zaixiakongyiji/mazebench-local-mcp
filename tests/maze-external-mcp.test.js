@@ -204,6 +204,7 @@ async function runMcpTests() {
     assert.ok(startPayload.observation, "start must return observation");
     assert.ok(startPayload.observation.player, "start observation must include player");
     assert.ok(startPayload.observation.current_room, "start observation must include current_room");
+    assert.ok(startPayload.observation.level, "start observation must include room ASCII map in level");
 
     const obsCallRes = await client.sendRequest(8, "tools/call", {
       name: "observe",
@@ -213,6 +214,7 @@ async function runMcpTests() {
     assert.equal(obsCallRes.result.isError, false);
     const obsPayload = JSON.parse(obsCallRes.result.content[0].text);
     assert.equal(obsPayload.status, "active");
+    assert.ok(obsPayload.observation?.level, "observe observation must include room ASCII map in level");
 
     const downCallRes = await client.sendContentLengthRequest(9, "tools/call", {
       name: "down",
@@ -222,6 +224,13 @@ async function runMcpTests() {
     assert.equal(downCallRes.result.isError, false);
     const downPayload = JSON.parse(downCallRes.result.content[0].text);
     assert.ok(downPayload);
+    assert.ok(downPayload.observation, "down response must include observation");
+    assert.ok(downPayload.observation.level, "down observation must include room ASCII map in level");
+    assert.ok(downPayload.observation.level.length > 1000, "level map must be full rendered ASCII grid (>1000 chars)");
+    assert.equal(typeof downPayload.observation.current_room, "string");
+    assert.equal(downPayload.observation.moved, true);
+    assert.equal(downPayload.observation._transition_source, undefined, "internal transition source must not leak to AI");
+    assert.equal(downPayload.observation.board_state_hash, undefined, "internal board state hash must not leak to AI");
 
     // 8. Schema and pattern validation: go_to_level
     console.log("  [Test 8] Schema argument and pattern validation for go_to_level");

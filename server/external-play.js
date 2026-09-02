@@ -1360,7 +1360,7 @@ class RunInstance {
         status: this.status,
         action_seq: this.lastActionSeq,
         viewer_state_hash: this.currentViewerStateHash,
-        observation: snap
+        observation: sanitizeObservationForMcp(snap)
       };
     });
   }
@@ -1860,13 +1860,53 @@ function assertSummaryInvariants(summary) {
 
 function sanitizeObservationForMcp(obs) {
   if (!obs) return {};
-  const { _render_state, ascii_legend, json_display_palette, ...rest } = obs;
-  const str = JSON.stringify(rest);
-  if (str.length > 3500) {
-    const { level, json_observation, ...compact } = rest;
-    return compact;
+  const {
+    current_room = "",
+    current_view = "",
+    yaw = 0,
+    gem_count = 0,
+    visited_levels = [],
+    player_dead = false,
+    game_won = false,
+    game_lost = false,
+    level = "",
+    json_observation = null,
+    player = null,
+    moved = undefined,
+    death_message = "",
+    allowed_commands = []
+  } = obs;
+
+  const result = {
+    observation_mode: json_observation ? "json" : "ascii",
+    current_room: String(current_room || ""),
+    current_view: String(current_view || ""),
+    yaw: Number.isInteger(yaw) ? yaw : 0,
+    gem_count: Math.max(0, Number(gem_count) || 0),
+    visited_levels: Array.isArray(visited_levels) ? visited_levels.map(String) : [],
+    player_dead: Boolean(player_dead),
+    game_won: Boolean(game_won),
+    game_lost: Boolean(game_lost)
+  };
+
+  if (level) {
+    result.level = String(level);
   }
-  return rest;
+  if (json_observation) {
+    result.json_observation = json_observation;
+  }
+  if (player) {
+    result.player = player;
+  }
+  if (moved !== undefined) {
+    result.moved = Boolean(moved);
+  }
+  if (result.player_dead) {
+    result.death_message = String(death_message || "The player died, you must now undo or reset or go to a level.");
+    result.allowed_commands = Array.isArray(allowed_commands) ? allowed_commands.map(String) : ["undo", "reset", "go to level X Y"];
+  }
+
+  return result;
 }
 
 function round4(v) {

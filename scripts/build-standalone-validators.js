@@ -507,7 +507,7 @@ const bundleSchema = {
             "required": ["type", "text"],
             "properties": {
               "type": { "type": "string", "const": "text" },
-              "text": { "type": "string", "maxLength": 4096 }
+              "text": { "type": "string", "maxLength": 16384 }
             },
             "additionalProperties": false
           }

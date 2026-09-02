@@ -1728,7 +1728,7 @@ args = ["mcp"]</code></pre>
           <span id="spectator-rooms-stat" class="spectator-badge">🏛️ <strong id="spectator-rooms-val">1</strong></span>
           <span id="spectator-gems" class="spectator-badge">💎 <strong id="spectator-gems-val">0</strong></span>
           <span id="spectator-actions" class="spectator-badge">👟 <strong id="spectator-actions-val">0</strong></span>
-          <span id="spectator-room-stat" class="spectator-badge">🚪 <strong id="spectator-room-val">level_HxI</strong></span>
+          <span id="spectator-room" class="spectator-badge">🚪 <strong id="spectator-room-val">level_HxI</strong></span>
           <span id="controller-status" class="spectator-badge controller-badge">Controller: Disconnected</span>
           <button id="cancel-run-btn" class="button--danger button--small" type="button" data-i18n="cancel_run">Cancel Run</button>
         </nav>
@@ -1763,7 +1763,7 @@ args = ["mcp"]</code></pre>
       <section id="summary-overlay" class="summary-overlay" hidden>
         <div class="summary-card-dialog">
           <div class="summary-header">
-            <h2>Game Summary</h2>
+            <h2 data-i18n="summary_title">Game Summary</h2>
             <span id="summary-outcome-badge" class="badge">WON</span>
           </div>
           <div class="summary-body">
@@ -1776,8 +1776,9 @@ args = ["mcp"]</code></pre>
               <div class="summary-stat"><label>Declared CLI</label><span id="summary-cli">-</span></div>
             </div>
             <div class="summary-actions">
-              <button id="summary-replay-btn" class="button button--primary" type="button">Replay from Beginning</button>
-              <a id="summary-json-link" class="button" href="/api/external-play/runs/${encodeURIComponent(run.runId)}/summary" download="summary.json">Download summary.json</a>
+              <a id="summary-home-btn" class="button" href="/" data-i18n="summary_home">Back to Home</a>
+              <button id="summary-replay-btn" class="button button--primary" type="button" data-i18n="summary_replay">Replay from Beginning</button>
+              <a id="summary-json-link" class="button" href="/api/external-play/runs/${encodeURIComponent(run.runId)}/summary" download="summary.json" data-i18n="summary_download">Download summary.json</a>
             </div>
           </div>
         </div>

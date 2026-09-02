@@ -80,7 +80,7 @@
     const gemsValElem = document.getElementById("spectator-gems-val");
     const actionsElem = document.getElementById("spectator-actions");
     const actionsValElem = document.getElementById("spectator-actions-val");
-    const roomElem = document.getElementById("spectator-room-stat");
+    const roomElem = document.getElementById("spectator-room") || document.getElementById("spectator-room-stat");
     const roomValElem = document.getElementById("spectator-room-val");
     const controllerStatusElem = document.getElementById("controller-status");
     const cancelBtn = document.getElementById("cancel-run-btn");
@@ -920,6 +920,9 @@
       summaryOverlay.removeAttribute("hidden");
       summaryOverlay.hidden = false;
       summaryOverlay.style.display = "flex";
+      if (window.MazeBenchI18n?.applyI18n) {
+        window.MazeBenchI18n.applyI18n();
+      }
     }
 
     if (summaryReplayBtn) {
