@@ -112,9 +112,9 @@ async function runBrowserTest() {
     }
 
     const context = await browser.newContext();
-    const runId = externalPlay.activeRunId;
-    const run = externalPlay.getRun(runId);
-    assert.ok(run, "Active run instance must exist");
+    assert.equal(externalPlay.activeRunId, null, "service startup must not create a run");
+    const run = await externalPlay.createRun();
+    const runId = run.runId;
 
     // 1. Launch stdio MCP client process and perform initial actions BEFORE browser opens
     console.log("  [Step 1] Launching stdio MCP adapter process and executing initial actions...");
