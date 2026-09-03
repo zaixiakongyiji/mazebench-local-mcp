@@ -129,12 +129,13 @@ assert.match(kimiLogo, /fill="black"/);
 assert.match(siteTheme, /img\[src\$="\/kimi\.svg"\][\s\S]*?object-fit: contain/);
 
 assert.match(
-  pages,
-  /id="train-model-loading" class="models-loading" role="status" aria-live="polite"><span class="inline-spinner" aria-hidden="true"><\/span><span class="models-loading__label">Loading models<\/span>/
+  agentScript,
+  /class="models-loading" role="status" aria-live="polite"><span class="inline-spinner" aria-hidden="true"><\/span><span class="models-loading__label">Loading models<\/span>/
 );
+assert.doesNotMatch(pageChrome, /href="\/train"/);
+assert.doesNotMatch(pages, /href="\/train"/);
 assert.match(siteTheme, /\.inline-spinner \{[\s\S]*?animation: loading-spin 0\.85s linear infinite/);
 assert.match(siteTheme, /@keyframes loading-spin \{[\s\S]*?transform: rotate\(360deg\)/);
-assert.match(pages, /rel="preload" as="image" href="\/logos\/codex\.png"[^>]*fetchpriority="high"/);
 assert.doesNotMatch(pages, /rel="preload" as="image" href="\/logos\/claude\.png"/);
 assert.doesNotMatch(pages, /rel="preload" as="image" href="\/logos\/kimi\.svg"/);
 assert.match(appSource, /"\/logos\/kimi\.svg"/);

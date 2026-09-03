@@ -12,7 +12,7 @@ function createRequestRouter({
   buildMazePreviewData,
   buildMazeWorldMapEditorData,
   buildWorlds,
-  capabilities = { external_play: true, local_mcp: true, prime_integration: false, training: false },
+  capabilities = { external_play: true, local_mcp: true, prime_integration: false },
   externalPlay,
   getContentType,
   getEditableLevel,
@@ -37,7 +37,6 @@ function createRequestRouter({
   renderHomePage,
   renderNotFound,
   renderPlayPage,
-  renderTrainPage,
   renderWorldMapEditorPage,
   resolveGameAssetPath,
   sanitizeEditorPayload,
@@ -46,7 +45,6 @@ function createRequestRouter({
   sendJson,
   sendRedirect,
   solverExports,
-  training,
   worldMaps,
   writeMazePreviewImageData
 }) {
@@ -638,46 +636,6 @@ function createRequestRouter({
 
     if (url.pathname === "/agent") {
       sendHtml(response, 200, renderAgentPage());
-      return;
-    }
-
-    if (url.pathname === "/train") {
-      sendHtml(response, 200, renderTrainPage());
-      return;
-    }
-
-    if (url.pathname === "/api/train/bootstrap") {
-      if (request.method !== "GET") {
-        response.writeHead(405, { Allow: "GET" });
-        response.end();
-        return;
-      }
-      if (!capabilities.training) {
-        sendJson(response, 400, { error: "Prime training integration is disabled.", code: "INTEGRATION_DISABLED" });
-        return;
-      }
-      sendJson(response, 200, await training.bootstrapAsync({ fresh: url.searchParams.get("refresh") === "1" }));
-      return;
-    }
-
-    if (url.pathname === "/api/train/runs") {
-      if (!capabilities.training) {
-        sendJson(response, 400, { error: "Prime training integration is disabled.", code: "INTEGRATION_DISABLED" });
-        return;
-      }
-      if (request.method === "GET") {
-        sendJson(response, 200, await training.listRunsAsync({
-          limit: Number(url.searchParams.get("limit")) || 10
-        }));
-        return;
-      }
-      if (request.method === "POST") {
-        const payload = await readJsonBody(request);
-        sendJson(response, 201, training.launch(payload));
-        return;
-      }
-      response.writeHead(405, { Allow: "GET, POST" });
-      response.end();
       return;
     }
 

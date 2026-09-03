@@ -102,8 +102,7 @@
   const capabilities = window.__AGENT_DATA__?.capabilities || window.__MAZEBENCH_CAPABILITIES__ || {
     external_play: true,
     local_mcp: true,
-    prime_integration: false,
-    training: false
+    prime_integration: false
   };
 
   const state = {
