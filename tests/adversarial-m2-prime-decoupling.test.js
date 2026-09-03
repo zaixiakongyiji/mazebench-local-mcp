@@ -156,7 +156,7 @@ async function testCleanEnvironmentIsolation() {
     assert.strictEqual(capBody.capabilities.external_play, true);
     assert.strictEqual(capBody.capabilities.local_mcp, true);
     assert.strictEqual(capBody.capabilities.prime_integration, false);
-    assert.strictEqual(capBody.capabilities.training, false);
+    assert(!("training" in capBody.capabilities));
 
     // 2. Check Agent Environment endpoint (which executes environment probing)
     const envRes = await fetch(`${baseUrl}/api/agent/environment?fresh=1`);
@@ -173,23 +173,13 @@ async function testCleanEnvironmentIsolation() {
     const harnessBody = await harnessRes.json();
     assert.deepStrictEqual(harnessBody.harnesses, []);
 
-    // 4. Check Train Bootstrap endpoint -> 400 INTEGRATION_DISABLED
-    const trainBootRes = await fetch(`${baseUrl}/api/train/bootstrap`);
-    assert.strictEqual(trainBootRes.status, 400);
-    const trainBootBody = await trainBootRes.json();
-    assert.strictEqual(trainBootBody.code, "INTEGRATION_DISABLED");
+    // 4. Removed Train routes stay unavailable
+    for (const route of ["/train", "/api/train/bootstrap", "/api/train/runs"]) {
+      const removedRes = await fetch(`${baseUrl}${route}`);
+      assert.strictEqual(removedRes.status, 404, `${route} must remain removed`);
+    }
 
-    // 5. Check Train Runs POST -> 400 INTEGRATION_DISABLED
-    const trainRunPostRes = await fetch(`${baseUrl}/api/train/runs`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "openai/gpt-5-nano" })
-    });
-    assert.strictEqual(trainRunPostRes.status, 400);
-    const trainRunPostBody = await trainRunPostRes.json();
-    assert.strictEqual(trainRunPostBody.code, "INTEGRATION_DISABLED");
-
-    // 6. Check Prime Sync POST -> 400 INTEGRATION_DISABLED
+    // 5. Check Prime Sync POST -> 400 INTEGRATION_DISABLED
     const syncRes = await fetch(`${baseUrl}/api/agent/runs/fake-run-123/prime-sync`, {
       method: "POST",
       headers: { "Content-Type": "application/json" }
@@ -298,7 +288,7 @@ async function testEnabledEnvironmentIntegration() {
     assert.strictEqual(capRes.status, 200);
     const capBody = await capRes.json();
     assert.strictEqual(capBody.capabilities.prime_integration, true);
-    assert.strictEqual(capBody.capabilities.training, true);
+    assert(!("training" in capBody.capabilities));
 
     // 2. Harnesses
     const harnessRes = await fetch(`${baseUrl}/api/agent/harnesses`);
@@ -310,7 +300,7 @@ async function testEnabledEnvironmentIntegration() {
 
     // 3. UI
     const homeHtml = await (await fetch(`${baseUrl}/`)).text();
-    assert(homeHtml.includes('href="/train"'), "Home page must include Train card when enabled");
+    assert(!homeHtml.includes('href="/train"'), "Home page must not include removed Train links");
 
     const agentHtml = await (await fetch(`${baseUrl}/agent`)).text();
     assert(agentHtml.includes('/logos/prime.png" type="image/png" fetchpriority="high"'), "Agent page must preload prime logo when enabled");
@@ -426,38 +416,7 @@ async function testAdversarialEdgeCases() {
   assert.strictEqual(cliHelpResult.status, 0, "CLI help must exit with code 0");
   assert(cliHelpResult.stdout.includes("run the MazeBench maze game"));
 
-  // 2. Training service direct invocation with enabled: false
-  console.log("  -> Testing Training service direct API safety when disabled...");
-  const { createTrainingService } = require("../server/training");
-  const disabledTraining = createTrainingService({
-    buildWorlds: { countWorldGems: () => 10 },
-    getGame: () => ({ id: "maze" }),
-    rootDir,
-    worldMaps: { defaultLevelIdForGame: () => "level_1" },
-    enabled: false,
-    primeIntegration: null
-  });
-
-  const bootstrap = disabledTraining.bootstrap();
-  assert.strictEqual(bootstrap.readiness.ready, false);
-  assert.strictEqual(bootstrap.readiness.issue, "Prime integration is disabled.");
-
-  const bootstrapAsync = await disabledTraining.bootstrapAsync();
-  assert.strictEqual(bootstrapAsync.readiness.ready, false);
-  assert.strictEqual(bootstrapAsync.readiness.issue, "Prime integration is disabled.");
-
-  const runs = disabledTraining.listRuns();
-  assert.deepStrictEqual(runs, { runs: [], total: 0 });
-
-  const runsAsync = await disabledTraining.listRunsAsync();
-  assert.deepStrictEqual(runsAsync, { runs: [], total: 0 });
-
-  assert.throws(
-    () => disabledTraining.launch({}),
-    /Prime integration is disabled|Choose an available Hosted Training model/
-  );
-
-  // 3. AgentRunService direct invocation with primeIntegration: null
+  // 2. AgentRunService direct invocation with primeIntegration: null
   console.log("  -> Testing AgentRunService direct API safety when disabled...");
   const { createAgentRunService } = require("../server/agent-runs");
   const disabledAgentService = createAgentRunService({

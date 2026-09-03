@@ -173,8 +173,8 @@ class ExternalPlayService {
     // 4. Scan & Recover existing runs
     await this._recoverRuns();
 
-    // 5. Select active run or create default armed run
-    await this._selectOrCreateActiveRun();
+    // 5. Recover an existing non-terminal run without creating a new record
+    await this._selectActiveRun();
 
     // 6. Mark READY and write initial server.json
     this.serviceState = "READY";
@@ -276,7 +276,7 @@ class ExternalPlayService {
     }
   }
 
-  async _selectOrCreateActiveRun() {
+  async _selectActiveRun() {
     const nonTerminalRuns = [];
     for (const [runId, run] of this.runs.entries()) {
       if (["armed", "active", "finalizing"].includes(run.status)) {
@@ -306,13 +306,13 @@ class ExternalPlayService {
         const target = path.join(this.quarantineDir, stale.runId);
         fs.renameSync(stale.runDir, target);
       }
-    } else {
-      // No non-terminal runs -> create default armed run
-      const newRun = await this._createArmedRunInternal({
-        maxActions: this.defaultMaxActions
-      });
-      this.activeRunId = newRun.runId;
     }
+  }
+
+  _clearActiveRun(runId) {
+    if (this.activeRunId !== runId) return;
+    this.activeRunId = null;
+    if (this.serviceState === "READY") this._writeServerJson();
   }
 
   async _createArmedRunInternal(options = {}) {
@@ -1680,6 +1680,7 @@ class RunInstance {
           };
 
           await this.appendJournalRecord(finalizeRecord);
+          this.service._clearActiveRun(this.runId);
         });
       } catch (err) {
         console.error("Finalize worker failed:", err);
@@ -1756,6 +1757,7 @@ class RunInstance {
           final_response: finalResponse
         };
         await this.appendJournalRecord(failedRecord);
+        this.service._clearActiveRun(this.runId);
       });
     } catch (fatalError) {
       console.error("Failed to persist run_failed terminal record:", fatalError);

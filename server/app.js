@@ -4,7 +4,6 @@ const crypto = require("crypto");
 const { execFile, spawnSync } = require("child_process");
 const { promisify } = require("util");
 const { createAgentRunService, enrichedPathEnv } = require("./agent-runs");
-const { createTrainingService } = require("./training");
 const { createLocalBuildWorldService } = require("./build-worlds-local");
 const { createRemoteService } = require("./remote");
 const { createMazeLevelService } = require("./maze-levels");
@@ -58,7 +57,6 @@ const PUBLIC_FILE_ROUTES = new Map(
     "/build.js",
     "/agent.js",
     "/agent-run.js",
-    "/train.js",
     "/site.css",
     "/build-theme.css",
     "/author-theme.css",
@@ -247,8 +245,7 @@ if (enablePrime) {
 const capabilities = {
   external_play: true,
   local_mcp: true,
-  prime_integration: Boolean(primeIntegration),
-  training: Boolean(primeIntegration)
+  prime_integration: Boolean(primeIntegration)
 };
 
 const agentRuns = createAgentRunService({
@@ -261,15 +258,6 @@ const agentRuns = createAgentRunService({
   loadJson,
   rootDir: ROOT_DIR,
   worldMaps
-});
-
-const training = createTrainingService({
-  buildWorlds,
-  getGame,
-  rootDir: ROOT_DIR,
-  worldMaps,
-  primeIntegration,
-  enabled: Boolean(primeIntegration)
 });
 
 const remote = createRemoteService({
@@ -740,7 +728,6 @@ const {
   renderHomePage,
   renderNotFound,
   renderPlayPage,
-  renderTrainPage,
   renderWorldMapEditorPage
 } = createPageRenderer({
   agentEnvironment,
@@ -786,7 +773,6 @@ const { handleRequest } = createRequestRouter({
   renderHomePage,
   renderNotFound,
   renderPlayPage,
-  renderTrainPage,
   renderWorldMapEditorPage,
   resolveGameAssetPath,
   sanitizeEditorPayload,
@@ -795,7 +781,6 @@ const { handleRequest } = createRequestRouter({
   sendJson,
   sendRedirect,
   solverExports,
-  training,
   worldMaps,
   writeMazePreviewImageData
 });
@@ -845,8 +830,7 @@ function createServerApp(options = {}) {
   const customCapabilities = {
     external_play: true,
     local_mcp: true,
-    prime_integration: Boolean(customPrimeIntegration),
-    training: Boolean(customPrimeIntegration)
+    prime_integration: Boolean(customPrimeIntegration)
   };
   const customAgentRuns = createAgentRunService({
     agentEnvironment,
@@ -858,14 +842,6 @@ function createServerApp(options = {}) {
     loadJson,
     rootDir: customRootDir,
     worldMaps
-  });
-  const customTraining = createTrainingService({
-    buildWorlds,
-    getGame,
-    rootDir: customRootDir,
-    worldMaps,
-    primeIntegration: customPrimeIntegration,
-    enabled: customEnablePrime
   });
   const pageRenderer = createPageRenderer({
     agentEnvironment,
@@ -907,7 +883,6 @@ function createServerApp(options = {}) {
     sendJson,
     sendRedirect,
     solverExports,
-    training: customTraining,
     worldMaps,
     writeMazePreviewImageData
   });
@@ -915,7 +890,6 @@ function createServerApp(options = {}) {
     capabilities: customCapabilities,
     primeIntegration: customPrimeIntegration,
     agentRuns: customAgentRuns,
-    training: customTraining,
     handleRequest: router.handleRequest,
     createRequestHandler: () => async (req, res) => {
       try {

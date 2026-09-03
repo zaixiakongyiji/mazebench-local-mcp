@@ -8,7 +8,6 @@ const primeCatalog = require("../server/integrations/prime/catalog");
 const primeRunner = require("../server/integrations/prime/runner");
 const primeResume = require("../server/integrations/prime/resume");
 const { createAgentRunService } = require("../server/agent-runs");
-const { createTrainingService } = require("../server/training");
 const { createServerApp } = require("../server/app");
 
 const rootDir = path.resolve(__dirname, "..");
@@ -78,46 +77,8 @@ async function testAgentRunServiceDisabledMode() {
   console.log("  ✓ Agent run service disabled mode passed");
 }
 
-async function testTrainingServiceDisabledMode() {
-  console.log("Section 3: Training service disabled mode...");
-
-  const training = createTrainingService({
-    buildWorlds: { countWorldGems: () => 100 },
-    getGame: () => ({ id: "maze" }),
-    rootDir,
-    worldMaps: { defaultLevelIdForGame: () => "level_HxI" },
-    primeIntegration: null,
-    enabled: false
-  });
-
-  const bootstrap = training.bootstrap();
-  assert.strictEqual(bootstrap.readiness.ready, false);
-  assert.strictEqual(bootstrap.readiness.issue, "Prime integration is disabled.");
-  assert.deepStrictEqual(bootstrap.models, []);
-
-  const bootstrapAsync = await training.bootstrapAsync();
-  assert.strictEqual(bootstrapAsync.readiness.ready, false);
-  assert.strictEqual(bootstrapAsync.readiness.issue, "Prime integration is disabled.");
-
-  const runs = training.listRuns();
-  assert.deepStrictEqual(runs, { runs: [], total: 0 });
-
-  const runsAsync = await training.listRunsAsync();
-  assert.deepStrictEqual(runsAsync, { runs: [], total: 0 });
-
-  assert.throws(
-    () => {
-      training.launch({});
-    },
-    /Prime integration is disabled|Choose an available Hosted Training model/,
-    "training.launch should reject when disabled"
-  );
-
-  console.log("  ✓ Training service disabled mode passed");
-}
-
 async function testServerCapabilitiesAndRoutes() {
-  console.log("Section 4: Server capabilities and HTTP route gating...");
+  console.log("Section 3: Server capabilities and HTTP route gating...");
 
   // Start server in default mode (enablePrime: false)
   const app = createServerApp({
@@ -138,8 +99,7 @@ async function testServerCapabilitiesAndRoutes() {
     assert.deepStrictEqual(capJson.capabilities, {
       external_play: true,
       local_mcp: true,
-      prime_integration: false,
-      training: false
+      prime_integration: false
     });
 
     // 2. GET /api/agent/harnesses
@@ -148,23 +108,19 @@ async function testServerCapabilitiesAndRoutes() {
     const harnessJson = await harnessRes.json();
     assert.deepStrictEqual(harnessJson.harnesses, []);
 
-    // 3. GET /api/train/bootstrap
-    const trainBootRes = await fetch(`${baseUrl}/api/train/bootstrap`);
-    assert.strictEqual(trainBootRes.status, 400);
-    const trainBootJson = await trainBootRes.json();
-    assert.strictEqual(trainBootJson.code, "INTEGRATION_DISABLED");
-
-    // 4. POST /api/train/runs
-    const trainRunRes = await fetch(`${baseUrl}/api/train/runs`, {
+    // 3. Train 页面与 API 已从核心服务移除
+    for (const route of ["/train", "/api/train/bootstrap", "/api/train/runs"]) {
+      const removedRes = await fetch(`${baseUrl}${route}`);
+      assert.strictEqual(removedRes.status, 404, `${route} must remain removed`);
+    }
+    const removedPostRes = await fetch(`${baseUrl}/api/train/runs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({})
     });
-    assert.strictEqual(trainRunRes.status, 400);
-    const trainRunJson = await trainRunRes.json();
-    assert.strictEqual(trainRunJson.code, "INTEGRATION_DISABLED");
+    assert.strictEqual(removedPostRes.status, 404);
 
-    // 5. POST /api/agent/runs/some-id/prime-sync
+    // 4. POST /api/agent/runs/some-id/prime-sync
     const syncRes = await fetch(`${baseUrl}/api/agent/runs/some-id/prime-sync`, {
       method: "POST",
       headers: { "Content-Type": "application/json" }
@@ -179,6 +135,13 @@ async function testServerCapabilitiesAndRoutes() {
     const homeHtml = await homeRes.text();
     assert(!homeHtml.includes('href="/train"'), "Home page should not render /train link when disabled");
     assert(homeHtml.includes('href="/external-play"'), "Home page should render /external-play link");
+
+    for (const route of ["/play/maze/level_HxI", "/flyover/maze/level_HxI"]) {
+      const pageRes = await fetch(`${baseUrl}${route}`);
+      assert.strictEqual(pageRes.status, 200);
+      const pageHtml = await pageRes.text();
+      assert(!pageHtml.includes('href="/train"'), `${route} must not render removed Train links`);
+    }
 
     console.log("  ✓ Server route gating passed (default disabled mode)");
   } finally {
@@ -201,7 +164,7 @@ async function testServerCapabilitiesAndRoutes() {
     assert.strictEqual(capRes.status, 200);
     const capJson = await capRes.json();
     assert.strictEqual(capJson.capabilities.prime_integration, true);
-    assert.strictEqual(capJson.capabilities.training, true);
+    assert(!("training" in capJson.capabilities));
 
     const harnessRes = await fetch(`${baseUrlEnabled}/api/agent/harnesses`);
     assert.strictEqual(harnessRes.status, 200);
@@ -212,7 +175,7 @@ async function testServerCapabilitiesAndRoutes() {
     const homeRes = await fetch(`${baseUrlEnabled}/`);
     assert.strictEqual(homeRes.status, 200);
     const homeHtml = await homeRes.text();
-    assert(homeHtml.includes('href="/train"'), "Home page should render /train link when enabled");
+    assert(!homeHtml.includes('href="/train"'), "Home page must not render removed Train links");
 
     console.log("  ✓ Server route gating passed (enabled mode)");
   } finally {
@@ -224,7 +187,6 @@ async function runAll() {
   console.log("=== Running Prime Integration Decoupled Test Suite ===");
   await testPrimeIntegrationModule();
   await testAgentRunServiceDisabledMode();
-  await testTrainingServiceDisabledMode();
   await testServerCapabilitiesAndRoutes();
   console.log("\nALL PRIME INTEGRATION DECOUPLING TESTS PASSED! (100% GREEN)");
 }
