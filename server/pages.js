@@ -78,7 +78,7 @@ function createPageRenderer({
           <script src="/play-render.js" defer></script>
           <script src="/maze-engine.js" defer></script>`;
 
-  function renderSitePage({ title, description = "", main, bodyClass = "", extraHeadHtml = "" }) {
+  function renderSitePage({ title, description = "", main, bodyClass = "", extraHeadHtml = "", extraScripts = "" }) {
     return `<!DOCTYPE html>
 <html lang="en">
   <head>
@@ -96,6 +96,7 @@ function createPageRenderer({
       ${main}
     </main>
     ${siteFooter()}
+    ${extraScripts}
   </body>
 </html>`;
   }
@@ -632,20 +633,20 @@ function createPageRenderer({
     return renderSitePage({
       title: "Build and Play — Maze Bench",
       main: `<div class="page-head">
-          <h1>Build and Play</h1>
-          <p class="page-sub">Worlds live in this repo under <span class="mono">games/</span> and never publish anywhere unless you push them.</p>
+          <h1 data-i18n="nav_build">Build and Play</h1>
+          <p class="page-sub" data-i18n="home_build_copy">Worlds live in this repo under <span class="mono">games/</span> and never publish anywhere unless you push them.</p>
           <p id="build-status" class="author-status" role="status" aria-live="polite"></p>
         </div>
         ${masterSection}
         <section class="panel" aria-label="My worlds">
-          <h2>My Worlds</h2>
+          <h2 data-i18n="my_worlds_title">My Worlds</h2>
           <div id="build-worlds" class="world-grid"></div>
         </section>
         <section class="panel build-import-panel" aria-label="Bring in a world">
-          <h2>Bring In A World</h2>
+          <h2 data-i18n="bring_world_title">Bring In A World</h2>
           <div class="card-actions" style="margin-top: 12px">
-            <button id="copy-master" type="button">Duplicate Maze Bench Environment</button>
-            <button id="import-world" type="button">Import World JSON</button>
+            <button id="copy-master" type="button" data-i18n="btn_duplicate_master">Duplicate Maze Bench Environment</button>
+            <button id="import-world" type="button" data-i18n="btn_import_json">Import World JSON</button>
             <input id="import-world-file" type="file" accept="application/json,.json" hidden>
           </div>
           <div class="online-pull" style="margin-top: 14px">
@@ -732,7 +733,7 @@ function createPageRenderer({
     return renderSitePage({
       title: "Agent — Maze Bench",
       extraHeadHtml: capabilities.prime_integration ? `<link rel="preload" as="image" href="/logos/prime.png" type="image/png" fetchpriority="high">` : "",
-      main: `<div class="page-head agent-page-head">
+      main: `<div class="page-head agent-page-head" style="display: none;">
           <h1 data-i18n="agent_title">Agent</h1>
           <p id="agent-status" class="author-status" role="status" aria-live="polite"></p>
           <div id="agent-launch-status" class="agent-launch-status" role="status" aria-live="polite" aria-atomic="true" hidden>
@@ -1687,6 +1688,177 @@ args = ["mcp"]</code></pre>
 </html>`;
   }
 
+  function renderLeaderboardPage({ capabilities = null, remoteStatus = null } = {}) {
+    return renderSitePage({
+      title: "AI Leaderboard — Maze Bench",
+      description: "Compare MazeBench model runs by exploration and gem collection.",
+      capabilities,
+      remoteStatus,
+      bodyClass: "ai-page",
+      main: `
+      <div class="ai-shell">
+        <header class="leaderboard-title">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M10 14.66v1.63a2 2 0 0 1-.98 1.69A5 5 0 0 0 7 21h10a5 5 0 0 0-2.02-3.02 2 2 0 0 1-.98-1.69v-1.63"></path>
+            <path d="M18 9h1.5a1 1 0 0 0 0-5H18"></path>
+            <path d="M4 22h16"></path>
+            <path d="M6 9a6 6 0 0 0 12 0V3a1 1 0 0 0-1-1H7a1 1 0 0 0-1 1Z"></path>
+            <path d="M6 9H4.5a1 1 0 0 1 0-5H6"></path>
+          </svg>
+          <h1 data-i18n="nav_leaderboard">AI Leaderboard</h1>
+        </header>
+
+        <section class="leaderboard-figure" id="leaderboard-figure" aria-labelledby="bar-title">
+          <header class="plot-heading">
+            <div>
+              <h2 id="bar-title" data-i18n="lb_gems_title">GEMS COLLECTED</h2>
+            </div>
+            <div class="leaderboard-filters" aria-label="Leaderboard filters">
+              <div class="filter-control">
+                <div class="filter-options" role="group" aria-label="Leaderboard metric">
+                  <button class="filter-option" type="button" data-metric="gems" data-i18n="lb_metric_gems" aria-pressed="true">Gems</button>
+                  <button class="filter-option" type="button" data-metric="rooms" data-i18n="lb_metric_rooms" aria-pressed="false">Rooms</button>
+                </div>
+              </div>
+              <div class="filter-control">
+                <div class="filter-options" role="group" aria-label="Benchmark scope">
+                  <button class="filter-option" type="button" data-scope="standard" data-i18n="lb_scope_standard" aria-pressed="true">≤256 Steps</button>
+                  <button class="filter-option" type="button" data-scope="all" data-i18n="lb_scope_all" aria-pressed="false">All Steps</button>
+                </div>
+              </div>
+              <div class="filter-control">
+                <div class="filter-options" role="group" aria-label="Aggregation mode">
+                  <button class="filter-option" type="button" data-agg="per_model" data-i18n="lb_agg_best" aria-pressed="true">Best per Model</button>
+                  <button class="filter-option" type="button" data-agg="all_runs" data-i18n="lb_agg_all" aria-pressed="false">All Records</button>
+                </div>
+              </div>
+            </div>
+          </header>
+          <p id="bar-description" class="sr-only" data-i18n="lb_bar_description">A horizontal bar leaderboard ranked by the share of MazeBench completed.</p>
+          <div id="leaderboard-bars" class="leaderboard-bars" data-metric="gems" role="list" aria-describedby="bar-description">
+            <div class="leaderboard-loading"><span class="inline-spinner" aria-hidden="true"></span></div>
+          </div>
+          <div id="leaderboard-empty" class="leaderboard-empty" hidden>
+            <strong data-i18n="lb_empty_title">暂无带模型名称的评测记录</strong>
+            <span data-i18n="lb_empty_desc">创建场次或通过 MCP 运行评测时输入模型名称，即可登上荣誉榜！</span>
+          </div>
+
+          <section id="run-detail" class="run-detail" aria-labelledby="diag-model-title">
+            <p id="run-detail-empty" class="run-detail__empty" data-i18n="lb_select_inspect">Select a run above to inspect its diagnostics.</p>
+            <div id="run-detail-content" class="diag-dashboard" hidden>
+              <header class="diag-hero">
+                <h2 id="diag-model-title" class="diag-hero__title">MODEL-NAME</h2>
+                <div id="diag-badges" class="diag-hero__badges">
+                  <span class="diag-badge diag-badge--cyan">ASCII</span>
+                  <span class="diag-badge diag-badge--emerald">NO TOOLS</span>
+                  <span id="diag-harness-badge" class="diag-badge diag-badge--purple">LOCAL MCP</span>
+                </div>
+              </header>
+
+              <div class="diag-stats-bar">
+                <div class="diag-stat-card">
+                  <span class="diag-stat-label" data-i18n="lb_rooms_visited">ROOMS VISITED</span>
+                  <div class="diag-stat-value"><strong id="diag-rooms">0</strong><span class="diag-stat-total"> / 256</span></div>
+                </div>
+                <div class="diag-stat-card">
+                  <span class="diag-stat-label" data-i18n="lb_gems_collected">GEMS COLLECTED</span>
+                  <div class="diag-stat-value"><strong id="diag-gems">0</strong><span class="diag-stat-total"> / 90</span></div>
+                </div>
+                <div class="diag-stat-card">
+                  <span class="diag-stat-label" data-i18n="lb_moves">MOVES</span>
+                  <div class="diag-stat-value"><strong id="diag-moves">0</strong></div>
+                </div>
+                <div class="diag-stat-card">
+                  <span class="diag-stat-label" data-i18n="lb_max_actions">MAX ACTIONS</span>
+                  <div class="diag-stat-value"><strong id="diag-actions">256</strong></div>
+                </div>
+                <div class="diag-stat-card">
+                  <span class="diag-stat-label" data-i18n="lb_status">STATUS</span>
+                  <div class="diag-stat-value"><strong id="diag-status" class="diag-status-pill">STOPPED</strong></div>
+                </div>
+              </div>
+
+              <div class="diag-charts-row">
+                <div class="diag-chart-card">
+                  <div class="diag-card-head">
+                    <div class="diag-card-title-group">
+                      <span class="diag-card-icon">🗺️</span>
+                      <div>
+                        <span class="diag-card-category" data-i18n="lb_category_exploration">EXPLORATION</span>
+                        <h4 class="diag-card-title" data-i18n="lb_rooms_visited">Rooms visited</h4>
+                      </div>
+                    </div>
+                    <span id="diag-rooms-badge" class="diag-card-badge">0</span>
+                  </div>
+                  <div class="diag-canvas-wrap">
+                    <canvas id="diag-rooms-canvas" width="320" height="150"></canvas>
+                  </div>
+                </div>
+
+                <div class="diag-chart-card">
+                  <div class="diag-card-head">
+                    <div class="diag-card-title-group">
+                      <span class="diag-card-icon">💎</span>
+                      <div>
+                        <span class="diag-card-category" data-i18n="lb_category_collection">COLLECTION</span>
+                        <h4 class="diag-card-title" data-i18n="lb_gems_collected">Gems collected</h4>
+                      </div>
+                    </div>
+                    <span id="diag-gems-badge" class="diag-card-badge diag-badge--gold">0</span>
+                  </div>
+                  <div class="diag-canvas-wrap">
+                    <canvas id="diag-gems-canvas" width="320" height="150"></canvas>
+                  </div>
+                </div>
+
+                <div class="diag-chart-card">
+                  <div class="diag-card-head">
+                    <div class="diag-card-title-group">
+                      <span class="diag-card-icon">✨</span>
+                      <div>
+                        <span class="diag-card-category" id="diag-novelty-category" data-i18n="lb_category_novelty">ROLLING AVERAGE OVER THE LAST 100 MOVES</span>
+                        <h4 class="diag-card-title" data-i18n="lb_novelty_title">Board-state novelty</h4>
+                      </div>
+                    </div>
+                    <span id="diag-novelty-badge" class="diag-card-badge diag-badge--pink">0%</span>
+                  </div>
+                  <div class="diag-canvas-wrap">
+                    <canvas id="diag-novelty-canvas" width="320" height="150"></canvas>
+                  </div>
+                </div>
+              </div>
+
+              <div class="diag-heatmap-card">
+                <div class="diag-card-head">
+                  <div class="diag-card-title-group">
+                    <span class="diag-card-icon">📍</span>
+                    <div>
+                      <span class="diag-card-category" data-i18n="lb_category_trajectory">TRAJECTORY</span>
+                      <h4 class="diag-card-title" data-i18n="lb_heatmap_title">Player visit heatmap</h4>
+                    </div>
+                  </div>
+                  <div class="diag-heatmap-meta">
+                    <span id="diag-unique-cells" class="diag-card-badge">0 unique cells</span>
+                    <a id="diag-source-link" class="button button--small" href="#" target="_blank" data-i18n="lb_open_run">Open agent run &rarr;</a>
+                  </div>
+                </div>
+                <div class="diag-heatmap-body" id="diag-heatmap-container">
+                  <div class="diag-heatmap-placeholder"><span class="inline-spinner"></span></div>
+                </div>
+                <div class="diag-playback-bar">
+                  <button id="diag-play-btn" type="button" class="diag-play-btn" aria-label="Play/Pause">▶</button>
+                  <input id="diag-scrubber" type="range" class="diag-scrubber" min="0" max="0" value="0" step="1">
+                  <span id="diag-step-counter" class="diag-step-counter">Step 0 / 0</span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+      </div>`,
+      extraHeadHtml: `<script src="/ai-leaderboard.js" defer></script>`
+    });
+  }
+
   function renderNotFound() {
     return renderSitePage({
       title: "Not Found — Maze Bench",
@@ -1704,6 +1876,7 @@ args = ["mcp"]</code></pre>
     renderFlyoverPage,
     renderGamePage,
     renderHomePage,
+    renderLeaderboardPage,
     renderNotFound,
     renderPlayPage,
     renderWorldMapEditorPage

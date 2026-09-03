@@ -1707,12 +1707,12 @@ class RunInstance {
             ended_at: this.finalizeStartedAt || new Date().toISOString(),
             elapsed_seconds: Math.max(0, (Date.parse(this.finalizeStartedAt || new Date().toISOString()) - Date.parse(this.startedAt)) / 1000),
             gems_collected: 0,
-            gems_total: 100,
+            gems_total: 90,
             rooms_visited: 1,
-            rooms_total: 100,
+            rooms_total: 256,
             actions_total: 0,
             declared_cli: this.declaredCli || "unknown",
-            declared_model: null,
+            declared_model: this.modelName || null,
             route: ["level_HxI"],
             progress_curve: [{ action_seq: 0, gems: 0, rooms: 1 }]
           };
@@ -1791,9 +1791,9 @@ class SummaryBuilder {
 
     const session = run.gameSession;
     const gemsCollected = !startedAt ? 0 : (session?.collectedGemIds ? session.collectedGemIds.size : 0);
-    const gemsTotal = 100;
+    const gemsTotal = 90;
     const roomsVisited = !startedAt ? 0 : (session?.visitedLevels ? session.visitedLevels.size : 1);
-    const roomsTotal = 100;
+    const roomsTotal = 256;
     const actionsTotal = run.lastActionSeq || 0;
 
     // Progress Curve calculation
@@ -1823,7 +1823,7 @@ class SummaryBuilder {
       rooms_total: roomsTotal,
       actions_total: actionsTotal,
       declared_cli: run.declaredCli || run.currentLease?.declaredCli || run.currentLease?.controllerId || "unknown",
-      declared_model: null,
+      declared_model: run.modelName || null,
       route,
       progress_curve: progressCurve
     };

@@ -2189,6 +2189,7 @@
       const active = payload.active || runs.some((run) => ["waiting", "running", "pausing", "stopping"].includes(run.status));
       clearTimeout(refreshTimer);
       refreshTimer = setTimeout(refreshRuns, active ? 3000 : 15000);
+      void fetchLeaderboard();
     } catch (error) {
       setStatus(error.message, true);
     }
@@ -2229,6 +2230,10 @@
       runsView.page += 1;
       refreshRuns();
     });
+  }
+
+  function fetchLeaderboard() {
+    window.MazeBenchLeaderboard?.fetch();
   }
 
   function wireModelCatalog() {
@@ -2388,6 +2393,7 @@
   wireConfigurationSummary();
   wireSelectionResize();
   wireRunsToolbar();
+  fetchLeaderboard();
   refreshRuns();
   document.getElementById("provider-setup-close")?.addEventListener("click", closeOrRetryProviderSetup);
   document.getElementById("provider-setup-modal")?.addEventListener("click", (event) => {
@@ -2400,6 +2406,7 @@
   });
   document.addEventListener("mazebench:langchange", () => {
     refreshRuns();
+    window.MazeBenchLeaderboard?.render();
   });
   syncComposerSteps(false);
 })();

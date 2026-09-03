@@ -2344,25 +2344,34 @@ function createAgentRunService({
     const summaryPath = path.join(runDir, "summary.json");
     let manifest = {};
     let summary = null;
+    let journalMeta = null;
     try {
       if (fs.existsSync(manifestPath)) manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     } catch (_e) {}
     try {
       if (fs.existsSync(summaryPath)) summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
     } catch (_e) {}
+    try {
+      const journalPath = path.join(runDir, "journal.jsonl");
+      if (fs.existsSync(journalPath)) {
+        const firstLine = fs.readFileSync(journalPath, "utf8").split("\n")[0];
+        if (firstLine) journalMeta = JSON.parse(firstLine);
+      }
+    } catch (_e) {}
 
     const modelName =
       manifest.model_name ||
       summary?.model_name ||
       summary?.declared_model ||
-      summary?.declared_cli ||
+      journalMeta?.model_name ||
       "External MCP";
     const harnessName =
       manifest.harness_name ||
       summary?.harness_name ||
       summary?.declared_cli ||
+      journalMeta?.harness_name ||
       "stdio-mcp";
-    const createdAt = manifest.created_at || summary?.started_at || entryName;
+    const createdAt = manifest.created_at || summary?.started_at || journalMeta?.timestamp || entryName;
 
     let status = "waiting";
     if (summary) {
@@ -2376,13 +2385,13 @@ function createAgentRunService({
 
     const turns = summary?.actions_total ?? summary?.turns ?? summary?.actions ?? 0;
     const gemCount = summary?.gems_collected ?? summary?.gem_count ?? summary?.gems ?? 0;
-    const gemTotal = summary?.gems_total ?? manifest.win_threshold ?? 100;
+    const gemTotal = summary?.gems_total ?? manifest.win_threshold ?? 90;
     const roomCount =
       summary?.rooms_visited ??
       summary?.room_count ??
       summary?.rooms ??
       (Array.isArray(summary?.route) ? summary.route.length : 1);
-    const roomTotal = summary?.rooms_total ?? 100;
+    const roomTotal = summary?.rooms_total ?? 256;
 
     return {
       id: entryName,
@@ -2399,7 +2408,8 @@ function createAgentRunService({
       status,
       turns,
       moves: turns,
-      unlimited: true,
+      max_actions: Number(manifest.max_actions ?? summary?.actions_total ?? summary?.max_actions ?? 256),
+      unlimited: !manifest.max_actions && !summary?.actions_total,
       gem_count: gemCount,
       gem_total: gemTotal,
       room_count: roomCount,
@@ -2734,6 +2744,290 @@ function createAgentRunService({
       models,
       statuses,
       active: all.some((run) => ["waiting", "running", "pausing", "stopping"].includes(run.status))
+    };
+  }
+
+  function isNamedModel(modelName, run = {}) {
+    if (!modelName || typeof modelName !== "string") return false;
+    const trimmed = modelName.trim();
+    if (!trimmed) return false;
+    if (/^(external[\s_-]*mcp|unknown|none|undefined|null|default|custom|antigravity[\s_-]*(?:mcp|client)|stdio[\s_-]*mcp)$/i.test(trimmed)) {
+      return false;
+    }
+    const harness = String(run.harness || run.harness_label || "").trim().toLowerCase();
+    if (harness && trimmed.toLowerCase() === harness) {
+      return false;
+    }
+    return true;
+  }
+
+  function isStandard256Steps(run) {
+    const turns = Number(run.turns ?? run.moves ?? 0);
+    const maxActions = Number(run.max_actions ?? run.moves ?? 256);
+    return turns <= 256 && maxActions <= 256;
+  }
+
+  function formatLeaderboardItem(run, rank) {
+    const roomCount = Number(run.room_count || 0);
+    const gemCount = Number(run.gem_count || 0);
+    const roomTotal = run.room_total != null ? Number(run.room_total) : 256;
+    const gemTotal = run.gem_total != null ? Number(run.gem_total) : 90;
+    const modelName = run.model_name || run.model || "Unknown";
+    const familyMatch = String(modelName).trim().toLowerCase().match(/^(claude|gpt|gemini|gemma|kimi|deepseek|llama|qwen|glm|minimax|mistral|grok|nemotron)/);
+    const modelFamily = familyMatch ? familyMatch[1] : "other";
+
+    // 官方百分比算法：rooms 为非起始房间占比 (max(0, rooms - 1) / 255 * 100)，gems 为 (gemCount / 90 * 100)
+    const roomPct = roomTotal > 1 ? Math.min(100, Math.max(0, Math.round(((roomCount > 0 ? roomCount - 1 : 0) / (roomTotal - 1)) * 100))) : 0;
+    const gemPct = gemTotal > 0 ? Math.min(100, Math.max(0, Math.round((gemCount / gemTotal) * 100))) : 0;
+
+    let configLabel = run.harness_label || run.harness || "";
+    if (!configLabel) {
+      configLabel = run.max_actions ? `${run.max_actions} actions` : (run.kind === "external" ? "External MCP" : "Native Runner");
+    }
+
+    return {
+      rank,
+      id: run.id,
+      model_name: modelName,
+      model: run.model || modelName,
+      model_family: modelFamily,
+      provider: run.provider || "",
+      harness: run.harness_label || run.harness || "",
+      config_label: configLabel,
+      kind: run.kind || "local",
+      status: run.status,
+      complete: Boolean(run.complete),
+      turns: Number(run.turns ?? run.moves ?? 0),
+      moves: Number(run.moves ?? run.turns ?? 0),
+      max_actions: Number(run.max_actions ?? run.moves ?? 256),
+      gem_count: gemCount,
+      gem_total: gemTotal,
+      gem_percentage: gemPct,
+      room_count: roomCount,
+      room_total: roomTotal,
+      room_percentage: roomPct,
+      created_at: run.created_at || "",
+      url: run.url || (String(run.id).startsWith("ext-") ? `/external-play/${encodeURIComponent(run.id)}` : `/agent/runs/${encodeURIComponent(run.id)}`)
+    };
+  }
+
+  function buildLeaderboardRankings(runsList) {
+    // 1. 最多房间排序: room_count DESC -> gem_count DESC -> turns ASC -> created_at DESC
+    const sortedByRooms = [...runsList].sort((left, right) => {
+      const roomDiff = (Number(right.room_count) || 0) - (Number(left.room_count) || 0);
+      if (roomDiff !== 0) return roomDiff;
+      const gemDiff = (Number(right.gem_count) || 0) - (Number(left.gem_count) || 0);
+      if (gemDiff !== 0) return gemDiff;
+      const turnDiff = (Number(left.turns ?? left.moves ?? 0) || 0) - (Number(right.turns ?? right.moves ?? 0) || 0);
+      if (turnDiff !== 0) return turnDiff;
+      return String(right.created_at || "").localeCompare(String(left.created_at || ""));
+    });
+
+    // 2. 最多宝石排序: gem_count DESC -> room_count DESC -> turns ASC -> created_at DESC
+    const sortedByGems = [...runsList].sort((left, right) => {
+      const gemDiff = (Number(right.gem_count) || 0) - (Number(left.gem_count) || 0);
+      if (gemDiff !== 0) return gemDiff;
+      const roomDiff = (Number(right.room_count) || 0) - (Number(left.room_count) || 0);
+      if (roomDiff !== 0) return roomDiff;
+      const turnDiff = (Number(left.turns ?? left.moves ?? 0) || 0) - (Number(right.turns ?? right.moves ?? 0) || 0);
+      if (turnDiff !== 0) return turnDiff;
+      return String(right.created_at || "").localeCompare(String(left.created_at || ""));
+    });
+
+    // 各模型仅取最佳一条 (per_model)
+    function dedupePerModel(list) {
+      const seen = new Set();
+      const deduped = [];
+      for (const run of list) {
+        const key = String(run.model_name || run.model || "").trim().toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          deduped.push(run);
+        }
+      }
+      return deduped;
+    }
+
+    const roomsPerModel = dedupePerModel(sortedByRooms).map((r, idx) => formatLeaderboardItem(r, idx + 1));
+    const roomsAllRuns = sortedByRooms.map((r, idx) => formatLeaderboardItem(r, idx + 1));
+    const gemsPerModel = dedupePerModel(sortedByGems).map((r, idx) => formatLeaderboardItem(r, idx + 1));
+    const gemsAllRuns = sortedByGems.map((r, idx) => formatLeaderboardItem(r, idx + 1));
+
+    return {
+      by_rooms: {
+        per_model: roomsPerModel,
+        all_runs: roomsAllRuns
+      },
+      by_gems: {
+        per_model: gemsPerModel,
+        all_runs: gemsAllRuns
+      }
+    };
+  }
+
+  function getLeaderboard(options = {}) {
+    const all = allRunSummaries();
+    // 仅保留有明确模型名称的记录
+    const namedRuns = all.filter((run) => isNamedModel(run.model_name || run.model, run));
+    const standardRuns = namedRuns.filter(isStandard256Steps);
+
+    return {
+      total_named_runs: namedRuns.length,
+      standard: buildLeaderboardRankings(standardRuns),
+      all: buildLeaderboardRankings(namedRuns)
+    };
+  }
+
+  function getRunDiagnostics(runId) {
+    if (!runId || typeof runId !== "string") return null;
+
+    let runDir = null;
+    let isExternal = false;
+    const extDir = resolveExternalRunsDir(runsDir);
+    const externalCandidates = [
+      path.join(extDir, runId),
+      path.join(runsDir, "external", runId)
+    ];
+    for (const d of externalCandidates) {
+      if (fs.existsSync(d)) {
+        runDir = d;
+        isExternal = true;
+        break;
+      }
+    }
+    if (!runDir) {
+      const nativeDir = path.join(runsDir, runId);
+      if (fs.existsSync(nativeDir)) {
+        runDir = nativeDir;
+      }
+    }
+
+    if (!runDir) return null;
+
+    let summary = null;
+    let manifest = {};
+    try {
+      const sPath = path.join(runDir, "summary.json");
+      if (fs.existsSync(sPath)) summary = JSON.parse(fs.readFileSync(sPath, "utf8"));
+    } catch (_e) {}
+    try {
+      const mPath = path.join(runDir, "manifest.json");
+      if (fs.existsSync(mPath)) manifest = JSON.parse(fs.readFileSync(mPath, "utf8"));
+    } catch (_e) {}
+
+    const trajectory = [];
+    const visitedSet = new Set();
+    const roomsVisitedSet = new Set();
+    const progressCurve = [];
+    let gemsCollected = 0;
+
+    const journalPath = path.join(runDir, "journal.jsonl");
+    const eventsPath = path.join(runDir, "agent-events.jsonl");
+
+    let journalMeta = null;
+    if (fs.existsSync(journalPath)) {
+      try {
+        const firstLine = fs.readFileSync(journalPath, "utf8").split("\n")[0];
+        if (firstLine) journalMeta = JSON.parse(firstLine);
+      } catch (_e) {}
+      try {
+        const lines = fs.readFileSync(journalPath, "utf8").split("\n");
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line);
+            if (ev.type === "action_committed") {
+              const pv = ev.action_record?.post_viewer_state;
+              const curRoom = pv?.current_room || ev.action_record?.sanitized_status?.current_room || "level_HxI";
+              const player = pv?.player;
+              const seq = ev.action_seq || trajectory.length + 1;
+              if (player && typeof player.x === "number" && typeof player.y === "number") {
+                trajectory.push({ seq, room: curRoom, x: player.x, y: player.y });
+                visitedSet.add(`${curRoom}:${player.x}:${player.y}`);
+              }
+              roomsVisitedSet.add(curRoom);
+              if (ev.action_record?.sanitized_status?.collected_gems_count != null) {
+                gemsCollected = ev.action_record.sanitized_status.collected_gems_count;
+              }
+              progressCurve.push({
+                seq,
+                rooms: roomsVisitedSet.size,
+                gems: gemsCollected
+              });
+            }
+          } catch (_err) {}
+        }
+      } catch (_e) {}
+    } else if (fs.existsSync(eventsPath)) {
+      try {
+        const lines = fs.readFileSync(eventsPath, "utf8").split("\n");
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line);
+            if (ev.player && ev.room) {
+              const seq = ev.action_seq || trajectory.length + 1;
+              trajectory.push({ seq, room: ev.room, x: ev.player.x, y: ev.player.y });
+              visitedSet.add(`${ev.room}:${ev.player.x}:${ev.player.y}`);
+              roomsVisitedSet.add(ev.room);
+              progressCurve.push({
+                seq,
+                rooms: roomsVisitedSet.size,
+                gems: ev.gem_count || 0
+              });
+            }
+          } catch (_err) {}
+        }
+      } catch (_e) {}
+    }
+
+    const noveltyCurve = [];
+    const windowSize = 50;
+    const noveltyWindow = [];
+    const seenStateKeys = new Set();
+    for (let i = 0; i < trajectory.length; i++) {
+      const cellKey = `${trajectory[i].room}:${trajectory[i].x}:${trajectory[i].y}`;
+      const isNovel = seenStateKeys.has(cellKey) ? 0 : 1;
+      seenStateKeys.add(cellKey);
+      noveltyWindow.push(isNovel);
+      if (noveltyWindow.length > windowSize) noveltyWindow.shift();
+      const sum = noveltyWindow.reduce((a, b) => a + b, 0);
+      const noveltyPct = Math.round((sum / noveltyWindow.length) * 100);
+      noveltyCurve.push({ seq: trajectory[i].seq, pct: noveltyPct });
+    }
+
+    const modelName =
+      summary?.declared_model ||
+      summary?.model_name ||
+      manifest.model_name ||
+      journalMeta?.model_name ||
+      "Unknown";
+    const harness =
+      summary?.harness_name ||
+      manifest.harness_name ||
+      journalMeta?.harness_name ||
+      (isExternal ? "antigravity-client" : "Native Runner");
+
+    const effectiveProgressCurve =
+      progressCurve.length > 2
+        ? progressCurve
+        : (summary?.progress_curve?.length ? summary.progress_curve : progressCurve);
+
+    return {
+      run_id: runId,
+      model_name: modelName,
+      harness,
+      turns: summary?.actions_total || trajectory.length || 0,
+      max_actions: summary?.max_actions || 256,
+      room_count: summary?.rooms_visited || roomsVisitedSet.size || 1,
+      room_total: 256,
+      gem_count: summary?.gems_collected || gemsCollected || 0,
+      gem_total: 90,
+      status: summary?.outcome || (isExternal ? "stopped" : "finished"),
+      unique_cells: visitedSet.size || trajectory.length || 0,
+      progress_curve: effectiveProgressCurve,
+      novelty_curve: noveltyCurve,
+      trajectory
     };
   }
 
@@ -6979,6 +7273,8 @@ function createAgentRunService({
     generateRunReview,
     getEnvironment,
     getEnvironmentAsync,
+    getLeaderboard,
+    getRunDiagnostics,
     getRunNotes,
     getRunReview,
     getRunObservation,

@@ -91,6 +91,7 @@ function topbar({ rightHtml = "", extraNavHtml = "", extraHtml = "" } = {}) {
         <a class="nav-link" href="/build" data-i18n="nav_build">Build</a>
         <a class="nav-link" href="/external-play" data-i18n="nav_external">External Play</a>
         <a class="nav-link" href="/agent" data-i18n="nav_agent">Agent</a>
+        <a class="nav-link" href="/leaderboard" data-i18n="nav_leaderboard">Leaderboard</a>
         ${extraNavHtml}
       </nav>
       <div class="topbar-end">
@@ -105,6 +106,7 @@ function topbar({ rightHtml = "", extraNavHtml = "", extraHtml = "" } = {}) {
 function siteFooter() {
   return `<footer class="site-footer">
       <span>Maze Bench (local)</span>
+      <a class="text-link" href="/leaderboard" data-i18n="nav_leaderboard">Leaderboard</a>
       <a class="text-link" href="/build" data-i18n="nav_build">Build</a>
       <a class="text-link" href="/external-play" data-i18n="nav_external">External Play</a>
       <a class="text-link" href="/agent" data-i18n="nav_agent">Agent</a>

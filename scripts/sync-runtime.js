@@ -29,6 +29,7 @@ const MIRRORED_FILES = [
   "public/author-play-data.js",
   "public/agent-run.js",
   "public/agent.js",
+  "public/ai-leaderboard.js",
   "public/external-play.css",
   "public/external-play.js",
   "public/external-play-host.js",

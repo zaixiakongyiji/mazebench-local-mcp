@@ -35,6 +35,7 @@ function createRequestRouter({
   renderFlyoverPage,
   renderGamePage,
   renderHomePage,
+  renderLeaderboardPage,
   renderNotFound,
   renderPlayPage,
   renderWorldMapEditorPage,
@@ -645,6 +646,11 @@ function createRequestRouter({
       return;
     }
 
+    if (url.pathname === "/leaderboard" || url.pathname === "/leaderboard/ai") {
+      sendHtml(response, 200, renderLeaderboardPage());
+      return;
+    }
+
     if (segments.length === 3 && segments[0] === "agent" && segments[1] === "runs") {
       const runId = decodeURIComponent(segments[2]);
       const summary = agentRuns.summarizeRun(runId);
@@ -723,6 +729,17 @@ function createRequestRouter({
       return;
     }
 
+    if (segments.length === 3 && segments[0] === "api" && segments[1] === "agent" && segments[2] === "leaderboard") {
+      if (request.method !== "GET") {
+        response.writeHead(405, { Allow: "GET" });
+        response.end();
+        return;
+      }
+
+      sendJson(response, 200, agentRuns.getLeaderboard());
+      return;
+    }
+
     if (segments.length === 3 && segments[0] === "api" && segments[1] === "agent" && segments[2] === "runs") {
       if (request.method === "GET") {
         sendJson(
@@ -786,6 +803,16 @@ function createRequestRouter({
       segments[2] === "runs"
     ) {
       const runId = decodeURIComponent(segments[3]);
+
+      if (segments[4] === "diagnostics" && request.method === "GET") {
+        const diag = agentRuns.getRunDiagnostics(runId);
+        if (!diag) {
+          sendJson(response, 404, { error: "Run not found or diagnostics unavailable" });
+          return;
+        }
+        sendJson(response, 200, diag);
+        return;
+      }
 
       if (segments[4] === "summary" && request.method === "GET") {
         sendJson(response, 200, { review: agentRuns.getRunReview(runId) });

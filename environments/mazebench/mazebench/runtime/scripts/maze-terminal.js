@@ -458,17 +458,34 @@ function cloneTransferActor(actor) {
   };
 }
 
+function replaceTransferActor(actors, transferActor) {
+  const source = actors || [];
+  if (!transferActor) {
+    return source.map((actor) => ({ ...actor }));
+  }
+
+  const firstPlayerIndex = source.findIndex((actor) => isPlayerActorType(actor?.type));
+  if (firstPlayerIndex === -1) {
+    return source.map((actor) => ({ ...actor })).concat({ ...transferActor });
+  }
+
+  const result = [];
+  for (let i = 0; i < source.length; i++) {
+    const actor = source[i];
+    if (i === firstPlayerIndex) {
+      result.push({ ...transferActor });
+    } else if (!isPlayerActorType(actor?.type)) {
+      result.push({ ...actor });
+    }
+  }
+  return result;
+}
+
 function buildRuntimeRoom(mazeEngine, playData, transferActor = null) {
   const roomPlayData = {
     ...playData,
-    actors: (playData.actors || []).map((actor) => ({ ...actor }))
+    actors: replaceTransferActor(playData.actors, transferActor)
   };
-
-  if (transferActor) {
-    roomPlayData.actors = roomPlayData.actors
-      .filter((actor) => !isPlayerActorType(actor.type))
-      .concat({ ...transferActor });
-  }
 
   const engine = mazeEngine.createEngine(roomPlayData);
 
@@ -3444,9 +3461,7 @@ function edgeTransitionForMove(context, dx, dy) {
   context.level = nextLevel;
   context.playData = {
     ...nextRoom.playData,
-    actors: nextRoom.playData.actors
-      .filter((actor) => !isPlayerActorType(actor.type))
-      .concat(transferActor)
+    actors: replaceTransferActor(nextRoom.playData.actors, transferActor)
   };
   context.engine = context.mazeEngine.createEngine(context.playData);
   context.state = context.engine.cloneState(context.engine.initialState);
@@ -4320,6 +4335,7 @@ module.exports = {
   buildObservationInventory,
   buildModelJsonPayload,
   buildJsonObservation,
+  buildRuntimeRoom,
   buildScorecard,
   cameraDirectionForInteractiveKey,
   createTerminalContext,

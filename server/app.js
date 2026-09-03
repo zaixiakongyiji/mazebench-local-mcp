@@ -57,6 +57,7 @@ const PUBLIC_FILE_ROUTES = new Map(
     "/build.js",
     "/agent.js",
     "/agent-run.js",
+    "/ai-leaderboard.js",
     "/site.css",
     "/build-theme.css",
     "/author-theme.css",
@@ -726,6 +727,7 @@ const {
   renderFlyoverPage,
   renderGamePage,
   renderHomePage,
+  renderLeaderboardPage,
   renderNotFound,
   renderPlayPage,
   renderWorldMapEditorPage
@@ -771,6 +773,7 @@ const { handleRequest } = createRequestRouter({
   renderFlyoverPage,
   renderGamePage,
   renderHomePage,
+  renderLeaderboardPage,
   renderNotFound,
   renderPlayPage,
   renderWorldMapEditorPage,

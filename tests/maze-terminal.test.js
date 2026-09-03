@@ -35,6 +35,7 @@ const {
   buildJsonDisplayPalette,
   buildJsonObservation,
   buildObservationInventory,
+  buildRuntimeRoom,
   buildScorecard,
   cameraDirectionForInteractiveKey,
   createTerminalContext,
@@ -2662,4 +2663,54 @@ function syntheticFloor(width, height) {
   assert.doesNotMatch(output, /"header":/);
 }
 
+{
+  // Regression: entering a room where the authored player sits between other actors
+  // (e.g. level_HxH / mygl8anih8, where M1 weightless blocks sit at index 26 and 28,
+  // with the player at index 27) must replace the player slot in place instead of
+  // filtering and appending to the end. Appending shifted non-player actor indices
+  // off-by-one, breaking Three.js polycube grouping and tearing multiblock meshes.
+  const ctx = createContext({ levelId: "level_HxH" });
+  const initialActors = ctx.playData.actors;
+
+  assert.equal(initialActors[26].type, "weightless_box");
+  assert.equal(initialActors[26].groupId, "M1");
+  assert.equal(initialActors[27].type, "player");
+  assert.equal(initialActors[28].type, "weightless_box");
+  assert.equal(initialActors[28].groupId, "M1");
+
+  const transferActor = {
+    type: "player",
+    groupId: null,
+    label: "player",
+    imageUrl: null,
+    modelUrl: null,
+    direction: null,
+    shape: null,
+    styleKey: null,
+    removed: false,
+    elevation: 0,
+    x: 6,
+    y: 15
+  };
+
+  const nextRoom = buildRuntimeRoom(mazeEngine, ctx.playData, transferActor);
+  const runtimeActors = nextRoom.playData.actors;
+
+  assert.equal(runtimeActors.length, 29, "Actor array length must remain invariant across cross-room transfer");
+  assert.equal(runtimeActors[26].type, "weightless_box");
+  assert.equal(runtimeActors[26].groupId, "M1");
+  assert.equal(runtimeActors[26].x, 10);
+  assert.equal(runtimeActors[26].y, 13);
+
+  assert.equal(runtimeActors[27].type, "player");
+  assert.equal(runtimeActors[27].x, 6);
+  assert.equal(runtimeActors[27].y, 15);
+
+  assert.equal(runtimeActors[28].type, "weightless_box");
+  assert.equal(runtimeActors[28].groupId, "M1");
+  assert.equal(runtimeActors[28].x, 10);
+  assert.equal(runtimeActors[28].y, 14);
+}
+
 console.log("maze terminal tests passed");
+
