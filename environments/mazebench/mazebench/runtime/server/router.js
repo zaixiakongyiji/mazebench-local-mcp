@@ -187,22 +187,28 @@ function createRequestRouter({
           return;
         }
         const payload = await readJsonBody(request);
-        let run = payload.run_id ? externalPlay.getRun(payload.run_id) : null;
-
-        if (payload.tool === "start") {
-          const isTerminal = !run || ["won", "action_limit", "timed_out", "cancelled", "failed"].includes(run.status);
-          if (isTerminal) {
-            const activeRun = externalPlay.getRun(externalPlay.activeRunId);
-            if (activeRun && ["armed", "active"].includes(activeRun.status)) {
-              run = activeRun;
-            } else {
-              run = await externalPlay.createRun();
-            }
-          }
-        }
+        const run = payload.run_id
+          ? externalPlay.getRun(payload.run_id)
+          : payload.tool === "start"
+            ? externalPlay.getRun(externalPlay.activeRunId)
+            : null;
 
         if (!run) {
-          sendJson(response, 404, { error: `Run not found: ${payload.run_id}`, code: "NOT_FOUND" });
+          const noActiveRun = payload.tool === "start" && !payload.run_id;
+          sendJson(response, 404, {
+            error: noActiveRun
+              ? "No armed External Play session. Create one manually from /external-play before calling start."
+              : `Run not found: ${payload.run_id}`,
+            code: noActiveRun ? "NO_ACTIVE_RUN" : "NOT_FOUND"
+          });
+          return;
+        }
+
+        if (payload.tool === "start" && ["won", "action_limit", "timed_out", "cancelled", "failed"].includes(run.status)) {
+          sendJson(response, 409, {
+            error: `Run ${run.runId} has ended. Create a new session manually from /external-play.`,
+            code: "RUN_ENDED"
+          });
           return;
         }
 

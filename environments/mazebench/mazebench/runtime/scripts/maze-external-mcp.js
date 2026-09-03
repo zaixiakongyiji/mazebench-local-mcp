@@ -32,7 +32,7 @@ function sendStdout(jsonRpcObj) {
 const TOOLS_MANIFEST = [
   {
     name: "start",
-    description: "Claim and start the currently armed MazeBench game session and its action budget.",
+    description: "Claim and start a MazeBench game session that was manually created on the External Play page.",
     inputSchema: {
       type: "object",
       properties: {
@@ -373,7 +373,7 @@ class StdioMcpAdapter {
         if (!force) process.exit(1);
         throw new Error(`Server instance mismatch: expected ${this.instanceId}, got ${health.instance_id}`);
       }
-      this.activeRunId = health.active_run_id;
+      this.activeRunId = health.active_run_id || null;
     } catch (err) {
       logStderr(`Health check failed: ${err.message}`);
       if (!force) process.exit(1);
@@ -471,7 +471,7 @@ class StdioMcpAdapter {
             name: "mazebench",
             version: "1.0.0"
           },
-          instructions: "MazeBench local MCP evaluation service. Call 'start' tool to claim session, then use 'observe' and action tools until terminal.",
+          instructions: "MazeBench local MCP evaluation service. First create an armed session on the External Play page, then call 'start' to claim it and use 'observe' and action tools until terminal.",
           capabilities: {
             tools: { listChanged: false }
           }
@@ -630,9 +630,7 @@ class StdioMcpAdapter {
         if (toolName === "start" && !targetRunId) {
           try {
             const health = await this.httpRequest("GET", "/api/external-play/health");
-            if (health?.active_run_id) {
-              this.activeRunId = health.active_run_id;
-            }
+            this.activeRunId = health?.active_run_id || null;
           } catch (_e) {}
         }
 

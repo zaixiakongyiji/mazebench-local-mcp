@@ -88,6 +88,10 @@ async function runMcpTests() {
   let child = null;
 
   try {
+    assert.equal(externalPlay.activeRunId, null);
+    assert.equal(externalPlay.runs.size, 0);
+    const initialManualRun = await externalPlay.createRun();
+
     // 1. Verify the legacy protocol remains compatible in a separate session.
     console.log("  [Test 1] Legacy protocol compatibility");
     const legacyChild = spawn(process.execPath, [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")], {
@@ -201,6 +205,7 @@ async function runMcpTests() {
     assert.ok(startCallRes.result);
     assert.equal(startCallRes.result.isError, false);
     const startPayload = JSON.parse(startCallRes.result.content[0].text);
+    assert.equal(startPayload.run_id, initialManualRun.runId);
     assert.equal(startPayload.status, "active");
     assert.equal(startPayload.ended, false);
     assert.equal(startPayload.max_actions, 256);
@@ -312,8 +317,8 @@ async function runMcpTests() {
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(activeRun.lastActionSeq, actionSeqBeforeActiveCancel, "cancelled pre-WAL action must not commit");
 
-    // 11. Reconfigured run auto-recovery: cancel current run and create a new armed run
-    console.log("  [Test 11] Reconfigured run auto-recovery on start");
+    // 11. Reconfigured run sync: cancel current run and manually create a new armed run
+    console.log("  [Test 11] Start syncs to a manually created replacement run");
     await activeRun._startFinalize("cancelled", "reconfigured_before_start");
     while (activeRun.status === "finalizing") {
       await new Promise((r) => setTimeout(r, 10));
@@ -351,28 +356,33 @@ async function runMcpTests() {
     assert.equal(explicitPayload.run_id, explicitRun.runId);
     assert.equal(explicitPayload.status, "active");
 
-    // 13. Auto-creation of armed run when all runs are terminal
-    console.log("  [Test 13] Auto-create armed run when starting on terminal state");
+    // 13. Starting without a manually created run must not add a record
+    console.log("  [Test 13] Start stays idle when all runs are terminal");
     await explicitRun._startFinalize("cancelled", "User requested manual cancellation");
     while (explicitRun.status === "finalizing") {
       await new Promise((r) => setTimeout(r, 10));
     }
+    assert.equal(externalPlay.activeRunId, null);
+    const runCountBeforeRejectedStart = externalPlay.runs.size;
     externalPlay.defaultMaxActions = 2;
-    const autoCreateStartRes = await client.sendRequest(17, "tools/call", {
+    const rejectedStartRes = await client.sendRequest(17, "tools/call", {
       name: "start",
       arguments: {}
     });
-    assert.ok(autoCreateStartRes.result);
-    assert.equal(autoCreateStartRes.result.isError, false);
-    const autoCreatePayload = JSON.parse(autoCreateStartRes.result.content[0].text);
-    assert.ok(autoCreatePayload.run_id);
-    assert.notEqual(autoCreatePayload.run_id, explicitRun.runId);
-    assert.equal(autoCreatePayload.status, "active");
-    assert.equal(autoCreatePayload.max_actions, 2);
+    assert.equal(rejectedStartRes.result?.isError, true);
+    assert.match(rejectedStartRes.result.content[0].text, /No armed External Play session/);
+    assert.equal(externalPlay.activeRunId, null);
+    assert.equal(externalPlay.runs.size, runCountBeforeRejectedStart);
 
     // 14. action_sequence stops exactly at the run action limit and returns ended=true.
     console.log("  [Test 14] action_sequence stops at action limit with ended=true");
-    const terminalSequenceRes = await client.sendRequest(18, "tools/call", {
+    const terminalSequenceRun = await externalPlay.createRun({ maxActions: 2 });
+    const terminalSequenceStartRes = await client.sendRequest(18, "tools/call", {
+      name: "start",
+      arguments: { run_id: terminalSequenceRun.runId }
+    });
+    assert.equal(terminalSequenceStartRes.result?.isError, false);
+    const terminalSequenceRes = await client.sendRequest(19, "tools/call", {
       name: "action_sequence",
       arguments: { actions: ["rotate camera left", "rotate camera right", "down"] }
     });

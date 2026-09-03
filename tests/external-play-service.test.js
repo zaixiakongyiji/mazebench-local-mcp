@@ -72,16 +72,23 @@ async function runTests() {
       assertIsolation(path.resolve(__dirname, "..", "server.json"), testDataHome);
     }, /Isolation assertion failed/);
 
-    // 2. Initialize service and default armed run creation
-    console.log("  [Test 2] Service initialization and default armed run creation");
+    // 2. Initialize service without creating a run record
+    console.log("  [Test 2] Service initialization stays idle until manual run creation");
     const service = new ExternalPlayService({ port: 3001, defaultMaxActions: 3 });
     await service.initialize();
 
     assert.equal(service.serviceState, "READY");
-    assert.ok(service.activeRunId);
-    assert.ok(service.activeRunId.startsWith("ext-"));
+    assert.equal(service.activeRunId, null);
+    assert.equal(service.runs.size, 0);
+    assert.deepEqual(fs.readdirSync(service.runsDir), []);
 
-    const initialRun = service.getRun(service.activeRunId);
+    const idleServerJson = JSON.parse(fs.readFileSync(service.serverJsonPath, "utf8"));
+    assert.equal(idleServerJson.active_run_id, null);
+
+    const initialRun = await service.createRun({ maxActions: 3 });
+    assert.equal(service.activeRunId, initialRun.runId);
+    assert.ok(initialRun.runId.startsWith("ext-"));
+
     assert.ok(initialRun);
     assert.equal(initialRun.status, "armed");
     assert.equal(initialRun.lastJournalSeq, 1);
@@ -278,6 +285,7 @@ async function runTests() {
     assert.ok(summaryContent.rooms_visited >= 1);
     assert.ok(summaryContent.actions_total >= 2);
     assert.ok(summaryContent.progress_curve.length >= 2);
+    assert.equal(service.activeRunId, null, "a finished run must not remain active");
 
     // Post-finalization mutations must be rejected
     await assert.rejects(async () => {
@@ -309,7 +317,8 @@ async function runTests() {
     await restartedService.initialize();
 
     assert.equal(restartedService.serviceState, "READY");
-    assert.ok(restartedService.activeRunId);
+    assert.equal(restartedService.activeRunId, null, "restart must not create a replacement run");
+    assert.equal(restartedService.runs.size, 1, "restart must recover history without adding records");
 
     const recoveredRun = restartedService.getRun(initialRun.runId);
     assert.ok(recoveredRun);
@@ -419,7 +428,7 @@ async function runTests() {
     const failureService = new ExternalPlayService({ dataHome: failureDataHome, port: 3005 });
     await failureService.initialize();
     try {
-      const failureRun = failureService.getRun(failureService.activeRunId);
+      const failureRun = await failureService.createRun();
       const failureControllerSession = await failureService.handleControllerSession(
         failureService.mcpBootstrapNonce,
         { name: "finalize-failure-client" }
@@ -441,6 +450,7 @@ async function runTests() {
       assert.ok(failedRecord);
       assert.match(failedRecord.partial_summary_digest, /^[0-9a-f]{64}$/);
       assert.equal(failedRecord.final_response.outcome, "failed");
+      assert.equal(failureService.activeRunId, null);
     } finally {
       failureService.shutdown();
     }
@@ -480,14 +490,14 @@ async function runTests() {
       paramService.shutdown();
     }
 
-    // 15. Atomic replacement of unclaimed default armed run
-    console.log("  [Test 15] Atomic replacement of unclaimed default armed run");
+    // 15. Atomic replacement of an unclaimed manually created armed run
+    console.log("  [Test 15] Atomic replacement of an unclaimed manual armed run");
     const replaceDataHome = path.join(testDataHome, "atomic-replace");
     const replaceService = new ExternalPlayService({ dataHome: replaceDataHome, port: 3007 });
     await replaceService.initialize();
     try {
-      const oldArmedRunId = replaceService.activeRunId;
-      const oldArmedRun = replaceService.getRun(oldArmedRunId);
+      const oldArmedRun = await replaceService.createRun();
+      const oldArmedRunId = oldArmedRun.runId;
       assert.ok(oldArmedRun);
       assert.equal(oldArmedRun.status, "armed");
 
@@ -543,7 +553,7 @@ async function runTests() {
       const raceService2 = new ExternalPlayService({ dataHome: raceDataHome, port: 3008 });
       await raceService2.initialize();
       try {
-        const armedRun = raceService2.getRun(raceService2.activeRunId);
+        const armedRun = await raceService2.createRun();
         const ctrlSession2 = await raceService2.handleControllerSession(raceService2.mcpBootstrapNonce, { name: "race-test-2" });
         const ctrl2 = raceService2.validateControllerToken(`Bearer ${ctrlSession2.controller_token}`);
         await armedRun.startOrAttach(ctrl2, "claim-op-1");

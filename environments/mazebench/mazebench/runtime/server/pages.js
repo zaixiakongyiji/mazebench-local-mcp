@@ -1460,7 +1460,7 @@ function createPageRenderer({
             <a class="button button--primary" href="/external-play/${encodeURIComponent(activeRun.runId)}" style="padding: 10px 20px;" data-i18n="ext_spectate_btn">Watch / Spectate 3D &rarr;</a>
           </div>
         </section>`
-      : `<p class="muted" style="margin-bottom: 24px;" data-i18n="ext_no_active_session">No active session right now. Create one below or launch MCP.</p>`;
+      : `<p class="muted" style="margin-bottom: 24px;" data-i18n="ext_no_active_session">No active session right now. Create one below before starting MCP play.</p>`;
 
     return renderSitePage({
       title: "External Play (Local MCP) — Maze Bench",
