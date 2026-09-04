@@ -6808,12 +6808,19 @@ button.run-tools__file:focus-visible {
   background-color: #03040a;
 }
 
+.ai-page .page-shell {
+  --page-max: min(95vw, 1680px);
+  max-width: var(--page-max);
+  padding: clamp(16px, 2.5vw, 32px) clamp(12px, 2vw, 28px) 64px;
+}
+
 .ai-shell {
-  --page-max: 1380px;
+  --page-max: 100%;
   gap: 0;
   margin: 0 auto;
-  max-width: var(--page-max);
-  padding: 0 20px 92px;
+  max-width: 100%;
+  padding: 0 0 92px;
+  width: 100%;
 }
 
 .leaderboard-title {
@@ -7496,6 +7503,7 @@ button.run-tools__file:focus-visible {
 
 .heatmap-svg {
   filter: drop-shadow(0 0 12px rgba(52, 231, 240, 0.3));
+  overflow: visible;
 }
 
 .heatmap-room-line {

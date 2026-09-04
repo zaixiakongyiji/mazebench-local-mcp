@@ -627,3 +627,19 @@ body.external-spectator-body {
   cursor: pointer;
   accent-color: var(--ext-accent);
 }
+
+/* Limit Mode Toggle & Presets */
+.limit-mode-option:hover {
+  filter: brightness(1.15);
+  border-color: rgba(124, 58, 237, 0.6) !important;
+}
+
+.preset-btn {
+  transition: all 0.15s ease;
+}
+
+.preset-btn:hover {
+  background: rgba(124, 58, 237, 0.2) !important;
+  border-color: #7c3aed !important;
+  color: #e2e8f0 !important;
+}

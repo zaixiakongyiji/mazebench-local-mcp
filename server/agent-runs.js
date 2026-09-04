@@ -2462,6 +2462,13 @@ function createAgentRunService({
       (Array.isArray(summary?.route) ? summary.route.length : 1);
     const roomTotal = summary?.rooms_total ?? 256;
     const novelty = getRunFinalNovelty(runDir, summary);
+    const isTimeLimited = Boolean(
+      (manifest.duration_ms && manifest.max_actions == null) ||
+      (summary?.duration_ms && summary?.max_actions == null)
+    );
+    const durationMs = manifest.duration_ms ?? summary?.duration_ms ?? (summary?.elapsed_seconds ? Math.round(summary.elapsed_seconds * 1000) : null);
+    const elapsedSeconds = Number.isFinite(Number(summary?.elapsed_seconds)) ? Number(summary.elapsed_seconds) : null;
+    const maxActions = isTimeLimited ? null : Number(manifest.max_actions ?? summary?.actions_total ?? summary?.max_actions ?? 256);
 
     return {
       id: entryName,
@@ -2478,8 +2485,11 @@ function createAgentRunService({
       status,
       turns,
       moves: turns,
-      max_actions: Number(manifest.max_actions ?? summary?.actions_total ?? summary?.max_actions ?? 256),
-      unlimited: !manifest.max_actions && !summary?.actions_total,
+      max_actions: maxActions,
+      duration_ms: durationMs,
+      elapsed_seconds: elapsedSeconds,
+      is_time_limited: isTimeLimited,
+      unlimited: !isTimeLimited && !manifest.max_actions && !summary?.actions_total,
       gem_count: gemCount,
       gem_total: gemTotal,
       room_count: roomCount,
@@ -2835,9 +2845,34 @@ function createAgentRunService({
   }
 
   function isStandard256Steps(run) {
+    if (run.is_time_limited) return false;
     const turns = Number(run.turns ?? run.moves ?? 0);
     const maxActions = Number(run.max_actions ?? run.moves ?? 256);
     return turns <= 256 && maxActions <= 256;
+  }
+
+  function isUnder60Min(run) {
+    if (!run.is_time_limited) return false;
+    if (run.duration_ms != null) {
+      return Number(run.duration_ms) <= 3600 * 1000;
+    }
+    const elapsed = Number(run.elapsed_seconds);
+    if (Number.isFinite(elapsed) && elapsed > 0) {
+      return elapsed <= 3600;
+    }
+    return false;
+  }
+
+  function isOver60Min(run) {
+    if (!run.is_time_limited) return false;
+    if (run.duration_ms != null) {
+      return Number(run.duration_ms) > 3600 * 1000;
+    }
+    const elapsed = Number(run.elapsed_seconds);
+    if (Number.isFinite(elapsed) && elapsed > 3600) {
+      return true;
+    }
+    return false;
   }
 
   function formatLeaderboardItem(run, rank) {
@@ -2855,7 +2890,12 @@ function createAgentRunService({
 
     let configLabel = run.harness_label || run.harness || "";
     if (!configLabel) {
-      configLabel = run.max_actions ? `${run.max_actions} actions` : (run.kind === "external" ? "External MCP" : "Native Runner");
+      if (run.is_time_limited && run.duration_ms) {
+        const mins = Math.round(Number(run.duration_ms) / 60000);
+        configLabel = mins >= 1 ? `${mins}m limit` : `${Math.round(Number(run.duration_ms) / 1000)}s limit`;
+      } else {
+        configLabel = run.max_actions ? `${run.max_actions} actions` : (run.kind === "external" ? "External MCP" : "Native Runner");
+      }
     }
 
     return {
@@ -2872,7 +2912,15 @@ function createAgentRunService({
       complete: Boolean(run.complete),
       turns: Number(run.turns ?? run.moves ?? 0),
       moves: Number(run.moves ?? run.turns ?? 0),
-      max_actions: Number(run.max_actions ?? run.moves ?? 256),
+      max_actions: run.is_time_limited ? null : Number(run.max_actions ?? run.moves ?? 256),
+      duration_ms: run.duration_ms != null ? Number(run.duration_ms) : null,
+      elapsed_seconds: Number.isFinite(Number(run.elapsed_seconds)) ? Number(run.elapsed_seconds) : null,
+      is_time_limited: Boolean(run.is_time_limited),
+      limit_label: run.is_time_limited && run.duration_ms
+        ? (Math.round(Number(run.duration_ms) / 60000) >= 1
+            ? `${Math.round(Number(run.duration_ms) / 60000)}m`
+            : `${Math.round(Number(run.duration_ms) / 1000)}s`)
+        : null,
       gem_count: gemCount,
       gem_total: gemTotal,
       gem_percentage: gemPct,
@@ -2948,10 +2996,14 @@ function createAgentRunService({
     // 仅保留有明确模型名称的记录
     const namedRuns = all.filter((run) => isNamedModel(run.model_name || run.model, run));
     const standardRuns = namedRuns.filter(isStandard256Steps);
+    const timeUnder60Runs = namedRuns.filter(isUnder60Min);
+    const timeOver60Runs = namedRuns.filter(isOver60Min);
 
     return {
       total_named_runs: namedRuns.length,
       standard: buildLeaderboardRankings(standardRuns),
+      time_under_60m: buildLeaderboardRankings(timeUnder60Runs),
+      time_over_60m: buildLeaderboardRankings(timeOver60Runs),
       all: buildLeaderboardRankings(namedRuns)
     };
   }

@@ -34,11 +34,78 @@
     const form = document.getElementById("create-external-run-form");
     if (!form) return;
 
+    const modeOptActions = document.getElementById("mode-opt-actions");
+    const modeOptTime = document.getElementById("mode-opt-time");
+    const fieldMaxActions = document.getElementById("field-max-actions");
+    const fieldTimeLimit = document.getElementById("field-time-limit");
     const maxActionsInput = document.getElementById("ext-max-actions");
+    const timeLimitInput = document.getElementById("ext-time-limit");
+    const presetBtns = form.querySelectorAll(".preset-btn");
     const modelNameInput = document.getElementById("ext-model-name");
     const harnessNameInput = document.getElementById("ext-harness-name");
     const statusText = document.getElementById("create-ext-status");
     const submitBtn = document.getElementById("create-ext-run-btn");
+
+    let currentMode = "actions";
+
+    function setMode(mode) {
+      currentMode = mode;
+      if (mode === "actions") {
+        if (modeOptActions) {
+          modeOptActions.classList.add("is-selected");
+          modeOptActions.style.background = "rgba(124, 58, 237, 0.2)";
+          modeOptActions.style.borderColor = "#7c3aed";
+        }
+        if (modeOptTime) {
+          modeOptTime.classList.remove("is-selected");
+          modeOptTime.style.background = "rgba(30, 41, 59, 0.7)";
+          modeOptTime.style.borderColor = "rgba(148, 163, 184, 0.2)";
+        }
+        if (fieldMaxActions) fieldMaxActions.style.display = "";
+        if (fieldTimeLimit) fieldTimeLimit.style.display = "none";
+        if (maxActionsInput) maxActionsInput.required = true;
+        if (timeLimitInput) timeLimitInput.required = false;
+      } else {
+        if (modeOptTime) {
+          modeOptTime.classList.add("is-selected");
+          modeOptTime.style.background = "rgba(124, 58, 237, 0.2)";
+          modeOptTime.style.borderColor = "#7c3aed";
+        }
+        if (modeOptActions) {
+          modeOptActions.classList.remove("is-selected");
+          modeOptActions.style.background = "rgba(30, 41, 59, 0.7)";
+          modeOptActions.style.borderColor = "rgba(148, 163, 184, 0.2)";
+        }
+        if (fieldMaxActions) fieldMaxActions.style.display = "none";
+        if (fieldTimeLimit) fieldTimeLimit.style.display = "";
+        if (maxActionsInput) maxActionsInput.required = false;
+        if (timeLimitInput) timeLimitInput.required = true;
+      }
+    }
+
+    if (modeOptActions) {
+      modeOptActions.addEventListener("click", () => setMode("actions"));
+    }
+    if (modeOptTime) {
+      modeOptTime.addEventListener("click", () => setMode("time"));
+    }
+
+    presetBtns.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const sec = btn.getAttribute("data-seconds");
+        if (timeLimitInput && sec) {
+          timeLimitInput.value = sec;
+          presetBtns.forEach((b) => {
+            b.style.background = "rgba(30, 41, 59, 0.8)";
+            b.style.borderColor = "rgba(148, 163, 184, 0.3)";
+            b.style.color = "#cbd5e1";
+          });
+          btn.style.background = "rgba(124, 58, 237, 0.25)";
+          btn.style.borderColor = "#7c3aed";
+          btn.style.color = "#c4b5fd";
+        }
+      });
+    });
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -46,18 +113,25 @@
       statusText.textContent = "Creating armed session...";
 
       try {
-        const maxActions = parseInt(maxActionsInput.value, 10) || 256;
         const model_name = modelNameInput?.value?.trim() || undefined;
         const harness_name = harnessNameInput?.value?.trim() || undefined;
+
+        const payload = {
+          model_name,
+          harness_name
+        };
+
+        if (currentMode === "actions") {
+          payload.max_actions = parseInt(maxActionsInput.value, 10) || 256;
+        } else {
+          const seconds = parseInt(timeLimitInput?.value, 10) || 120;
+          payload.duration_ms = Math.max(1000, seconds * 1000);
+        }
 
         const res = await fetch("/api/external-play/runs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            max_actions: maxActions,
-            model_name,
-            harness_name
-          })
+          body: JSON.stringify(payload)
         });
 
         if (!res.ok) {
@@ -169,6 +243,7 @@
     let isLiveMode = true;
     let isPaused = false;
     let autoPlayInterval = null;
+    let currentSummaryData = null;
 
     let eventLog = [];
     let actionQueue = [];
@@ -276,18 +351,21 @@
 
     function updateScrubberUI() {
       const maxSteps = historyActions.length;
+      const isZh = Boolean(window.i18n?.isZh ? window.i18n.isZh() : window.MazeBenchI18n?.isZh?.());
       if (scrubber) {
         scrubber.max = String(maxSteps);
         scrubber.value = String(currentPlaybackStep);
       }
       if (stepLabel) {
-        stepLabel.innerHTML = `Step: <strong>${currentPlaybackStep} / ${maxSteps}</strong>`;
+        const stepText = isZh ? "步数" : "Step";
+        stepLabel.innerHTML = `${stepText}: <strong>${currentPlaybackStep} / ${maxSteps}</strong>`;
       }
       if (liveBtn) {
         liveBtn.classList.toggle("is-active", isLiveMode);
+        liveBtn.textContent = isZh ? "🔴 实时" : "🔴 Live";
       }
       if (playBtn) {
-        playBtn.textContent = isPaused ? "▶️ Play" : "⏸️ Pause";
+        playBtn.textContent = isPaused ? (isZh ? "▶️ 播放" : "▶️ Play") : (isZh ? "⏸️ 暂停" : "⏸️ Pause");
       }
       if (prevBtn) {
         prevBtn.disabled = currentPlaybackStep <= 0;
@@ -455,23 +533,57 @@
       });
     }
 
+    function formatTimeRemaining(ms) {
+      if (ms <= 0) return "0s left";
+      const totalSec = Math.ceil(ms / 1000);
+      const m = Math.floor(totalSec / 60);
+      const s = totalSec % 60;
+      if (m > 0) {
+        return `${m}:${s.toString().padStart(2, "0")} left`;
+      }
+      return `${s}s left`;
+    }
+
     // Action budget and controller liveness display.
     function updateRunStatus() {
       if (isEnded) return;
 
+      const isTimeLimited = !runData.max_actions && (runData.duration_ms || runData.deadline_at);
+
       if (!runData.started_at) {
-        if (budgetValElem) budgetValElem.textContent = "Waiting for MCP";
+        if (budgetValElem) {
+          if (isTimeLimited) {
+            const sec = Math.round((Number(runData.duration_ms) || 120000) / 1000);
+            budgetValElem.textContent = `Waiting for MCP (${sec}s limit)`;
+          } else {
+            budgetValElem.textContent = "Waiting for MCP";
+          }
+        }
         return;
       }
 
       const now = Date.now();
-      const maxActions = Number(runData.max_actions) || 256;
-      const remainingActions = Math.max(0, maxActions - totalActions);
-      if (budgetValElem) {
-        budgetValElem.textContent = `${remainingActions} actions left`;
-      }
-      if (budgetElem) {
-        budgetElem.style.color = remainingActions <= 0 ? "#f87171" : "";
+
+      if (isTimeLimited) {
+        const deadline = runData.deadline_at
+          ? Date.parse(runData.deadline_at)
+          : Date.parse(runData.started_at) + (Number(runData.duration_ms) || 120000);
+        const remainingMs = Math.max(0, deadline - now);
+        if (budgetValElem) {
+          budgetValElem.textContent = formatTimeRemaining(remainingMs);
+        }
+        if (budgetElem) {
+          budgetElem.style.color = remainingMs <= 10000 ? "#f87171" : "";
+        }
+      } else {
+        const maxActions = Number(runData.max_actions) || 256;
+        const remainingActions = Math.max(0, maxActions - totalActions);
+        if (budgetValElem) {
+          budgetValElem.textContent = `${remainingActions} actions left`;
+        }
+        if (budgetElem) {
+          budgetElem.style.color = remainingActions <= 0 ? "#f87171" : "";
+        }
       }
 
       // Controller heartbeat check
@@ -666,6 +778,8 @@
         // Sync lifecycle and action budget.
         if (snapshot.started_at) runData.started_at = snapshot.started_at;
         if (snapshot.max_actions) runData.max_actions = snapshot.max_actions;
+        if (snapshot.duration_ms) runData.duration_ms = snapshot.duration_ms;
+        if (snapshot.deadline_at) runData.deadline_at = snapshot.deadline_at;
         if (snapshot.status === "active") {
           statusPill.textContent = "ACTIVE";
           statusPill.className = "status-pill status-pill--running";
@@ -887,6 +1001,8 @@
       if (type === "started" || record.type === "started") {
         if (record.started_at) runData.started_at = record.started_at;
         if (record.max_actions) runData.max_actions = record.max_actions;
+        if (record.duration_ms) runData.duration_ms = record.duration_ms;
+        if (record.deadline_at) runData.deadline_at = record.deadline_at;
         statusPill.textContent = "ACTIVE";
         statusPill.className = "status-pill status-pill--running";
         controllerStatusElem.textContent = "Live Stream Connected";
@@ -959,10 +1075,13 @@
         };
       }
 
-      const outcome = (summary.outcome || summary.status || "ENDED").toUpperCase();
-      summaryOutcomeBadge.textContent = outcome;
-      summaryOutcomeBadge.className = `badge badge--${outcome.toLowerCase()}`;
-      summaryOutcome.textContent = outcome;
+      currentSummaryData = summary;
+      const rawOutcome = (summary.outcome || summary.status || "ENDED").toLowerCase();
+      const outcomeKey = `outcome_${rawOutcome}`;
+      const translatedOutcome = window.i18n?.t ? window.i18n.t(outcomeKey, rawOutcome.toUpperCase()) : (window.MazeBenchI18n?.t ? window.MazeBenchI18n.t(outcomeKey, rawOutcome.toUpperCase()) : rawOutcome.toUpperCase());
+      summaryOutcomeBadge.textContent = translatedOutcome;
+      summaryOutcomeBadge.className = `badge badge--${rawOutcome}`;
+      summaryOutcome.textContent = translatedOutcome;
 
       const durationSec = summary.elapsed_seconds || 0;
       summaryElapsed.textContent = `${durationSec}s`;
@@ -971,7 +1090,7 @@
       summaryRooms.textContent = summary.rooms_visited ?? (summary.route ? summary.route.length : 1);
       summaryCli.textContent = summary.declared_cli || "browser-test-cli";
 
-      console.log("[Spectator] Showing summary modal with outcome:", outcome);
+      console.log("[Spectator] Showing summary modal with outcome:", outcomeKey, translatedOutcome);
       summaryOverlay.removeAttribute("hidden");
       summaryOverlay.hidden = false;
       summaryOverlay.style.display = "flex";
@@ -981,7 +1100,9 @@
         summaryBarBtn.hidden = false;
         summaryBarBtn.style.display = "inline-flex";
       }
-      if (window.MazeBenchI18n?.applyI18n) {
+      if (window.i18n?.applyI18n) {
+        window.i18n.applyI18n();
+      } else if (window.MazeBenchI18n?.applyI18n) {
         window.MazeBenchI18n.applyI18n();
       }
     }
@@ -1008,11 +1129,24 @@
         summaryOverlay.removeAttribute("hidden");
         summaryOverlay.hidden = false;
         summaryOverlay.style.display = "flex";
-        if (window.MazeBenchI18n?.applyI18n) {
+        if (window.i18n?.applyI18n) {
+          window.i18n.applyI18n();
+        } else if (window.MazeBenchI18n?.applyI18n) {
           window.MazeBenchI18n.applyI18n();
         }
       });
     }
+
+    document.addEventListener("languagechange", () => {
+      updateScrubberUI();
+      if (currentSummaryData) {
+        const rawOutcome = (currentSummaryData.outcome || currentSummaryData.status || "ENDED").toLowerCase();
+        const outcomeKey = `outcome_${rawOutcome}`;
+        const translatedOutcome = window.i18n?.t ? window.i18n.t(outcomeKey, rawOutcome.toUpperCase()) : (window.MazeBenchI18n?.t ? window.MazeBenchI18n.t(outcomeKey, rawOutcome.toUpperCase()) : rawOutcome.toUpperCase());
+        summaryOutcomeBadge.textContent = translatedOutcome;
+        summaryOutcome.textContent = translatedOutcome;
+      }
+    });
     if (summaryOverlay) {
       summaryOverlay.addEventListener("click", (e) => {
         if (e.target === summaryOverlay) {

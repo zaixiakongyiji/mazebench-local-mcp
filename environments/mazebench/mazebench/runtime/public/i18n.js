@@ -23,8 +23,15 @@
       ext_mcp_config_title: "MCP 配置指南",
       ext_mcp_config_desc: "将以下配置添加到您的 Codex 或 Claude Desktop 客户端中：",
       create_session_title: "创建外部游玩会话 (External Play)",
+      limit_mode_label: "限制模式 (Limit Mode)",
+      limit_mode_actions: "步数限制 (Action Limit)",
+      limit_mode_time: "时间限制 (Time Limit)",
       duration_label: "时长限制（分钟）",
       win_threshold_label: "通关目标（收集宝石数）",
+      max_actions_label: "步数上限 (Action Limit)",
+      time_limit_label: "限定时间 (秒) (Time Limit in Seconds)",
+      time_limit_placeholder: "例如：120 (2分钟)",
+      time_limit_hint: "单位为秒，超时后会话将自动判定为超时结束。",
       model_name_label: "模型名称 (Model Name)",
       model_name_placeholder: "例如：Gemini 2.5 Flash / Claude 3.7 Sonnet",
       harness_name_label: "评测框架 (Harness Name)",
@@ -43,6 +50,16 @@
       step: "步骤",
       live: "实时 (Live)",
       minimal_mode_btn: "✨ 极简模式",
+      summary_btn: "📊 结算概览",
+      summary_btn_title: "查看结算概览",
+      live_btn: "🔴 实时",
+      live_btn_title: "跳转至最新实时",
+      play_btn_play: "▶️ 播放",
+      play_btn_pause: "⏸️ 暂停",
+      play_btn_title: "播放 / 暂停",
+      step_prev_title: "上一步",
+      step_next_title: "下一步",
+      playback_step_label: "步数",
       feed_title: "AI 决策与指令流",
       empty_feed: "等待 MCP 控制器下达指令...",
       outcome_won: "胜利通关",
@@ -50,6 +67,12 @@
       outcome_cancelled: "已取消",
       outcome_failed: "失败",
       summary_title: "游戏结算概览",
+      summary_outcome: "最终状态",
+      summary_duration: "持续时间",
+      summary_total_actions: "总行动数",
+      summary_gems_collected: "收集宝石数",
+      summary_rooms_visited: "探索房间数",
+      summary_declared_cli: "声明客户端",
       summary_home: "返回首页",
       summary_replay: "从头回放",
       summary_dismiss: "查看棋盘",
@@ -70,6 +93,7 @@
       agent_recent_runs: "评测运行历史 (RECENT RUNS)",
       runs_count_label: "条记录",
       agent_search_placeholder: "搜索运行记录（模型、框架、状态）...",
+      agent_search_model_placeholder: "按厂商或模型名称搜索…",
       filter_company: "厂商 / 框架",
       filter_model: "模型",
       filter_status: "状态",
@@ -126,7 +150,9 @@
       lb_metric_gems: "💎 宝石",
       lb_metric_rooms: "🏛️ 房间",
       lb_scope_standard: "≤256 步",
-      lb_scope_all: "全部步数",
+      lb_scope_time_under_60m: "≤60 分钟",
+      lb_scope_time_over_60m: ">60 分钟",
+      lb_scope_all: "全量汇总",
       lb_agg_best: "各模型最佳",
       lb_agg_all: "全部记录",
       lb_detail_title: "评测运行诊断大屏",
@@ -183,8 +209,15 @@
       ext_mcp_config_title: "MCP Client Configuration",
       ext_mcp_config_desc: "Add this configuration to your Codex or Claude Desktop client:",
       create_session_title: "Create External Play Session",
+      limit_mode_label: "Limit Mode",
+      limit_mode_actions: "Action Limit",
+      limit_mode_time: "Time Limit",
       duration_label: "Duration Limit (minutes)",
       win_threshold_label: "Win Threshold (gems to collect)",
+      max_actions_label: "Action Limit",
+      time_limit_label: "Time Limit (seconds)",
+      time_limit_placeholder: "e.g., 120 (2 min)",
+      time_limit_hint: "In seconds. The session will finalize as timed_out once the deadline is reached.",
       model_name_label: "Model Name",
       model_name_placeholder: "e.g., Gemini 2.5 Flash / Claude 3.7 Sonnet",
       harness_name_label: "Harness Name",
@@ -203,6 +236,16 @@
       step: "Step",
       live: "Live",
       minimal_mode_btn: "✨ Minimal Mode",
+      summary_btn: "📊 Summary",
+      summary_btn_title: "View Summary",
+      live_btn: "🔴 Live",
+      live_btn_title: "Jump to Live",
+      play_btn_play: "▶️ Play",
+      play_btn_pause: "⏸️ Pause",
+      play_btn_title: "Play / Pause",
+      step_prev_title: "Previous Step",
+      step_next_title: "Next Step",
+      playback_step_label: "Step",
       feed_title: "Agent Actions",
       empty_feed: "Waiting for actions from the MCP controller...",
       outcome_won: "Won",
@@ -210,6 +253,12 @@
       outcome_cancelled: "Cancelled",
       outcome_failed: "Failed",
       summary_title: "Game Summary",
+      summary_outcome: "Outcome",
+      summary_duration: "Duration",
+      summary_total_actions: "Total Actions",
+      summary_gems_collected: "Gems Collected",
+      summary_rooms_visited: "Rooms Visited",
+      summary_declared_cli: "Declared CLI",
       summary_home: "Back to Home",
       summary_replay: "Replay from Beginning",
       summary_dismiss: "View Board",
@@ -230,6 +279,7 @@
       agent_recent_runs: "Recent Runs",
       runs_count_label: "runs",
       agent_search_placeholder: "Search runs by model, harness, status...",
+      agent_search_model_placeholder: "Search by provider or model name…",
       filter_company: "Harness / Company",
       filter_model: "Model",
       filter_status: "Status",
@@ -274,7 +324,9 @@
       lb_metric_gems: "Gems",
       lb_metric_rooms: "Rooms",
       lb_scope_standard: "≤256 Steps",
-      lb_scope_all: "All Steps",
+      lb_scope_time_under_60m: "≤60 Min",
+      lb_scope_time_over_60m: ">60 Min",
+      lb_scope_all: "All Records",
       lb_agg_best: "Best per Model",
       lb_agg_all: "All Records",
       lb_detail_title: "Run Detail",
@@ -370,6 +422,13 @@
       }
     });
 
+    document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+      const key = el.getAttribute("data-i18n-title");
+      if (key) {
+        el.setAttribute("title", t(key));
+      }
+    });
+
     // 动态页面元素双语切换
     DYNAMIC_REPLACEMENTS.forEach(({ selector, zh, en, matchText }) => {
       document.querySelectorAll(selector).forEach((el) => {
@@ -418,8 +477,9 @@
     });
   }
 
-  window.i18n = {
+  const i18nInstance = {
     getLang,
+    getLanguage: getLang,
     setLang,
     toggleLang,
     t,
@@ -427,6 +487,9 @@
     applyI18n,
     isZh: () => currentLang === "zh"
   };
+
+  window.i18n = i18nInstance;
+  window.MazeBenchI18n = i18nInstance;
 
   document.addEventListener("DOMContentLoaded", () => {
     applyI18n();

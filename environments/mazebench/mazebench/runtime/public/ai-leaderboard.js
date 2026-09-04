@@ -248,7 +248,19 @@
     nameStrong.style.color = color;
 
     const configSmall = document.createElement("small");
-    configSmall.textContent = entry.config_label || entry.harness || "";
+    const metaParts = [];
+    if (entry.harness) metaParts.push(entry.harness);
+    if (entry.is_time_limited && entry.duration_ms) {
+      const mins = Math.round(Number(entry.duration_ms) / 60000);
+      metaParts.push(mins >= 1 ? `⏱️ ${mins}m` : `⏱️ ${Math.round(Number(entry.duration_ms) / 1000)}s`);
+    } else if (entry.max_actions) {
+      metaParts.push(`🎯 ${entry.max_actions}`);
+    }
+    if (entry.elapsed_seconds) {
+      const elapsedMin = Math.round(Number(entry.elapsed_seconds) / 60);
+      if (elapsedMin > 0 && !entry.is_time_limited) metaParts.push(`${elapsedMin}m`);
+    }
+    configSmall.textContent = metaParts.join(" · ") || entry.config_label || entry.harness || "";
 
     modelSpan.append(nameStrong, configSmall);
     identity.append(modelSpan);
@@ -550,22 +562,11 @@
       minRow = 8; maxRow = 8;
     }
 
-    // 留出四周边距 (Padding)，使得迷宫在视口中拥有宽敞的暗黑背景网格，对标官方图一~图四
-    const PAD = 1;
-    let viewMinCol = Math.max(0, minCol - PAD);
-    let viewMaxCol = Math.min(15, maxCol + PAD);
-    let viewMinRow = Math.max(0, minRow - PAD);
-    let viewMaxRow = Math.min(15, maxRow + PAD);
-
-    // 保证至少有 4 列 x 6 行的合理视觉视口（避免只有 1 个房间时显得太空单薄）
-    while (viewMaxCol - viewMinCol + 1 < 4 && (viewMinCol > 0 || viewMaxCol < 15)) {
-      if (viewMinCol > 0) viewMinCol--;
-      if (viewMaxCol < 15 && viewMaxCol - viewMinCol + 1 < 4) viewMaxCol++;
-    }
-    while (viewMaxRow - viewMinRow + 1 < 6 && (viewMinRow > 0 || viewMaxRow < 15)) {
-      if (viewMinRow > 0) viewMinRow--;
-      if (viewMaxRow < 15 && viewMaxRow - viewMinRow + 1 < 6) viewMaxRow++;
-    }
+    // 精确根据实际访问过的房间范围自适应裁切视口，不再强制补足 4 列或外加 padding
+    const viewMinCol = minCol;
+    const viewMaxCol = maxCol;
+    const viewMinRow = minRow;
+    const viewMaxRow = maxRow;
 
     const roomSpanX = viewMaxCol - viewMinCol + 1;
     const roomSpanY = viewMaxRow - viewMinRow + 1;
@@ -574,8 +575,9 @@
     const svgWidth = roomSpanX * ROOM_PX;
     const svgHeight = roomSpanY * ROOM_PX;
 
-    // 预先生成固定的网格分割线，全程稳定不跳变
+    // 预先生成固定的网格分割线与房间外边框，全程稳定不跳变
     const gridLines = [];
+    gridLines.push(`<rect x="0.5" y="0.5" width="${svgWidth - 1}" height="${svgHeight - 1}" fill="none" class="heatmap-room-line"></rect>`);
     for (let c = 1; c < roomSpanX; c++) {
       const x = c * ROOM_PX;
       gridLines.push(`<line x1="${x}" y1="0" x2="${x}" y2="${svgHeight}" class="heatmap-room-line"></line>`);
@@ -761,8 +763,14 @@
 
     if (elements.diagRooms) elements.diagRooms.textContent = entry.room_count || 1;
     if (elements.diagGems) elements.diagGems.textContent = entry.gem_count || 0;
-    if (elements.diagMoves) elements.diagMoves.textContent = entry.moves ?? entry.turns ?? 0;
-    if (elements.diagActions) elements.diagActions.textContent = entry.max_actions || 256;
+    if (elements.diagActions) {
+      if (entry.is_time_limited && entry.duration_ms) {
+        const mins = Math.round(Number(entry.duration_ms) / 60000);
+        elements.diagActions.textContent = mins >= 1 ? `${mins}m limit` : `${Math.round(Number(entry.duration_ms) / 1000)}s limit`;
+      } else {
+        elements.diagActions.textContent = entry.max_actions || 256;
+      }
+    }
     if (elements.diagStatus) {
       const rawStatus = (entry.status || (entry.complete ? "FINISHED" : "ACTIVE")).toUpperCase();
       if (window.i18n?.isZh()) {
@@ -782,7 +790,14 @@
     if (elements.selectedRooms) elements.selectedRooms.textContent = `${entry.room_count} / ${entry.room_total || 256}`;
     if (elements.selectedGems) elements.selectedGems.textContent = `${entry.gem_count} / ${entry.gem_total || 90}`;
     if (elements.selectedMoves) elements.selectedMoves.textContent = `${entry.moves ?? entry.turns ?? 0}`;
-    if (elements.selectedActions) elements.selectedActions.textContent = `${entry.max_actions || 256}`;
+    if (elements.selectedActions) {
+      if (entry.is_time_limited && entry.duration_ms) {
+        const mins = Math.round(Number(entry.duration_ms) / 60000);
+        elements.selectedActions.textContent = mins >= 1 ? `${mins}m limit` : `${Math.round(Number(entry.duration_ms) / 1000)}s limit`;
+      } else {
+        elements.selectedActions.textContent = `${entry.max_actions || 256}`;
+      }
+    }
     if (elements.selectedStatus) elements.selectedStatus.textContent = entry.status || (entry.complete ? "finished" : "active");
 
     if (elements.diagSourceLink) {

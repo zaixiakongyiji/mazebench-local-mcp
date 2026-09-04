@@ -570,6 +570,40 @@ async function runTests() {
       replaceService.shutdown();
     }
 
+    // 18. Time-limited session lifecycle, durationMs preservation, and MCP time_remaining response
+    console.log("  [Test 18] Time-limited session creation, durationMs preservation, and MCP time_remaining response");
+    const timedDataHome = path.join(testDataHome, "timed-session");
+    const timedService = new ExternalPlayService({ dataHome: timedDataHome, port: 3009 });
+    await timedService.initialize();
+    try {
+      const timedRun = await timedService.createRun({ durationMs: 60000 });
+      assert.equal(timedRun.maxActions, null);
+      assert.equal(timedRun.durationMs, 60000);
+      assert.equal(timedRun.status, "armed");
+
+      const timedCtrlSession = await timedService.handleControllerSession(timedService.mcpBootstrapNonce, { name: "timed-test-client" });
+      const timedCtrl = timedService.validateControllerToken(`Bearer ${timedCtrlSession.controller_token}`);
+
+      const startRes = await timedRun.startOrAttach(timedCtrl, "timed-start-op");
+      assert.equal(startRes.status, "active");
+      assert.ok(startRes.deadline_at);
+      assert.equal(timedRun.maxActions, null);
+
+      const startContent = JSON.parse(startRes.sanitized_result.content[0].text);
+      assert.equal(startContent.duration_ms, 60000);
+      assert.ok(startContent.deadline_at);
+      assert.ok(typeof startContent.time_remaining_ms === "number" && startContent.time_remaining_ms > 0);
+
+      const actRes = await timedRun.executeAction(timedCtrl, timedRun.currentLease.leaseId, timedRun.currentLease.leaseEpoch, "down", {}, "timed-act-1");
+      assert.equal(actRes.isError, false);
+      const actContent = JSON.parse(actRes.content[0].text);
+      assert.equal(actContent.duration_ms, 60000);
+      assert.ok(actContent.deadline_at);
+      assert.ok(typeof actContent.time_remaining_ms === "number" && actContent.time_remaining_ms > 0);
+    } finally {
+      timedService.shutdown();
+    }
+
     console.log("All ExternalPlayService unit & integration tests PASSED!");
   } finally {
     fs.rmSync(testDataHome, { recursive: true, force: true });

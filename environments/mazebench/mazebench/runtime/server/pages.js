@@ -1505,10 +1505,36 @@ args = ["mcp"]</code></pre>
         <section class="panel">
           <h2 data-i18n="create_session_title">Create New Session</h2>
           <form id="create-external-run-form" style="display: flex; flex-direction: column; gap: 14px; max-width: 480px; margin-top: 12px;">
-            <label class="field">
+            <div class="field">
+              <span data-i18n="limit_mode_label">Limit Mode</span>
+              <div class="limit-mode-toggle" style="display: flex; gap: 8px; margin-top: 6px;">
+                <label id="mode-opt-actions" class="limit-mode-option is-selected" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 12px; background: rgba(124, 58, 237, 0.2); border: 1px solid #7c3aed; border-radius: 8px; cursor: pointer; font-size: 0.9rem; font-weight: 500; transition: all 0.2s;">
+                  <input type="radio" name="ext-limit-mode" value="actions" checked style="display: none;">
+                  <span>🎯</span> <span data-i18n="limit_mode_actions">Action Limit</span>
+                </label>
+                <label id="mode-opt-time" class="limit-mode-option" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 12px; background: rgba(30, 41, 59, 0.7); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; cursor: pointer; font-size: 0.9rem; font-weight: 500; transition: all 0.2s;">
+                  <input type="radio" name="ext-limit-mode" value="time" style="display: none;">
+                  <span>⏱️</span> <span data-i18n="limit_mode_time">Time Limit</span>
+                </label>
+              </div>
+            </div>
+            <label class="field" id="field-max-actions">
               <span data-i18n="max_actions_label">Action Limit</span>
               <input type="number" id="ext-max-actions" min="1" max="100000" value="256" required>
             </label>
+            <div class="field" id="field-time-limit" style="display: none;">
+              <label for="ext-time-limit" style="display: flex; flex-direction: column; gap: 4px;">
+                <span data-i18n="time_limit_label">Time Limit (seconds)</span>
+                <input type="number" id="ext-time-limit" min="5" max="86400" value="120" placeholder="120">
+              </label>
+              <div class="preset-pills" style="display: flex; gap: 6px; margin-top: 6px;">
+                <button type="button" class="preset-btn" data-seconds="60" style="background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(148, 163, 184, 0.3); color: #cbd5e1; border-radius: 6px; padding: 3px 8px; font-size: 0.75rem; cursor: pointer;">60s</button>
+                <button type="button" class="preset-btn" data-seconds="120" style="background: rgba(124, 58, 237, 0.25); border: 1px solid #7c3aed; color: #c4b5fd; border-radius: 6px; padding: 3px 8px; font-size: 0.75rem; cursor: pointer;">120s</button>
+                <button type="button" class="preset-btn" data-seconds="300" style="background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(148, 163, 184, 0.3); color: #cbd5e1; border-radius: 6px; padding: 3px 8px; font-size: 0.75rem; cursor: pointer;">300s (5m)</button>
+                <button type="button" class="preset-btn" data-seconds="600" style="background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(148, 163, 184, 0.3); color: #cbd5e1; border-radius: 6px; padding: 3px 8px; font-size: 0.75rem; cursor: pointer;">600s (10m)</button>
+              </div>
+              <p class="muted" style="font-size: 0.75rem; margin: 4px 0 0 0; color: #94a3b8;" data-i18n="time_limit_hint">In seconds. The session will finalize as timed_out once the deadline is reached.</p>
+            </div>
             <label class="field">
               <span data-i18n="model_name_label">Model Name</span>
               <input type="text" id="ext-model-name" data-i18n-placeholder="model_name_placeholder" placeholder="e.g. Gemini 2.5 Flash / Claude 3.7 Sonnet">
@@ -1550,9 +1576,16 @@ args = ["mcp"]</code></pre>
       status: run.status,
       started_at: run.startedAt,
       max_actions: run.maxActions,
+      duration_ms: run.durationMs,
+      deadline_at: run.deadlineAt,
       model_name: run.modelName || "",
       harness_name: run.harnessName || ""
     };
+
+    const initialBudgetIcon = run.maxActions ? "🎯" : "⏱️";
+    const initialBudgetText = run.maxActions
+      ? `${run.maxActions} actions left`
+      : `${Math.round((run.durationMs || 120000) / 1000)}s limit`;
 
     const modelDisplay = run.modelName ? ` · Model: ${escapeHtml(run.modelName)}` : "";
     const harnessDisplay = run.harnessName ? ` · Harness: ${escapeHtml(run.harnessName)}` : "";
@@ -1599,7 +1632,7 @@ args = ["mcp"]</code></pre>
 
         <!-- Top HUD Data Pods (Centered At Top) -->
         <nav id="spectator-top-hud" class="spectator-top-hud" aria-label="Spectator top stats">
-          <span id="spectator-budget" class="spectator-badge timer-badge">🎯 <strong id="spectator-budget-val">256 actions left</strong></span>
+          <span id="spectator-budget" class="spectator-badge timer-badge">${initialBudgetIcon} <strong id="spectator-budget-val">${escapeHtml(initialBudgetText)}</strong></span>
           <span id="spectator-rooms-stat" class="spectator-badge">🏛️ <strong id="spectator-rooms-val">1</strong></span>
           <span id="spectator-gems" class="spectator-badge">💎 <strong id="spectator-gems-val">0</strong></span>
           <span id="spectator-actions" class="spectator-badge">👟 <strong id="spectator-actions-val">0</strong></span>
@@ -1622,18 +1655,18 @@ args = ["mcp"]</code></pre>
         <!-- Bottom Playback Control Bar -->
         <nav id="spectator-playback-bar" class="spectator-playback-bar" aria-label="Playback controls">
           <div class="playback-controls-left">
-            <button id="playback-play-btn" class="playback-btn" type="button" title="Play / Pause">⏸️ Pause</button>
-            <button id="playback-prev-btn" class="playback-btn" type="button" title="Previous Step">⏮️</button>
-            <button id="playback-next-btn" class="playback-btn" type="button" title="Next Step">⏭️</button>
+            <button id="playback-play-btn" class="playback-btn" type="button" title="Play / Pause" data-i18n-title="play_btn_title">⏸️ Pause</button>
+            <button id="playback-prev-btn" class="playback-btn" type="button" title="Previous Step" data-i18n-title="step_prev_title">⏮️</button>
+            <button id="playback-next-btn" class="playback-btn" type="button" title="Next Step" data-i18n-title="step_next_title">⏭️</button>
             <span id="playback-step-label" class="playback-step-label">Step: <strong>0 / 0</strong></span>
           </div>
           <div class="playback-scrubber-container">
             <input id="playback-scrubber" class="playback-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Playback step scrubber">
           </div>
           <div class="playback-controls-right">
-            <button id="playback-summary-btn" class="playback-btn" type="button" title="View Summary" data-i18n="summary_btn" hidden>📊 Summary</button>
+            <button id="playback-summary-btn" class="playback-btn" type="button" title="View Summary" data-i18n="summary_btn" data-i18n-title="summary_btn_title" hidden>📊 Summary</button>
             <button id="playback-minimal-btn" class="playback-btn playback-btn--toggle" type="button" title="Toggle Minimal Mode" aria-pressed="false" data-i18n="minimal_mode_btn">✨ Minimal Mode</button>
-            <button id="playback-live-btn" class="playback-btn playback-btn--live is-active" type="button" title="Jump to Live">🔴 Live</button>
+            <button id="playback-live-btn" class="playback-btn playback-btn--live is-active" type="button" title="Jump to Live" data-i18n="live_btn" data-i18n-title="live_btn_title">🔴 Live</button>
           </div>
         </nav>
       </div>
@@ -1646,12 +1679,12 @@ args = ["mcp"]</code></pre>
           </div>
           <div class="summary-body">
             <div class="summary-grid">
-              <div class="summary-stat"><label>Outcome</label><span id="summary-outcome">-</span></div>
-              <div class="summary-stat"><label>Duration</label><span id="summary-elapsed">-</span></div>
-              <div class="summary-stat"><label>Total Actions</label><span id="summary-actions">-</span></div>
-              <div class="summary-stat"><label>Gems Collected</label><span id="summary-gems">-</span></div>
-              <div class="summary-stat"><label>Rooms Visited</label><span id="summary-rooms">-</span></div>
-              <div class="summary-stat"><label>Declared CLI</label><span id="summary-cli">-</span></div>
+              <div class="summary-stat"><label data-i18n="summary_outcome">Outcome</label><span id="summary-outcome">-</span></div>
+              <div class="summary-stat"><label data-i18n="summary_duration">Duration</label><span id="summary-elapsed">-</span></div>
+              <div class="summary-stat"><label data-i18n="summary_total_actions">Total Actions</label><span id="summary-actions">-</span></div>
+              <div class="summary-stat"><label data-i18n="summary_gems_collected">Gems Collected</label><span id="summary-gems">-</span></div>
+              <div class="summary-stat"><label data-i18n="summary_rooms_visited">Rooms Visited</label><span id="summary-rooms">-</span></div>
+              <div class="summary-stat"><label data-i18n="summary_declared_cli">Declared CLI</label><span id="summary-cli">-</span></div>
             </div>
             <div class="summary-actions">
               <button id="summary-replay-btn" class="button button--primary" type="button" data-i18n="summary_replay">Replay from Beginning</button>
@@ -1724,7 +1757,9 @@ args = ["mcp"]</code></pre>
               <div class="filter-control">
                 <div class="filter-options" role="group" aria-label="Benchmark scope">
                   <button class="filter-option" type="button" data-scope="standard" data-i18n="lb_scope_standard" aria-pressed="true">≤256 Steps</button>
-                  <button class="filter-option" type="button" data-scope="all" data-i18n="lb_scope_all" aria-pressed="false">All Steps</button>
+                  <button class="filter-option" type="button" data-scope="time_under_60m" data-i18n="lb_scope_time_under_60m" aria-pressed="false">≤60 Min</button>
+                  <button class="filter-option" type="button" data-scope="time_over_60m" data-i18n="lb_scope_time_over_60m" aria-pressed="false">&gt;60 Min</button>
+                  <button class="filter-option" type="button" data-scope="all" data-i18n="lb_scope_all" aria-pressed="false">All Records</button>
                 </div>
               </div>
               <div class="filter-control">

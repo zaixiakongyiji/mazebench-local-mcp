@@ -1173,7 +1173,13 @@ class RunInstance {
                 observation: initialObs,
                 game_won: false,
                 ended: false,
-                ...(this.maxActions ? { max_actions: this.maxActions, actions_remaining: this.maxActions } : {})
+                ...(this.maxActions
+                  ? { max_actions: this.maxActions, actions_remaining: this.maxActions }
+                  : (deadlineAt ? {
+                      duration_ms: this.durationMs,
+                      deadline_at: deadlineAt,
+                      time_remaining_ms: Math.max(0, Date.parse(deadlineAt) - Date.now())
+                    } : {}))
               })
             }
           ],
@@ -1562,7 +1568,11 @@ class RunInstance {
               ended,
               ...(this.maxActions
                 ? { max_actions: this.maxActions, actions_remaining: Math.max(0, this.maxActions - nextActionSeq) }
-                : {})
+                : (this.deadlineAt ? {
+                    duration_ms: this.durationMs,
+                    deadline_at: this.deadlineAt,
+                    time_remaining_ms: Math.max(0, Date.parse(this.deadlineAt) - Date.now())
+                  } : {}))
             })
           }
         ],
