@@ -127,7 +127,7 @@ async function runTests() {
     const controllerInfo = service.validateControllerToken(`Bearer ${sessionRes.controller_token}`);
     assert.ok(controllerInfo);
 
-    const startRes = await initialRun.startOrAttach(controllerInfo, "op-start-1");
+    const startRes = await initialRun.startOrAttach(controllerInfo, "op-start-1", null, { modelName: "Test Model" });
     assert.equal(startRes.status, "active");
     assert.equal(startRes.lease_epoch, 1);
     assert.ok(startRes.lease_id);
@@ -367,7 +367,7 @@ async function runTests() {
         { name: "deadline-race-client" }
       );
       const raceController = raceService.validateControllerToken(`Bearer ${raceControllerSession.controller_token}`);
-      const raceStart = await raceRun.startOrAttach(raceController, "race-start");
+      const raceStart = await raceRun.startOrAttach(raceController, "race-start", null, { modelName: "Race Model" });
 
       const preservedDeadline = raceStart.deadline_at;
       if (raceRun.leaseTimer) clearTimeout(raceRun.leaseTimer);
@@ -434,7 +434,7 @@ async function runTests() {
         { name: "finalize-failure-client" }
       );
       const failureController = failureService.validateControllerToken(`Bearer ${failureControllerSession.controller_token}`);
-      await failureRun.startOrAttach(failureController, "failure-start");
+      await failureRun.startOrAttach(failureController, "failure-start", null, { modelName: "Failure Model" });
       failureRun._writeSummaryAtomically = () => {
         throw new Error("synthetic summary storage failure");
       };
@@ -534,21 +534,19 @@ async function runTests() {
       assert.ok(finalizedRecord);
       assert.equal(finalizedRecord.outcome, "cancelled");
 
-      // 16. Conflict when creating run while active run exists
-      console.log("  [Test 16] Conflict rejection when active run exists");
+      // 16. A claimed run no longer blocks preparation of the next session.
+      console.log("  [Test 16] Create next armed session while a claimed run remains active");
       const ctrlSession = await replaceService.handleControllerSession(replaceService.mcpBootstrapNonce, { name: "replace-test" });
       const ctrl = replaceService.validateControllerToken(`Bearer ${ctrlSession.controller_token}`);
-      await newRun.startOrAttach(ctrl, "start-op-1");
+      await newRun.startOrAttach(ctrl, "start-op-1", null, { modelName: "Replace Model" });
       assert.equal(newRun.status, "active");
 
-      await assert.rejects(
-        replaceService.createRun({ durationMs: 120000 }),
-        (err) => err?.status === 409 && (err?.code === "RUN_ACTIVE" || err?.code === "CONFLICT"),
-        "createRun while run is active must fail with 409"
-      );
+      const nextRun = await replaceService.createRun({ durationMs: 120000 });
+      assert.equal(nextRun.status, "armed");
+      assert.equal(replaceService.activeRunId, nextRun.runId);
 
-      // 17. Atomic rejection when MCP concurrently claims armed run
-      console.log("  [Test 17] Atomic rejection when armed run is already claimed");
+      // 17. A successful claim removes the run from the available queue.
+      console.log("  [Test 17] Claimed run leaves the queue before the next session is created");
       const raceDataHome = path.join(testDataHome, "atomic-race");
       const raceService2 = new ExternalPlayService({ dataHome: raceDataHome, port: 3008 });
       await raceService2.initialize();
@@ -556,13 +554,11 @@ async function runTests() {
         const armedRun = await raceService2.createRun();
         const ctrlSession2 = await raceService2.handleControllerSession(raceService2.mcpBootstrapNonce, { name: "race-test-2" });
         const ctrl2 = raceService2.validateControllerToken(`Bearer ${ctrlSession2.controller_token}`);
-        await armedRun.startOrAttach(ctrl2, "claim-op-1");
+        await armedRun.startOrAttach(ctrl2, "claim-op-1", null, { modelName: "Race Model 2" });
 
-        await assert.rejects(
-          raceService2.createRun({ durationMs: 180000 }),
-          (err) => err?.status === 409,
-          "createRun after claim must fail with 409"
-        );
+        const followingRun = await raceService2.createRun({ durationMs: 180000 });
+        assert.notEqual(followingRun.runId, armedRun.runId);
+        assert.equal(raceService2.activeRunId, followingRun.runId);
       } finally {
         raceService2.shutdown();
       }
@@ -584,7 +580,7 @@ async function runTests() {
       const timedCtrlSession = await timedService.handleControllerSession(timedService.mcpBootstrapNonce, { name: "timed-test-client" });
       const timedCtrl = timedService.validateControllerToken(`Bearer ${timedCtrlSession.controller_token}`);
 
-      const startRes = await timedRun.startOrAttach(timedCtrl, "timed-start-op");
+      const startRes = await timedRun.startOrAttach(timedCtrl, "timed-start-op", null, { modelName: "Timed Model" });
       assert.equal(startRes.status, "active");
       assert.ok(startRes.deadline_at);
       assert.equal(timedRun.maxActions, null);

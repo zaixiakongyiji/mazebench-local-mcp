@@ -48,6 +48,7 @@ const bundleSchema = {
             "request_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "controller_id": { "type": "string", "maxLength": 128 },
             "declared_cli": { "type": ["string", "null"], "maxLength": 128 },
+            "model_name": { "type": "string", "minLength": 1, "maxLength": 128 },
             "lease_id": { "type": "string", "maxLength": 128 },
             "lease_epoch": { "type": "integer", "const": 1 },
             "started_at": { "type": "string", "format": "date-time" },
@@ -429,6 +430,9 @@ const bundleSchema = {
         "actions_total": { "type": "integer", "minimum": 0 },
         "declared_cli": { "type": "string", "maxLength": 128 },
         "declared_model": { "type": ["string", "null"], "maxLength": 128 },
+        "group_id": { "type": "string", "pattern": "^grp-[0-9a-fA-F-]+$" },
+        "entry_id": { "type": "string", "pattern": "^entry-[1-8]$" },
+        "group_mode": { "type": "string", "enum": ["concurrent", "competition"] },
         "route": { "type": "array", "maxItems": 1024, "items": { "type": "string" } },
         "progress_curve": {
           "type": "array",
@@ -477,7 +481,7 @@ const bundleSchema = {
       "type": "object",
       "required": ["code", "message"],
       "properties": {
-        "code": { "type": "string", "enum": ["INVALID_ARGUMENT", "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "CONFLICT", "PRECONDITION_FAILED", "RESOURCE_EXHAUSTED", "INTERNAL_ERROR"] },
+        "code": { "type": "string", "enum": ["INVALID_ARGUMENT", "IDENTITY_MISMATCH", "NO_AVAILABLE_RUN", "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "CONFLICT", "PRECONDITION_FAILED", "RESOURCE_EXHAUSTED", "INTERNAL_ERROR"] },
         "message": { "type": "string", "maxLength": 512 }
       },
       "additionalProperties": false
@@ -488,14 +492,120 @@ const bundleSchema = {
       "properties": {
         "run_id": { "type": "string", "pattern": "^ext-[0-9a-fA-F-]+$" },
         "run_kind": { "type": "string", "const": "external_play" },
-        "execution_class": { "type": "string", "const": "external-unverified" },
+        "execution_class": { "type": "string", "enum": ["external-unverified", "external"] },
         "benchmark_eligible": { "type": "boolean", "const": false },
         "created_at": { "type": "string", "format": "date-time" },
         "duration_ms": { "type": "integer", "minimum": 1000 },
         "max_actions": { "type": "integer", "minimum": 1 },
-        "win_threshold": { "type": "integer", "minimum": 1 }
+        "win_threshold": { "type": "integer", "minimum": 1 },
+        "group_id": { "type": "string", "pattern": "^grp-[0-9a-fA-F-]+$" },
+        "entry_id": { "type": "string", "pattern": "^entry-[1-8]$" },
+        "group_mode": { "type": "string", "enum": ["concurrent", "competition"] }
       },
       "additionalProperties": false
+    },
+    "run_group_manifest_v1": {
+      "type": "object",
+      "required": ["schema_version", "group_id", "mode", "created_at", "world_bundle_digest", "common_config", "entries"],
+      "properties": {
+        "schema_version": { "type": "integer", "const": 1 },
+        "group_id": { "type": "string", "pattern": "^grp-[0-9a-fA-F-]+$" },
+        "mode": { "type": "string", "enum": ["concurrent", "competition"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "world_bundle_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "common_config": {
+          "type": "object",
+          "properties": {
+            "max_actions": { "type": "integer", "minimum": 1, "maximum": 100000 },
+            "duration_ms": { "type": "integer", "minimum": 60000, "maximum": 21600000 },
+            "win_threshold": { "type": "integer", "minimum": 1, "maximum": 100 }
+          },
+          "oneOf": [
+            { "required": ["max_actions"], "not": { "required": ["duration_ms"] } },
+            { "required": ["duration_ms"], "not": { "required": ["max_actions"] } }
+          ],
+          "additionalProperties": false
+        },
+        "entries": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "required": ["entry_id", "run_id"],
+            "properties": {
+              "entry_id": { "type": "string", "pattern": "^entry-[1-8]$" },
+              "run_id": { "type": "string", "pattern": "^ext-[0-9a-fA-F-]+$" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "run_group_result_v1": {
+      "type": "object",
+      "required": ["schema_version", "group_id", "mode", "completed_at", "entries", "ranking"],
+      "properties": {
+        "schema_version": { "type": "integer", "const": 1 },
+        "group_id": { "type": "string", "pattern": "^grp-[0-9a-fA-F-]+$" },
+        "mode": { "type": "string", "enum": ["concurrent", "competition"] },
+        "completed_at": { "type": "string", "format": "date-time" },
+        "entries": { "$ref": "#/$defs/run_group_result_entries" },
+        "ranking": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 8,
+              "items": {
+                "type": "object",
+                "required": ["rank", "entry_id", "run_id", "model_name", "harness", "outcome", "rooms_visited", "gems_collected", "novelty", "actions_total"],
+                "properties": {
+                  "rank": { "type": "integer", "minimum": 1, "maximum": 8 },
+                  "entry_id": { "type": "string", "pattern": "^entry-[1-8]$" },
+                  "run_id": { "type": "string", "pattern": "^ext-[0-9a-fA-F-]+$" },
+                  "model_name": { "type": ["string", "null"], "maxLength": 128 },
+                  "harness": { "type": ["string", "null"], "maxLength": 128 },
+                  "outcome": { "type": ["string", "null"] },
+                  "rooms_visited": { "type": "integer", "minimum": 0 },
+                  "gems_collected": { "type": "integer", "minimum": 0 },
+                  "novelty": { "type": "integer", "minimum": 0, "maximum": 100 },
+                  "actions_total": { "type": "integer", "minimum": 0 }
+                },
+                "additionalProperties": false
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "run_group_result_entries": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["entry_id", "run_id", "model_name", "harness", "status", "outcome", "started_at", "ended_at", "rooms_visited", "gems_collected", "actions_total", "novelty", "replay_url"],
+        "properties": {
+          "entry_id": { "type": "string", "pattern": "^entry-[1-8]$" },
+          "run_id": { "type": "string", "pattern": "^ext-[0-9a-fA-F-]+$" },
+          "model_name": { "type": ["string", "null"], "maxLength": 128 },
+          "harness": { "type": ["string", "null"], "maxLength": 128 },
+          "status": { "type": "string", "enum": ["won", "action_limit", "timed_out", "cancelled", "failed"] },
+          "outcome": { "type": ["string", "null"] },
+          "started_at": { "type": ["string", "null"], "format": "date-time" },
+          "ended_at": { "type": ["string", "null"], "format": "date-time" },
+          "rooms_visited": { "type": "integer", "minimum": 0 },
+          "gems_collected": { "type": "integer", "minimum": 0 },
+          "actions_total": { "type": "integer", "minimum": 0 },
+          "novelty": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "replay_url": { "type": "string", "maxLength": 256 }
+        },
+        "additionalProperties": false
+      }
     },
     "mcp_call_result": {
       "type": "object",
@@ -681,7 +791,9 @@ function buildValidators() {
     validateActionMessage: "https://mazebench.dev/schemas/bundle.json#/$defs/action_message_payload",
     validateSanitizedStatus: "https://mazebench.dev/schemas/bundle.json#/$defs/sanitized_status_payload",
     validateFinalResponse: "https://mazebench.dev/schemas/bundle.json#/$defs/final_response_payload",
-    validateErrorPayload: "https://mazebench.dev/schemas/bundle.json#/$defs/error_payload_safe"
+    validateErrorPayload: "https://mazebench.dev/schemas/bundle.json#/$defs/error_payload_safe",
+    validateRunGroupManifest: "https://mazebench.dev/schemas/bundle.json#/$defs/run_group_manifest_v1",
+    validateRunGroupResult: "https://mazebench.dev/schemas/bundle.json#/$defs/run_group_result_v1"
   };
 
   const rawCode = standaloneCode(ajv, mapping);

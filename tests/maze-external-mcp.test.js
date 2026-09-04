@@ -202,7 +202,7 @@ async function runMcpTests() {
     console.log("  [Test 7] Tool calling workflow with Content-Length framing");
     const startCallRes = await client.sendContentLengthRequest(7, "tools/call", {
       name: "start",
-      arguments: {}
+      arguments: { model_name: "Test Model" }
     });
     assert.ok(startCallRes.result);
     assert.equal(startCallRes.result.isError, false);
@@ -211,6 +211,10 @@ async function runMcpTests() {
     assert.equal(startPayload.status, "active");
     assert.equal(startPayload.ended, false);
     assert.equal(startPayload.max_actions, 256);
+    assert.equal(startPayload.model_name, "Test Model");
+    assert.equal(startPayload.harness, "测试客户端-claude-desktop");
+    assert.match(startPayload.run_instructions, /action_sequence/);
+    assert.equal(startPayload.instructions_version, "external-mcp-v1");
     assert.ok(startPayload.observation, "start must return observation");
     assert.ok(startPayload.observation.player, "start observation must include player");
     assert.ok(startPayload.observation.current_room, "start observation must include current_room");
@@ -298,7 +302,7 @@ async function runMcpTests() {
 
     // Cancellation while an HTTP request is waiting for the run lock must
     // propagate to the server and prevent the pre-WAL action from committing.
-    const activeRun = externalPlay.getRun(externalPlay.activeRunId);
+    const activeRun = externalPlay.getRun(startPayload.run_id);
     const unlockRun = await activeRun.sessionMutex.acquire();
     const actionSeqBeforeActiveCancel = activeRun.lastActionSeq;
     const activeCancelPromise = client.sendRequest(14, "tools/call", {
@@ -328,10 +332,10 @@ async function runMcpTests() {
     const replacementRun = await externalPlay.createRun({ durationMs: 1800000 });
     assert.equal(externalPlay.activeRunId, replacementRun.runId);
 
-    // Call start on MCP client without arguments; MCP should auto-sync and start the replacement run
+    // Call start with a new model declaration; MCP should claim the replacement run.
     const reconfigStartRes = await client.sendRequest(15, "tools/call", {
       name: "start",
-      arguments: {}
+      arguments: { model_name: "Replacement Model" }
     });
     assert.ok(reconfigStartRes.result);
     assert.equal(reconfigStartRes.result.isError, false);
@@ -350,7 +354,7 @@ async function runMcpTests() {
     const explicitRun = await externalPlay.createRun({ durationMs: 1800000 });
     const explicitStartRes = await client.sendRequest(16, "tools/call", {
       name: "start",
-      arguments: { run_id: explicitRun.runId }
+      arguments: { run_id: explicitRun.runId, model_name: "Explicit Model" }
     });
     assert.ok(explicitStartRes.result);
     assert.equal(explicitStartRes.result.isError, false);
@@ -372,7 +376,7 @@ async function runMcpTests() {
       arguments: {}
     });
     assert.equal(rejectedStartRes.result?.isError, true);
-    assert.match(rejectedStartRes.result.content[0].text, /No armed External Play session/);
+    assert.match(rejectedStartRes.result.content[0].text, /No armed External Play run is available/);
     assert.equal(externalPlay.activeRunId, null);
     assert.equal(externalPlay.runs.size, runCountBeforeRejectedStart);
 
@@ -381,7 +385,7 @@ async function runMcpTests() {
     const terminalSequenceRun = await externalPlay.createRun({ maxActions: 2 });
     const terminalSequenceStartRes = await client.sendRequest(18, "tools/call", {
       name: "start",
-      arguments: { run_id: terminalSequenceRun.runId }
+      arguments: { run_id: terminalSequenceRun.runId, model_name: "Sequence Model" }
     });
     assert.equal(terminalSequenceStartRes.result?.isError, false);
     const terminalSequenceRes = await client.sendRequest(19, "tools/call", {

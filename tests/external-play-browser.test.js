@@ -140,7 +140,7 @@ async function runBrowserTest() {
     // Call "start" tool
     const startToolRes = await mcpClient.sendRequest(2, "tools/call", {
       name: "start",
-      arguments: {}
+      arguments: { model_name: "browser-test-model" }
     });
     assert.equal(startToolRes.result?.isError, false);
 
@@ -276,7 +276,10 @@ async function runBrowserTest() {
     assert.ok(summaryVisible, "Summary modal dialog should be visible after session ends");
 
     const summaryOutcome = await page.$eval("#summary-outcome", (el) => el.textContent);
-    assert.equal(summaryOutcome.trim(), "CANCELLED");
+    assert.ok(
+      ["CANCELLED", "已取消"].includes(summaryOutcome.trim()),
+      `Unexpected localized cancellation label: ${summaryOutcome}`
+    );
 
     const summaryCli = await page.$eval("#summary-cli", (el) => el.textContent);
     assert.ok(summaryCli.includes("browser-test-cli"), `Expected declared_cli browser-test-cli, got: ${summaryCli}`);

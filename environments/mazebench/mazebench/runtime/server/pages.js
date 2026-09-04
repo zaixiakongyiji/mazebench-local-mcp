@@ -1448,6 +1448,8 @@ function createPageRenderer({
 
   function renderExternalPlayLandingPage(serviceData = {}) {
     const activeRun = serviceData.activeRun || null;
+    const groups = serviceData.groups || [];
+    const activeGroup = groups.find((group) => group.group_id === serviceData.activeGroupId) || null;
     const runsList = serviceData.runs || [];
 
     const activeRunHtml = activeRun
@@ -1462,21 +1464,43 @@ function createPageRenderer({
           </div>
         </section>`
       : `<p class="muted" style="margin-bottom: 24px;" data-i18n="ext_no_active_session">No active session right now. Create one below before starting MCP play.</p>`;
+    const activeGroupHtml = activeGroup
+      ? `<section class="panel active-run-panel" style="border: 1px solid var(--accent, #7c3aed); padding: 18px; border-radius: 8px; margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+            <div>
+              <span class="badge">${escapeHtml(activeGroup.mode.toUpperCase())}</span>
+              <h2 style="margin: 8px 0 4px 0; font-size: 1.25rem;">Run Group: <code>${escapeHtml(activeGroup.group_id)}</code></h2>
+              <p class="muted" style="margin: 0;">${activeGroup.entries.filter((entry) => entry.status !== "armed").length} / ${activeGroup.entries.length} models claimed</p>
+            </div>
+            <a class="button button--primary" href="/external-play/groups/${encodeURIComponent(activeGroup.group_id)}">Open Run Group</a>
+          </div>
+        </section>`
+      : "";
+    const groupHistoryHtml = groups.length
+      ? `<section class="panel" style="margin-top: 24px;">
+          <h2>Run Group History</h2>
+          <div class="external-group-list">
+            ${groups.map((group) => `<a class="external-group-list__item" href="/external-play/groups/${encodeURIComponent(group.group_id)}">
+              <span><strong>${escapeHtml(group.mode === "competition" ? "Competition" : "Concurrent")}</strong><small>${escapeHtml(group.group_id)}</small></span>
+              <span>${group.entries.length} runs · ${escapeHtml(group.status)}</span>
+            </a>`).join("")}
+          </div>
+        </section>`
+      : "";
 
     return renderSitePage({
       title: "External Play (Local MCP) — Maze Bench",
       bodyClass: "external-play-landing-page",
+      extraHeadHtml: '<link rel="stylesheet" href="/external-play.css">',
       main: `<div class="page-head">
-          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
-            <span class="badge" style="background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); padding: 4px 8px; border-radius: 6px; font-size: 12px; font-weight: bold;" data-i18n="ext_badge_unverified">EXTERNAL / UNVERIFIED</span>
-          </div>
+          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;"><span class="badge">EXTERNAL · LOCAL MCP</span></div>
           <h1 data-i18n="ext_landing_title">External Play — Local MCP</h1>
           <p class="card-by" style="font-size: 1rem; color: #94a3b8; max-width: 720px;" data-i18n="ext_landing_subtitle">
             Control the authoritative MazeBench game session locally via stdio MCP (Codex, Claude Desktop, etc.) and spectate the full 3D game in real time.
           </p>
         </div>
 
-        ${activeRunHtml}
+        ${activeGroupHtml || activeRunHtml}
 
         <section class="panel" style="margin-bottom: 24px;">
           <h2 data-i18n="ext_mcp_config_title">MCP Configuration</h2>
@@ -1506,6 +1530,18 @@ args = ["mcp"]</code></pre>
           <h2 data-i18n="create_session_title">Create New Session</h2>
           <form id="create-external-run-form" style="display: flex; flex-direction: column; gap: 14px; max-width: 480px; margin-top: 12px;">
             <div class="field">
+              <span>Session Type</span>
+              <div class="external-session-type" role="radiogroup" aria-label="Session type">
+                <label><input type="radio" name="ext-session-type" value="single" checked> Single</label>
+                <label><input type="radio" name="ext-session-type" value="concurrent"> Concurrent</label>
+                <label><input type="radio" name="ext-session-type" value="competition"> Competition</label>
+              </div>
+            </div>
+            <label class="field" id="field-group-count" hidden>
+              <span>Model Slots</span>
+              <input type="number" id="ext-group-count" min="2" max="8" value="2">
+            </label>
+            <div class="field">
               <span data-i18n="limit_mode_label">Limit Mode</span>
               <div class="limit-mode-toggle" style="display: flex; gap: 8px; margin-top: 6px;">
                 <label id="mode-opt-actions" class="limit-mode-option is-selected" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 12px; background: rgba(124, 58, 237, 0.2); border: 1px solid #7c3aed; border-radius: 8px; cursor: pointer; font-size: 0.9rem; font-weight: 500; transition: all 0.2s;">
@@ -1525,7 +1561,7 @@ args = ["mcp"]</code></pre>
             <div class="field" id="field-time-limit" style="display: none;">
               <label for="ext-time-limit" style="display: flex; flex-direction: column; gap: 4px;">
                 <span data-i18n="time_limit_label">Time Limit (seconds)</span>
-                <input type="number" id="ext-time-limit" min="5" max="86400" value="120" placeholder="120">
+                <input type="number" id="ext-time-limit" min="60" max="21600" value="120" placeholder="120">
               </label>
               <div class="preset-pills" style="display: flex; gap: 6px; margin-top: 6px;">
                 <button type="button" class="preset-btn" data-seconds="60" style="background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(148, 163, 184, 0.3); color: #cbd5e1; border-radius: 6px; padding: 3px 8px; font-size: 0.75rem; cursor: pointer;">60s</button>
@@ -1535,18 +1571,42 @@ args = ["mcp"]</code></pre>
               </div>
               <p class="muted" style="font-size: 0.75rem; margin: 4px 0 0 0; color: #94a3b8;" data-i18n="time_limit_hint">In seconds. The session will finalize as timed_out once the deadline is reached.</p>
             </div>
-            <label class="field">
-              <span data-i18n="model_name_label">Model Name</span>
-              <input type="text" id="ext-model-name" data-i18n-placeholder="model_name_placeholder" placeholder="e.g. Gemini 2.5 Flash / Claude 3.7 Sonnet">
-            </label>
-            <label class="field">
-              <span data-i18n="harness_name_label">Harness Name</span>
-              <input type="text" id="ext-harness-name" data-i18n-placeholder="harness_name_placeholder" placeholder="e.g. antigravity-mcp / stdio-mcp">
-            </label>
             <button class="button button--primary" type="submit" id="create-ext-run-btn" data-i18n="create_btn">Create Armed Session</button>
             <p id="create-ext-status" class="author-status" role="status" aria-live="polite"></p>
           </form>
         </section>
+        ${groupHistoryHtml}
+        <script src="/external-play.js" defer></script>`
+    });
+  }
+
+  function renderExternalPlayGroupPage(group) {
+    return renderSitePage({
+      title: `Run Group ${group.group_id} — Maze Bench`,
+      bodyClass: "external-play-group-page",
+      extraHeadHtml: '<link rel="stylesheet" href="/external-play.css">',
+      main: `<div class="page-head external-group-head">
+          <div>
+            <span class="badge">${escapeHtml(group.mode === "competition" ? "COMPETITION" : "CONCURRENT")}</span>
+            <h1>External Run Group</h1>
+            <p class="muted"><code>${escapeHtml(group.group_id)}</code> · <span id="external-group-status">${escapeHtml(group.status)}</span></p>
+          </div>
+          <button id="cancel-external-group" class="button--danger" type="button">Cancel unfinished runs</button>
+        </div>
+        <section class="panel external-group-bootstrap">
+          <h2>Model bootstrap prompt</h2>
+          <pre><code>调用 MazeBench 的 start 工具，填写指定的 model_name，然后严格按照返回的 run_instructions 继续游戏。</code></pre>
+          <p class="muted">Open one model client per slot. Each first start call claims exactly one available run.</p>
+        </section>
+        <section class="external-group-results" aria-labelledby="external-group-results-title">
+          <div class="section-heading"><h2 id="external-group-results-title">Runs</h2><span id="external-group-claim-count"></span></div>
+          <div id="external-group-entries" class="external-group-entry-grid"></div>
+        </section>
+        <section id="external-group-ranking-section" class="external-group-ranking" ${group.mode === "competition" ? "" : "hidden"}>
+          <div class="section-heading"><h2>Competition ranking</h2></div>
+          <div id="external-group-ranking"></div>
+        </section>
+        <script>window.__EXTERNAL_PLAY_GROUP__ = ${serializeForScript(group)};</script>
         <script src="/external-play.js" defer></script>`
     });
   }
@@ -1589,7 +1649,7 @@ args = ["mcp"]</code></pre>
 
     const modelDisplay = run.modelName ? ` · Model: ${escapeHtml(run.modelName)}` : "";
     const harnessDisplay = run.harnessName ? ` · Harness: ${escapeHtml(run.harnessName)}` : "";
-    const bannerTitle = `EXTERNAL PLAY — LOCAL MCP${modelDisplay}${harnessDisplay} (UNVERIFIED) · NOT A BENCHMARK RESULT`;
+    const bannerTitle = `EXTERNAL PLAY · LOCAL MCP${modelDisplay}${harnessDisplay}`;
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1610,7 +1670,7 @@ args = ["mcp"]</code></pre>
     <script src="/i18n.js"></script>
   </head>
   <body class="play-page external-spectator-body">
-    <div id="external-banner" class="external-unverified-banner">
+    <div id="external-banner" class="external-play-banner">
       <span id="external-banner-text">${bannerTitle}</span>
       <span id="external-status-pill" class="status-pill status-pill--${escapeHtml(run.status)}">${escapeHtml(run.status.toUpperCase())}</span>
     </div>
@@ -1907,6 +1967,7 @@ args = ["mcp"]</code></pre>
     renderAgentRunPage,
     renderAuthorPage,
     renderBuildPage,
+    renderExternalPlayGroupPage,
     renderExternalPlayLandingPage,
     renderExternalPlayRunPage,
     renderFlyoverPage,

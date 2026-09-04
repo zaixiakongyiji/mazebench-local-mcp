@@ -34,11 +34,12 @@ function sendStdout(jsonRpcObj) {
 const TOOLS_MANIFEST = [
   {
     name: "start",
-    description: "Claim and start a MazeBench game session that was manually created on the External Play page.",
+    description: "Claim and start an armed MazeBench game. Provide the model name specified by the user; the result contains the authoritative run instructions and initial observation.",
     inputSchema: {
       type: "object",
       properties: {
-        run_id: { type: "string", description: "Optional specific run ID to start or claim." }
+        model_name: { type: "string", minLength: 1, maxLength: 128, description: "Model name specified by the user. Required when claiming a new run." },
+        run_id: { type: "string", description: "Optional prior run ID used only to reconnect to that run." }
       },
       additionalProperties: false
     }
@@ -162,6 +163,15 @@ function validateToolArguments(toolName, args = {}) {
   if (toolName === "go_to_level") {
     if (!/^[A-Za-z]$/.test(String(args.x || "")) || !/^[A-Za-z]$/.test(String(args.y || ""))) {
       return { valid: false, error: "go_to_level x and y arguments must be a single letter (e.g. 'H', 'I')" };
+    }
+  }
+
+  if (toolName === "start" && args.model_name !== undefined) {
+    if (typeof args.model_name !== "string" || !args.model_name.trim() || args.model_name.trim().length > 128) {
+      return { valid: false, error: "start model_name must be a non-empty string of at most 128 characters" };
+    }
+    if (/[\u0000-\u001f\u007f]/.test(args.model_name.trim())) {
+      return { valid: false, error: "start model_name must not contain control characters" };
     }
   }
 
@@ -375,7 +385,7 @@ class StdioMcpAdapter {
         if (!force) process.exit(1);
         throw new Error(`Server instance mismatch: expected ${this.instanceId}, got ${health.instance_id}`);
       }
-      this.activeRunId = health.active_run_id || null;
+      if (this.leaseId && !this.activeRunId) this.activeRunId = health.active_run_id || null;
     } catch (err) {
       logStderr(`Health check failed: ${err.message}`);
       if (!force) process.exit(1);
@@ -473,7 +483,7 @@ class StdioMcpAdapter {
             name: "mazebench",
             version: "1.0.0"
           },
-          instructions: "MazeBench local MCP evaluation service. First create an armed session on the External Play page, then call 'start' to claim it and use 'observe' and action tools until terminal.",
+          instructions: "Create a MazeBench session first. Call start with the model_name specified by the user, then follow the returned run_instructions until the run reaches a terminal state.",
           capabilities: {
             tools: { listChanged: false }
           }
@@ -629,13 +639,6 @@ class StdioMcpAdapter {
           return;
         }
 
-        if (toolName === "start" && !targetRunId) {
-          try {
-            const health = await this.httpRequest("GET", "/api/external-play/health");
-            this.activeRunId = health?.active_run_id || null;
-          } catch (_e) {}
-        }
-
         try {
           if (!this.activeRunId && !targetRunId) {
             await this.connectServer(true);
@@ -644,7 +647,7 @@ class StdioMcpAdapter {
             "POST",
             "/api/external-play/mcp",
             {
-              run_id: targetRunId || this.activeRunId,
+              run_id: toolName === "start" ? targetRunId : this.activeRunId,
               tool: toolName,
               arguments: toolArgs,
               lease_id: this.leaseId,
@@ -658,20 +661,19 @@ class StdioMcpAdapter {
           if (
             requestErr.statusCode === 401 ||
             requestErr.statusCode === 403 ||
-            requestErr.statusCode === 404 ||
-            (toolName === "start" && requestErr.statusCode === 409)
+            requestErr.statusCode === 404
           ) {
             logStderr(`Request failed with status ${requestErr.statusCode}. Attempting to reconnect...`);
             if (requestErr.statusCode === 401 || requestErr.statusCode === 403) {
               this.controllerToken = null;
             }
             await this.connectServer(true);
-            targetRunId = toolArgs?.run_id || this.activeRunId;
+            targetRunId = toolArgs?.run_id || null;
             proxyRes = await this.httpRequest(
               "POST",
               "/api/external-play/mcp",
               {
-                run_id: targetRunId || this.activeRunId,
+                run_id: toolName === "start" ? targetRunId : this.activeRunId,
                 tool: toolName,
                 arguments: toolArgs,
                 lease_id: this.leaseId,
@@ -728,6 +730,15 @@ class StdioMcpAdapter {
                   type: "text",
                   text: JSON.stringify({
                     run_id: this.activeRunId,
+                    ...(proxyRes.group_id ? {
+                      group_id: proxyRes.group_id,
+                      entry_id: proxyRes.entry_id,
+                      group_mode: proxyRes.group_mode
+                    } : {}),
+                    model_name: proxyRes.model_name,
+                    harness: proxyRes.harness,
+                    instructions_version: proxyRes.instructions_version,
+                    run_instructions: proxyRes.run_instructions,
                     status: proxyRes.status,
                     action_seq: 0,
                     observation,

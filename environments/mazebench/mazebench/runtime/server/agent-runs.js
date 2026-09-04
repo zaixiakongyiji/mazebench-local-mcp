@@ -37,6 +37,7 @@ const {
   toolActivityPrefix
 } = require("./run-branch");
 const { killPlaywrightBrowserProcess } = require("../scripts/playwright-process");
+const { buildLeaderboardRankings, getRunFinalNovelty } = require("./run-rankings");
 const {
   autoQuitLaunchParams,
   evaluateAutoQuit,
@@ -2328,75 +2329,6 @@ function createAgentRunService({
     return readClaudeRunModelId(runId, requested) || resolveClaudeCatalogModelId(requested) || modelName;
   }
 
-  const noveltyCache = new Map();
-
-  function getRunFinalNovelty(runDir, summary = null) {
-    if (summary && summary.novelty != null && Number.isFinite(Number(summary.novelty))) {
-      return Math.min(100, Math.max(0, Math.round(Number(summary.novelty))));
-    }
-    if (!runDir || !fs.existsSync(runDir)) return 0;
-
-    const actionsPath = path.join(runDir, "actions.jsonl");
-    const journalPath = path.join(runDir, "journal.jsonl");
-    let targetPath = null;
-    if (fs.existsSync(actionsPath)) {
-      targetPath = actionsPath;
-    } else if (fs.existsSync(journalPath)) {
-      targetPath = journalPath;
-    }
-    if (!targetPath) return 0;
-
-    try {
-      const stat = fs.statSync(targetPath);
-      const cached = noveltyCache.get(targetPath);
-      if (cached && cached.mtime === stat.mtimeMs) {
-        return cached.novelty;
-      }
-
-      const content = fs.readFileSync(targetPath, "utf8");
-      const lines = content.split("\n");
-      const windowSize = 50;
-      const noveltyWindow = [];
-      const seen = new Set();
-      let lastNovelty = 0;
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const entry = JSON.parse(line);
-          let room = null;
-          let player = null;
-          if (entry.type === "action_committed") {
-            const pv = entry.action_record?.post_viewer_state;
-            room = pv?.current_room || entry.action_record?.sanitized_status?.current_room || "level_HxI";
-            player = pv?.player;
-          } else if (entry.post_viewer_state) {
-            room = entry.post_viewer_state.current_room || "level_HxI";
-            player = entry.post_viewer_state.player;
-          } else if (entry.player && entry.room) {
-            room = entry.room;
-            player = entry.player;
-          }
-
-          if (player && typeof player.x === "number" && typeof player.y === "number") {
-            const cellKey = `${room || "level_HxI"}:${player.x}:${player.y}`;
-            const isNovel = seen.has(cellKey) ? 0 : 1;
-            seen.add(cellKey);
-            noveltyWindow.push(isNovel);
-            if (noveltyWindow.length > windowSize) noveltyWindow.shift();
-            const sum = noveltyWindow.reduce((a, b) => a + b, 0);
-            lastNovelty = Math.round((sum / noveltyWindow.length) * 100);
-          }
-        } catch (_err) {}
-      }
-
-      noveltyCache.set(targetPath, { mtime: stat.mtimeMs, novelty: lastNovelty });
-      return lastNovelty;
-    } catch (_e) {
-      return 0;
-    }
-  }
-
   function summarizeExternalRun(entryName, itemDir = null) {
     if (!entryName || typeof entryName !== "string") return null;
     const extDir = resolveExternalRunsDir(runsDir);
@@ -2481,7 +2413,7 @@ function createAgentRunService({
       harness_label: harnessName,
       provider: "local_mcp",
       kind: "external",
-      unverified: true,
+      unverified: manifest.execution_class === "external-unverified",
       status,
       turns,
       moves: turns,
@@ -2933,64 +2865,6 @@ function createAgentRunService({
     };
   }
 
-  function buildLeaderboardRankings(runsList) {
-    // 1. 最多房间排序: room_count DESC -> gem_count DESC -> novelty DESC -> turns ASC -> created_at DESC
-    const sortedByRooms = [...runsList].sort((left, right) => {
-      const roomDiff = (Number(right.room_count) || 0) - (Number(left.room_count) || 0);
-      if (roomDiff !== 0) return roomDiff;
-      const gemDiff = (Number(right.gem_count) || 0) - (Number(left.gem_count) || 0);
-      if (gemDiff !== 0) return gemDiff;
-      const noveltyDiff = (Number(right.novelty) || 0) - (Number(left.novelty) || 0);
-      if (noveltyDiff !== 0) return noveltyDiff;
-      const turnDiff = (Number(left.turns ?? left.moves ?? 0) || 0) - (Number(right.turns ?? right.moves ?? 0) || 0);
-      if (turnDiff !== 0) return turnDiff;
-      return String(right.created_at || "").localeCompare(String(left.created_at || ""));
-    });
-
-    // 2. 最多宝石排序: gem_count DESC -> room_count DESC -> novelty DESC -> turns ASC -> created_at DESC
-    const sortedByGems = [...runsList].sort((left, right) => {
-      const gemDiff = (Number(right.gem_count) || 0) - (Number(left.gem_count) || 0);
-      if (gemDiff !== 0) return gemDiff;
-      const roomDiff = (Number(right.room_count) || 0) - (Number(left.room_count) || 0);
-      if (roomDiff !== 0) return roomDiff;
-      const noveltyDiff = (Number(right.novelty) || 0) - (Number(left.novelty) || 0);
-      if (noveltyDiff !== 0) return noveltyDiff;
-      const turnDiff = (Number(left.turns ?? left.moves ?? 0) || 0) - (Number(right.turns ?? right.moves ?? 0) || 0);
-      if (turnDiff !== 0) return turnDiff;
-      return String(right.created_at || "").localeCompare(String(left.created_at || ""));
-    });
-
-    // 各模型仅取最佳一条 (per_model)
-    function dedupePerModel(list) {
-      const seen = new Set();
-      const deduped = [];
-      for (const run of list) {
-        const key = String(run.model_name || run.model || "").trim().toLowerCase();
-        if (!seen.has(key)) {
-          seen.add(key);
-          deduped.push(run);
-        }
-      }
-      return deduped;
-    }
-
-    const roomsPerModel = dedupePerModel(sortedByRooms).map((r, idx) => formatLeaderboardItem(r, idx + 1));
-    const roomsAllRuns = sortedByRooms.map((r, idx) => formatLeaderboardItem(r, idx + 1));
-    const gemsPerModel = dedupePerModel(sortedByGems).map((r, idx) => formatLeaderboardItem(r, idx + 1));
-    const gemsAllRuns = sortedByGems.map((r, idx) => formatLeaderboardItem(r, idx + 1));
-
-    return {
-      by_rooms: {
-        per_model: roomsPerModel,
-        all_runs: roomsAllRuns
-      },
-      by_gems: {
-        per_model: gemsPerModel,
-        all_runs: gemsAllRuns
-      }
-    };
-  }
-
   function getLeaderboard(options = {}) {
     const all = allRunSummaries();
     // 仅保留有明确模型名称的记录
@@ -3001,10 +2875,10 @@ function createAgentRunService({
 
     return {
       total_named_runs: namedRuns.length,
-      standard: buildLeaderboardRankings(standardRuns),
-      time_under_60m: buildLeaderboardRankings(timeUnder60Runs),
-      time_over_60m: buildLeaderboardRankings(timeOver60Runs),
-      all: buildLeaderboardRankings(namedRuns)
+      standard: buildLeaderboardRankings(standardRuns, formatLeaderboardItem),
+      time_under_60m: buildLeaderboardRankings(timeUnder60Runs, formatLeaderboardItem),
+      time_over_60m: buildLeaderboardRankings(timeOver60Runs, formatLeaderboardItem),
+      all: buildLeaderboardRankings(namedRuns, formatLeaderboardItem)
     };
   }
 

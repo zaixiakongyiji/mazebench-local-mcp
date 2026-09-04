@@ -30,6 +30,7 @@ function createRequestRouter({
   renderAgentRunPage,
   renderAuthorPage,
   renderBuildPage,
+  renderExternalPlayGroupPage,
   renderExternalPlayLandingPage,
   renderExternalPlayRunPage,
   renderFlyoverPage,
@@ -108,6 +109,8 @@ function createRequestRouter({
           200,
           renderExternalPlayLandingPage({
             activeRun: externalPlay.getRun(externalPlay.activeRunId),
+            activeGroupId: externalPlay.activeGroupId,
+            groups: externalPlay.listGroups(),
             runs: Array.from(externalPlay.runs.values())
           })
         );
@@ -125,6 +128,16 @@ function createRequestRouter({
         return;
       }
       sendHtml(response, 200, renderExternalPlayRunPage(run));
+      return;
+    }
+
+    if (segments.length === 3 && segments[0] === "external-play" && segments[1] === "groups") {
+      const group = externalPlay ? externalPlay.getGroup(segments[2]) : null;
+      if (!group) {
+        sendHtml(response, 404, renderNotFound());
+        return;
+      }
+      sendHtml(response, 200, renderExternalPlayGroupPage(group));
       return;
     }
 
@@ -146,7 +159,9 @@ function createRequestRouter({
           status: "ok",
           service_state: externalPlay.serviceState,
           instance_id: externalPlay.instanceId,
-          active_run_id: externalPlay.activeRunId
+          active_run_id: externalPlay.activeRunId,
+          active_group_id: externalPlay.activeGroupId,
+          claimable_run_count: externalPlay.claimableRunIds.length
         });
         return;
       }
@@ -188,27 +203,14 @@ function createRequestRouter({
           return;
         }
         const payload = await readJsonBody(request);
-        const run = payload.run_id
-          ? externalPlay.getRun(payload.run_id)
-          : payload.tool === "start"
-            ? externalPlay.getRun(externalPlay.activeRunId)
-            : null;
+        const run = payload.tool === "start"
+          ? null
+          : (payload.run_id ? externalPlay.getRun(payload.run_id) : null);
 
-        if (!run) {
-          const noActiveRun = payload.tool === "start" && !payload.run_id;
+        if (payload.tool !== "start" && !run) {
           sendJson(response, 404, {
-            error: noActiveRun
-              ? "No armed External Play session. Create one manually from /external-play before calling start."
-              : `Run not found: ${payload.run_id}`,
-            code: noActiveRun ? "NO_ACTIVE_RUN" : "NOT_FOUND"
-          });
-          return;
-        }
-
-        if (payload.tool === "start" && ["won", "action_limit", "timed_out", "cancelled", "failed"].includes(run.status)) {
-          sendJson(response, 409, {
-            error: `Run ${run.runId} has ended. Create a new session manually from /external-play.`,
-            code: "RUN_ENDED"
+            error: `Run not found: ${payload.run_id}`,
+            code: "NOT_FOUND"
           });
           return;
         }
@@ -223,7 +225,12 @@ function createRequestRouter({
         try {
           let res;
           if (payload.tool === "start") {
-            res = await run.startOrAttach(controllerInfo, payload.operation_id, requestAbort.signal);
+            res = await externalPlay.claimOrAttachRun(
+              controllerInfo,
+              { ...(payload.arguments || {}), ...(payload.run_id ? { run_id: payload.run_id } : {}) },
+              payload.operation_id,
+              requestAbort.signal
+            );
           } else if (payload.tool === "observe") {
             const obs = await run.observe();
             res = {
@@ -315,7 +322,62 @@ function createRequestRouter({
         return;
       }
 
-      // 7. Runs Collection: GET /runs & POST /runs
+      // 7. Run Groups Collection: GET /groups & POST /groups
+      if (segments.length === 3 && segments[2] === "groups") {
+        if (request.method === "GET") {
+          sendJson(response, 200, {
+            groups: externalPlay.listGroups(),
+            active_group_id: externalPlay.activeGroupId
+          });
+          return;
+        }
+        if (request.method === "POST") {
+          const payload = await readJsonBody(request);
+          try {
+            const group = await externalPlay.createGroup({
+              mode: payload.mode,
+              count: payload.count,
+              maxActions: payload.max_actions !== undefined ? payload.max_actions : undefined,
+              durationMs: payload.max_actions === undefined && payload.duration_ms !== undefined ? payload.duration_ms : undefined,
+              winThreshold: payload.win_threshold !== undefined ? payload.win_threshold : undefined
+            });
+            sendJson(response, 201, group);
+          } catch (err) {
+            sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+          }
+          return;
+        }
+        response.writeHead(405, { Allow: "GET, POST" });
+        response.end();
+        return;
+      }
+
+      // 8. Individual Run Group: GET /groups/:id & POST /groups/:id/cancel
+      if (segments.length >= 4 && segments[2] === "groups") {
+        const groupId = segments[3];
+        if (segments.length === 4 && request.method === "GET") {
+          const group = externalPlay.getGroup(groupId);
+          if (!group) {
+            sendJson(response, 404, { error: `Run group not found: ${groupId}`, code: "NOT_FOUND" });
+          } else {
+            sendJson(response, 200, group);
+          }
+          return;
+        }
+        if (segments.length === 5 && segments[4] === "cancel" && request.method === "POST") {
+          try {
+            sendJson(response, 200, await externalPlay.cancelGroup(groupId));
+          } catch (err) {
+            sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+          }
+          return;
+        }
+        response.writeHead(405, { Allow: "GET, POST" });
+        response.end();
+        return;
+      }
+
+      // 9. Runs Collection: GET /runs & POST /runs
       if (segments.length === 3 && segments[2] === "runs") {
         if (request.method === "GET") {
           const runsList = Array.from(externalPlay.runs.values()).map((r) => ({
@@ -336,9 +398,7 @@ function createRequestRouter({
             const run = await externalPlay.createRun({
               maxActions: payload.max_actions !== undefined ? payload.max_actions : undefined,
               durationMs: payload.max_actions === undefined && payload.duration_ms !== undefined ? payload.duration_ms : undefined,
-              winThreshold: payload.win_threshold !== undefined ? payload.win_threshold : undefined,
-              modelName: payload.model_name || undefined,
-              harnessName: payload.harness_name || undefined
+              winThreshold: payload.win_threshold !== undefined ? payload.win_threshold : undefined
             });
             sendJson(response, 201, { run_id: run.runId, status: run.status });
           } catch (err) {

@@ -11,7 +11,7 @@ MazeBench Local MCP 是基于 MazeBenchEngine 改造的本地游戏控制与实�
 - 不托管外部 CLI，也不采集模型思考过程、token 或费用；
 - 游戏状态只能通过 MCP 工具修改；
 - 网页只在本机 loopback 地址提供服务；
-- External Play 结果标记为 `EXTERNAL / UNVERIFIED`，不属于正式 benchmark 成绩。
+- External Play 结果作为普通 `EXTERNAL` 历史记录保存，可回放并参与本地全局排行榜；内部仍标记为不具备正式 benchmark eligibility。
 
 当前维护仓库：[zaixiakongyiji/mazebench-local-mcp](https://github.com/zaixiakongyiji/mazebench-local-mcp.git)
 
@@ -148,13 +148,15 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 
 1. 在源码仓库执行 `npm run start`，或执行 `mazebench launch`。
 2. 在浏览器打开 External Play 页面。
-3. 创建场次，设置游戏 actions 上限，并可选填写模型名称和 harness 名称。
+3. 创建单局、并发组或比赛组，并设置统一的游戏 actions 上限；运行组支持 2–8 个席位。
 4. 启动或重启已经配置 MCP 的 CLI/桌面端。
-5. 让模型先调用 `start`，然后通过 `observe` 和动作工具游玩。
+5. 给每个模型指定名称，并发送统一初始提示词：`调用 MazeBench 的 start 工具，填写指定的 model_name，然后严格按照返回的 run_instructions 继续游戏。`
 6. 在浏览器中实时观看 3D 画面、动作记录、房间和 gems 状态。
 7. 达到 actions 上限后，在同一页面查看总结和回放。
 
-服务启动时会准备一个默认的 `armed` 场次。只要该场次尚未被 MCP claim，网页创建的新场次会安全替换它；已经开始的场次不会被覆盖。
+单局和运行组都必须先在 External Play 页面创建。单局保持独立历史；运行组为每个席位创建独立 run，并冻结相同地图、起点、预算和结束规则。`concurrent` 组只聚合结果，`competition` 组会在所有席位结束后额外保存本场排名快照；两种模式的子 run 都进入历史、回放和全局排行榜。
+
+同一时间只允许一个运行组等待认领。全部席位被模型调用 `start` 认领后，即可创建下一组，即使上一组仍在游玩。模型名称由 `start` 的 `model_name` 参数登记，harness 自动取自 MCP initialize 的 `clientInfo.name`，无需在网页表单中填写。
 
 ## MCP 工具
 
@@ -169,6 +171,23 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 - `reset`
 - `go_to_level`
 - `action_sequence`
+
+首次认领 run 时调用：
+
+```json
+{
+  "model_name": "gpt-5.6"
+}
+```
+
+`start` 会返回 `run_id`、可选的 `group_id`/`entry_id`、模型与 harness 身份、`run_instructions`、初始观察和本局预算。连接中断后，可用首次返回的 `run_id` 和相同的 `model_name` 明确恢复；同一 controller 重复 attach 时可以省略参数。
+
+运行组管理 API：
+
+- `POST /api/external-play/groups`
+- `GET /api/external-play/groups`
+- `GET /api/external-play/groups/:id`
+- `POST /api/external-play/groups/:id/cancel`
 
 `start` 用于 claim 当前场次并建立控制 lease。之后的游戏操作必须使用同一个 MCP 会话，不能直接调用或修改游戏引擎状态。
 

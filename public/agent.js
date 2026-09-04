@@ -1997,7 +1997,7 @@
           <h3 title="${escapeText(modelName)}">${escapeText(modelName)}</h3>
           <div class="run-card__details">
             <span class="run-card__world">${escapeText(run.game_title || run.game_id)}</span>
-            ${run.unverified || run.kind === "external"
+            ${run.unverified
               ? `<span class="run-card__badge" style="background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3);">UNVERIFIED · LOCAL MCP</span>`
               : ""}
             ${showStartRoom ? `<span class="run-card__badge">Start ${escapeText(levelLabel(run.level_id))}</span>` : ""}

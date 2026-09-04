@@ -20,6 +20,15 @@
   let viewerToken = null;
   let currentGenerationId = 0;
 
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
   // Simple in-browser SHA-256 for blob validation
   async function computeSha256Hex(text) {
     const encoder = new TextEncoder();
@@ -41,12 +50,29 @@
     const maxActionsInput = document.getElementById("ext-max-actions");
     const timeLimitInput = document.getElementById("ext-time-limit");
     const presetBtns = form.querySelectorAll(".preset-btn");
-    const modelNameInput = document.getElementById("ext-model-name");
-    const harnessNameInput = document.getElementById("ext-harness-name");
+    const sessionTypeInputs = [...form.querySelectorAll('input[name="ext-session-type"]')];
+    const groupCountField = document.getElementById("field-group-count");
+    const groupCountInput = document.getElementById("ext-group-count");
     const statusText = document.getElementById("create-ext-status");
     const submitBtn = document.getElementById("create-ext-run-btn");
 
     let currentMode = "actions";
+    let currentSessionType = "single";
+
+    function setSessionType(type) {
+      currentSessionType = type;
+      if (groupCountField) groupCountField.hidden = type === "single";
+      if (groupCountInput) groupCountInput.required = type !== "single";
+      if (submitBtn) {
+        submitBtn.textContent = type === "single"
+          ? "Create Armed Session"
+          : (type === "competition" ? "Create Competition" : "Create Concurrent Group");
+      }
+    }
+
+    sessionTypeInputs.forEach((input) => {
+      input.addEventListener("change", () => setSessionType(input.value));
+    });
 
     function setMode(mode) {
       currentMode = mode;
@@ -113,22 +139,23 @@
       statusText.textContent = "Creating armed session...";
 
       try {
-        const model_name = modelNameInput?.value?.trim() || undefined;
-        const harness_name = harnessNameInput?.value?.trim() || undefined;
-
-        const payload = {
-          model_name,
-          harness_name
-        };
+        const payload = {};
+        if (currentSessionType !== "single") {
+          payload.mode = currentSessionType;
+          payload.count = parseInt(groupCountInput?.value, 10) || 2;
+        }
 
         if (currentMode === "actions") {
           payload.max_actions = parseInt(maxActionsInput.value, 10) || 256;
         } else {
           const seconds = parseInt(timeLimitInput?.value, 10) || 120;
-          payload.duration_ms = Math.max(1000, seconds * 1000);
+          payload.duration_ms = Math.max(60000, seconds * 1000);
         }
 
-        const res = await fetch("/api/external-play/runs", {
+        const endpoint = currentSessionType === "single"
+          ? "/api/external-play/runs"
+          : "/api/external-play/groups";
+        const res = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -140,13 +167,96 @@
         }
 
         const data = await res.json();
-        statusText.textContent = "Session created! Redirecting...";
-        window.location.assign(`/external-play/${encodeURIComponent(data.run_id)}`);
+        statusText.textContent = "Created. Redirecting...";
+        window.location.assign(currentSessionType === "single"
+          ? `/external-play/${encodeURIComponent(data.run_id)}`
+          : `/external-play/groups/${encodeURIComponent(data.group_id)}`);
       } catch (err) {
         statusText.textContent = `Error: ${err.message}`;
         submitBtn.disabled = false;
       }
     });
+  }
+
+  function initGroupPage() {
+    let group = window.__EXTERNAL_PLAY_GROUP__;
+    if (!group) return;
+
+    const status = document.getElementById("external-group-status");
+    const claimCount = document.getElementById("external-group-claim-count");
+    const entriesRoot = document.getElementById("external-group-entries");
+    const rankingRoot = document.getElementById("external-group-ranking");
+    const rankingSection = document.getElementById("external-group-ranking-section");
+    const cancelButton = document.getElementById("cancel-external-group");
+    let pollTimer = null;
+
+    function renderEntry(entry) {
+      const model = entry.model_name || "Waiting for model";
+      const stats = `${entry.rooms_visited || 0} rooms · ${entry.gems_collected || 0} gems · ${entry.actions_total || 0} actions`;
+      return `<article class="external-group-entry">
+        <div class="external-group-entry__head"><strong>${escapeHtml(model)}</strong><span class="status-pill status-pill--${escapeHtml(entry.status)}">${escapeHtml(entry.status)}</span></div>
+        <p>${escapeHtml(entry.harness || "MCP client not connected")}</p>
+        <p>${escapeHtml(stats)}</p>
+        <a class="text-link" href="${escapeHtml(entry.replay_url)}">Watch / replay</a>
+      </article>`;
+    }
+
+    function renderRanking(ranking) {
+      if (!rankingRoot || !rankingSection) return;
+      if (!Array.isArray(ranking)) {
+        rankingRoot.innerHTML = '<p class="muted">Ranking is finalized after every run ends.</p>';
+        return;
+      }
+      rankingSection.hidden = false;
+      rankingRoot.innerHTML = `<div class="external-ranking-table">${ranking.map((entry) => `
+        <div class="external-ranking-row">
+          <strong>#${entry.rank}</strong>
+          <span>${escapeHtml(entry.model_name || entry.entry_id)}</span>
+          <span>${entry.rooms_visited} rooms</span>
+          <span>${entry.gems_collected} gems</span>
+          <span>${entry.actions_total} actions</span>
+        </div>`).join("")}</div>`;
+    }
+
+    function render() {
+      const claimed = group.entries.filter((entry) => entry.status !== "armed").length;
+      if (status) status.textContent = group.status;
+      if (claimCount) claimCount.textContent = `${claimed} / ${group.entries.length} models claimed`;
+      if (entriesRoot) entriesRoot.innerHTML = group.entries.map(renderEntry).join("");
+      if (group.mode === "competition") renderRanking(group.result?.ranking || null);
+      if (cancelButton) cancelButton.hidden = group.status === "completed";
+      if (group.status === "completed" && pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch(`/api/external-play/groups/${encodeURIComponent(group.group_id)}`, { cache: "no-store" });
+        if (response.ok) {
+          group = await response.json();
+          render();
+        }
+      } catch (_error) {}
+    }
+
+    if (cancelButton) {
+      cancelButton.addEventListener("click", async () => {
+        cancelButton.disabled = true;
+        try {
+          const response = await fetch(`/api/external-play/groups/${encodeURIComponent(group.group_id)}/cancel`, { method: "POST" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          group = await response.json();
+          render();
+        } finally {
+          cancelButton.disabled = false;
+        }
+      });
+    }
+
+    render();
+    if (group.status !== "completed") pollTimer = setInterval(refresh, 1000);
   }
 
   // 3. Spectator Page Logic
@@ -1174,6 +1284,7 @@
   // Initialization
   async function startup() {
     initLandingPage();
+    initGroupPage();
     await initSpectatorPage();
   }
 

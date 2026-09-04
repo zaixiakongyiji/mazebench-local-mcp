@@ -14,9 +14,17 @@ const {
   validateSanitizedStatus,
   validateFinalResponse,
   validateErrorPayload,
+  validateRunGroupManifest,
+  validateRunGroupResult,
   computeViewerStateHash,
   canonicalizeJson
 } = require("../shared/validators.standalone");
+const { ExternalRunGroupStore, TERMINAL_STATUSES } = require("./external-run-groups");
+const {
+  INSTRUCTIONS_VERSION,
+  buildRunInstructions,
+  normalizeModelName
+} = require("./external-run-instructions");
 
 function getBridge() {
   return require("../scripts/maze-bridge");
@@ -118,6 +126,7 @@ class ExternalPlayService {
     this.options = options || {};
     this.dataHome = options.dataHome || resolveDataHome();
     this.runsDir = path.join(this.dataHome, "external-runs");
+    this.groupsDir = path.join(this.dataHome, "external-groups");
     this.quarantineDir = path.join(this.dataHome, "external-quarantine");
     this.serverJsonPath = path.join(this.dataHome, "server.json");
     this.serverLockPath = path.join(this.dataHome, "server.lock");
@@ -128,6 +137,9 @@ class ExternalPlayService {
     this.serviceState = "INITIALIZING";
     this.instanceId = options.instanceId || `srv-${crypto.randomUUID()}`;
     this.activeRunId = null;
+    this.activeGroupId = null;
+    this.claimableRunIds = [];
+    this.controllerRunBindings = new Map();
 
     this.controllerTokens = new Map(); // token -> { instanceId, controllerId, declaredCli, createdAt }
     this.viewerKey = null;
@@ -139,6 +151,12 @@ class ExternalPlayService {
 
     // Map of runId -> RunInstance
     this.runs = new Map();
+    this.groupStore = new ExternalRunGroupStore({
+      groupsDir: this.groupsDir,
+      getRun: (runId) => this.getRun(runId),
+      validateManifest: validateRunGroupManifest,
+      validateResult: validateRunGroupResult
+    });
 
     this.serverPort = options.port || 3000;
     this.serverHost = options.host || "127.0.0.1";
@@ -148,6 +166,7 @@ class ExternalPlayService {
   async initialize() {
     this.dataHome = this.options.dataHome || resolveDataHome();
     this.runsDir = path.join(this.dataHome, "external-runs");
+    this.groupsDir = path.join(this.dataHome, "external-groups");
     this.quarantineDir = path.join(this.dataHome, "external-quarantine");
     this.serverJsonPath = path.join(this.dataHome, "server.json");
     this.serverLockPath = path.join(this.dataHome, "server.lock");
@@ -157,8 +176,10 @@ class ExternalPlayService {
 
     // 1. Assert isolations
     fs.mkdirSync(this.runsDir, { recursive: true });
+    fs.mkdirSync(this.groupsDir, { recursive: true });
     fs.mkdirSync(this.quarantineDir, { recursive: true });
     assertIsolation(this.runsDir, this.dataHome);
+    assertIsolation(this.groupsDir, this.dataHome);
     assertIsolation(this.quarantineDir, this.dataHome);
     assertIsolation(this.serverLockPath, this.dataHome);
     assertIsolation(this.serverJsonPath, this.dataHome);
@@ -173,8 +194,17 @@ class ExternalPlayService {
     // 4. Scan & Recover existing runs
     await this._recoverRuns();
 
-    // 5. Recover an existing non-terminal run without creating a new record
-    await this._selectActiveRun();
+    this.groupStore = new ExternalRunGroupStore({
+      groupsDir: this.groupsDir,
+      getRun: (runId) => this.getRun(runId),
+      validateManifest: validateRunGroupManifest,
+      validateResult: validateRunGroupResult
+    });
+    this.groupStore.initialize();
+
+    // 5. Recover every independent run and rebuild the claim queue.
+    await this._recoverActiveRuns();
+    this._refreshClaimState();
 
     // 6. Mark READY and write initial server.json
     this.serviceState = "READY";
@@ -232,6 +262,8 @@ class ExternalPlayService {
       port: this.serverPort,
       url,
       active_run_id: this.activeRunId,
+      active_group_id: this.activeGroupId,
+      claimable_run_count: this.claimableRunIds.length,
       mcp_bootstrap_nonce: this.mcpBootstrapNonce,
       started_at: new Date().toISOString()
     };
@@ -276,47 +308,49 @@ class ExternalPlayService {
     }
   }
 
-  async _selectActiveRun() {
-    const nonTerminalRuns = [];
-    for (const [runId, run] of this.runs.entries()) {
-      if (["armed", "active", "finalizing"].includes(run.status)) {
-        nonTerminalRuns.push(run);
+  async _recoverActiveRuns() {
+    for (const run of this.runs.values()) {
+      if (["active", "finalizing"].includes(run.status)) {
+        await run.handleServerRestart();
       }
     }
-
-    if (nonTerminalRuns.length === 1) {
-      const run = nonTerminalRuns[0];
-      this.activeRunId = run.runId;
-      await run.handleServerRestart();
-    } else if (nonTerminalRuns.length > 1) {
-      // Pick latest started_at / created_at
-      nonTerminalRuns.sort((a, b) => {
-        const tA = Date.parse(a.startedAt || a.manifest.created_at || 0);
-        const tB = Date.parse(b.startedAt || b.manifest.created_at || 0);
-        return tB - tA;
-      });
-      const selected = nonTerminalRuns[0];
-      this.activeRunId = selected.runId;
-      await selected.handleServerRestart();
-
-      for (let i = 1; i < nonTerminalRuns.length; i++) {
-        const stale = nonTerminalRuns[i];
-        console.warn(`Quarantining conflicting non-terminal run ${stale.runId}`);
-        this.runs.delete(stale.runId);
-        const target = path.join(this.quarantineDir, stale.runId);
-        fs.renameSync(stale.runDir, target);
-      }
+    for (const group of this.groupStore.list()) {
+      this.groupStore.maybeFinalize(group.group_id);
     }
   }
 
-  _clearActiveRun(runId) {
-    if (this.activeRunId !== runId) return;
-    this.activeRunId = null;
+  _refreshClaimState() {
+    const groupedRunIds = new Set();
+    for (const record of this.groupStore.groups.values()) {
+      for (const entry of record.manifest.entries) groupedRunIds.add(entry.run_id);
+    }
+
+    const activeGroupId = this.groupStore.activeClaimGroupId();
+    const groupedClaims = activeGroupId ? this.groupStore.claimableRunIds(activeGroupId) : [];
+    const standaloneClaims = [...this.runs.values()]
+      .filter((run) => run.status === "armed" && !groupedRunIds.has(run.runId))
+      .sort((left, right) => String(left.manifest.created_at).localeCompare(String(right.manifest.created_at)))
+      .map((run) => run.runId);
+
+    this.activeGroupId = activeGroupId;
+    this.claimableRunIds = groupedClaims.length > 0 ? groupedClaims : standaloneClaims;
+    this.activeRunId = this.claimableRunIds[0] || null;
     if (this.serviceState === "READY") this._writeServerJson();
   }
 
+  _clearActiveRun(runId) {
+    this.claimableRunIds = this.claimableRunIds.filter((candidate) => candidate !== runId);
+    this.controllerRunBindings.forEach((boundRunId, controllerId) => {
+      if (boundRunId === runId && TERMINAL_STATUSES.has(this.getRun(runId)?.status)) {
+        this.controllerRunBindings.delete(controllerId);
+      }
+    });
+    this.groupStore.onRunChanged(runId);
+    this._refreshClaimState();
+  }
+
   async _createArmedRunInternal(options = {}) {
-    const runId = `ext-${crypto.randomUUID()}`;
+    const runId = options.runId || `ext-${crypto.randomUUID()}`;
     const runDir = path.join(this.runsDir, runId);
     fs.mkdirSync(runDir, { recursive: true });
     fs.mkdirSync(path.join(runDir, "blobs"), { recursive: true });
@@ -325,11 +359,9 @@ class ExternalPlayService {
     const durationMs = usesLegacyDuration ? options.durationMs : null;
     const maxActions = usesLegacyDuration ? null : (options.maxActions || this.defaultMaxActions);
     const winThreshold = options.winThreshold || null;
-    const modelName = options.modelName || null;
-    const harnessName = options.harnessName || null;
 
     // Freeze world bundle at armed time
-    const rawBundle = this.worldBundleProvider ? this.worldBundleProvider() : { worldRevision: "0".repeat(64) };
+    const rawBundle = options.frozenWorldBundle || (this.worldBundleProvider ? this.worldBundleProvider() : { worldRevision: "0".repeat(64) });
     const worldBundleStr = JSON.stringify(rawBundle, null, 2);
     const worldDigest = rawBundle.worldRevision || crypto.createHash("sha256").update(worldBundleStr, "utf8").digest("hex");
     fs.writeFileSync(path.join(runDir, "world-bundle.json"), worldBundleStr, "utf8");
@@ -337,11 +369,16 @@ class ExternalPlayService {
     const manifest = {
       run_id: runId,
       run_kind: "external_play",
-      execution_class: "external-unverified",
+      execution_class: "external",
       benchmark_eligible: false,
       created_at: new Date().toISOString(),
       ...(maxActions ? { max_actions: maxActions } : { duration_ms: durationMs }),
-      ...(winThreshold ? { win_threshold: winThreshold } : {})
+      ...(winThreshold ? { win_threshold: winThreshold } : {}),
+      ...(options.groupId ? {
+        group_id: options.groupId,
+        entry_id: options.entryId,
+        group_mode: options.groupMode
+      } : {})
     };
 
     if (!validateManifest(manifest)) {
@@ -375,8 +412,8 @@ class ExternalPlayService {
       durationMs,
       maxActions,
       winThreshold,
-      modelName,
-      harnessName
+      modelName: null,
+      harnessName: null
     });
     runInstance.gameSession = baseBridgeSession;
 
@@ -391,9 +428,7 @@ class ExternalPlayService {
       world_bundle_digest: worldDigest,
       base_viewer_state_digest: baseViewerStateHash,
       ...(maxActions ? { max_actions: maxActions } : { duration_ms: durationMs }),
-      ...(winThreshold ? { win_threshold: winThreshold } : {}),
-      model_name: modelName,
-      harness_name: harnessName
+      ...(winThreshold ? { win_threshold: winThreshold } : {})
     };
 
     await runInstance.appendJournalRecord(armedRecord);
@@ -412,12 +447,18 @@ class ExternalPlayService {
       this.mcpBootstrapNonce = crypto.randomBytes(32).toString("hex");
       this._writeServerJson();
 
-      const controllerId = clientInfo.name ? `${clientInfo.name}-${crypto.randomUUID().slice(0, 8)}` : `ctrl-${crypto.randomUUID()}`;
+      const declaredCli = typeof clientInfo.name === "string" && clientInfo.name.trim()
+        ? clientInfo.name.trim()
+        : "unknown";
+      if (declaredCli.length > 128 || /[\u0000-\u001f\u007f]/.test(declaredCli)) {
+        throw { status: 400, code: "INVALID_ARGUMENT", message: "MCP clientInfo.name must be at most 128 characters without control characters" };
+      }
+      const controllerId = `${declaredCli.slice(0, 80)}-${crypto.randomUUID().slice(0, 8)}`;
       const token = `mcp_${crypto.randomBytes(32).toString("hex")}`;
       this.controllerTokens.set(token, {
         instanceId: this.instanceId,
         controllerId,
-        declaredCli: clientInfo.name || "unknown",
+        declaredCli,
         createdAt: Date.now()
       });
 
@@ -475,7 +516,7 @@ class ExternalPlayService {
     }
   }
 
-  async createRun(options = {}) {
+  _normalizeRunOptions(options = {}) {
     let durationMs;
     if (options.durationMs !== undefined) {
       if (!Number.isSafeInteger(options.durationMs) || options.durationMs < 60000 || options.durationMs > 21600000) {
@@ -503,35 +544,155 @@ class ExternalPlayService {
       winThreshold = options.winThreshold;
     }
 
+    return { durationMs, maxActions, winThreshold };
+  }
+
+  async createRun(options = {}) {
+    const normalized = this._normalizeRunOptions(options);
     return await this.admissionMutex.withLock(async () => {
-      for (const [, run] of this.runs.entries()) {
-        if (run.finalizeReason === "reconfigured_before_start" || ["won", "action_limit", "timed_out", "cancelled", "failed"].includes(run.status)) {
-          continue;
-        }
-        if (["active", "finalizing"].includes(run.status)) {
-          throw { status: 409, code: "RUN_ACTIVE", message: `A run (${run.runId}) is currently ${run.status}` };
-        }
-        if (run.status === "armed") {
-          await run.sessionMutex.withLock(async () => {
-            if (run.status !== "armed" || run.startedAt || run.lastActionSeq > 0 || run.currentLease) {
-              throw { status: 409, code: "RUN_ALREADY_CLAIMED", message: `Run ${run.runId} has already been claimed by a controller` };
-            }
-            await run._startFinalize("cancelled", "reconfigured_before_start");
-            run.cleanup();
-          });
-        }
+      this._refreshClaimState();
+      if (this.activeGroupId) {
+        throw { status: 409, code: "CONFLICT", message: `Run group ${this.activeGroupId} is still waiting for controllers` };
+      }
+
+      for (const runId of [...this.claimableRunIds]) {
+        const run = this.getRun(runId);
+        if (!run || run.manifest.group_id || run.status !== "armed") continue;
+        await run.sessionMutex.withLock(async () => {
+          if (run.status !== "armed" || run.startedAt || run.lastActionSeq > 0 || run.currentLease) {
+            throw { status: 409, code: "RUN_ALREADY_CLAIMED", message: `Run ${run.runId} has already been claimed by a controller` };
+          }
+          await run._startFinalize("cancelled", "reconfigured_before_start");
+          run.cleanup();
+        });
       }
 
       const run = await this._createArmedRunInternal({
-        durationMs,
-        maxActions,
-        winThreshold,
-        modelName: options.modelName || null,
-        harnessName: options.harnessName || null
+        durationMs: normalized.durationMs,
+        maxActions: normalized.maxActions,
+        winThreshold: normalized.winThreshold
       });
-      this.activeRunId = run.runId;
-      this._writeServerJson();
+      this._refreshClaimState();
       return run;
+    });
+  }
+
+  async createGroup(options = {}) {
+    const mode = String(options.mode || "");
+    if (!new Set(["concurrent", "competition"]).has(mode)) {
+      throw { status: 400, code: "INVALID_ARGUMENT", message: "mode must be concurrent or competition" };
+    }
+    const count = Number(options.count);
+    if (!Number.isSafeInteger(count) || count < 2 || count > 8) {
+      throw { status: 400, code: "INVALID_ARGUMENT", message: "count must be an integer between 2 and 8" };
+    }
+    const normalized = this._normalizeRunOptions(options);
+
+    return await this.admissionMutex.withLock(async () => {
+      this._refreshClaimState();
+      if (this.claimableRunIds.length > 0) {
+        throw { status: 409, code: "CONFLICT", message: "Another session or run group is still waiting for controllers" };
+      }
+
+      const groupId = `grp-${crypto.randomUUID()}`;
+      const frozenWorldBundle = this.worldBundleProvider ? this.worldBundleProvider() : { worldRevision: "0".repeat(64) };
+      const worldBundleStr = JSON.stringify(frozenWorldBundle, null, 2);
+      const worldDigest = frozenWorldBundle.worldRevision || crypto.createHash("sha256").update(worldBundleStr, "utf8").digest("hex");
+      const entries = Array.from({ length: count }, (_, index) => ({
+        entry_id: `entry-${index + 1}`,
+        run_id: `ext-${crypto.randomUUID()}`
+      }));
+      const commonConfig = {
+        ...(normalized.maxActions ? { max_actions: normalized.maxActions } : { duration_ms: normalized.durationMs }),
+        ...(normalized.winThreshold ? { win_threshold: normalized.winThreshold } : {})
+      };
+      const manifest = {
+        schema_version: 1,
+        group_id: groupId,
+        mode,
+        created_at: new Date().toISOString(),
+        world_bundle_digest: worldDigest,
+        common_config: commonConfig,
+        entries
+      };
+
+      const createdRuns = [];
+      try {
+        for (const entry of entries) {
+          createdRuns.push(await this._createArmedRunInternal({
+            runId: entry.run_id,
+            frozenWorldBundle,
+            durationMs: normalized.durationMs,
+            maxActions: normalized.maxActions,
+            winThreshold: normalized.winThreshold,
+            groupId,
+            entryId: entry.entry_id,
+            groupMode: mode
+          }));
+        }
+        this.groupStore.create(manifest);
+      } catch (error) {
+        for (const run of createdRuns) {
+          this.runs.delete(run.runId);
+          if (fs.existsSync(run.runDir)) fs.rmSync(run.runDir, { recursive: true, force: true });
+        }
+        this.groupStore.remove(groupId);
+        throw error;
+      }
+
+      this._refreshClaimState();
+      return this.getGroup(groupId);
+    });
+  }
+
+  getGroup(groupId) {
+    return this.groupStore.describe(groupId);
+  }
+
+  listGroups() {
+    return this.groupStore.list();
+  }
+
+  async cancelGroup(groupId) {
+    const group = this.getGroup(groupId);
+    if (!group) throw { status: 404, code: "NOT_FOUND", message: `Run group not found: ${groupId}` };
+    await Promise.all(group.entries.map(async (entry) => {
+      const run = this.getRun(entry.run_id);
+      if (run && !TERMINAL_STATUSES.has(run.status)) await run.cancelRun();
+    }));
+    this._refreshClaimState();
+    return this.getGroup(groupId);
+  }
+
+  async claimOrAttachRun(controllerInfo, args = {}, operationId = null, abortSignal = null) {
+    return await this.admissionMutex.withLock(async () => {
+      const explicitRunId = args.run_id ? String(args.run_id) : null;
+      let boundRunId = this.controllerRunBindings.get(controllerInfo.controllerId) || null;
+      if (boundRunId && TERMINAL_STATUSES.has(this.getRun(boundRunId)?.status)) {
+        this.controllerRunBindings.delete(controllerInfo.controllerId);
+        boundRunId = null;
+      }
+      const runId = explicitRunId || boundRunId || this.claimableRunIds[0] || null;
+      const run = runId ? this.getRun(runId) : null;
+      if (!run) {
+        if (explicitRunId) {
+          throw { status: 404, code: "NOT_FOUND", message: `Run not found: ${explicitRunId}` };
+        }
+        throw { status: 409, code: "NO_AVAILABLE_RUN", message: "No armed External Play run is available" };
+      }
+      if (boundRunId && explicitRunId && boundRunId !== explicitRunId) {
+        throw { status: 409, code: "CONFLICT", message: `Controller is already bound to run ${boundRunId}` };
+      }
+
+      const modelName = normalizeModelName(args.model_name, { required: run.status === "armed" });
+      if (run.modelName && modelName && run.modelName !== modelName) {
+        throw { status: 409, code: "IDENTITY_MISMATCH", message: `Run ${run.runId} is already registered as ${run.modelName}` };
+      }
+
+      const result = await run.startOrAttach(controllerInfo, operationId, abortSignal, { modelName });
+      this.controllerRunBindings.set(controllerInfo.controllerId, run.runId);
+      this._refreshClaimState();
+      return result;
     });
   }
 
@@ -559,6 +720,7 @@ class ExternalPlayService {
     for (const [, run] of this.runs.entries()) {
       run.cleanup();
     }
+    this.controllerRunBindings.clear();
     this._releaseServerLock();
     this._clearServerJson();
   }
@@ -627,6 +789,24 @@ class RunInstance {
     this.deadlineTimer = null;
 
     this.operationIndex = new Map(); // operation_id -> final record / response
+  }
+
+  _startResponseMetadata(overrides = {}) {
+    const modelName = Object.hasOwn(overrides, "modelName") ? overrides.modelName : this.modelName;
+    const harnessName = Object.hasOwn(overrides, "harnessName")
+      ? overrides.harnessName
+      : (this.harnessName || this.declaredCli || "stdio-mcp");
+    return {
+      ...(this.manifest.group_id ? {
+        group_id: this.manifest.group_id,
+        entry_id: this.manifest.entry_id,
+        group_mode: this.manifest.group_mode
+      } : {}),
+      model_name: modelName,
+      harness: harnessName,
+      instructions_version: INSTRUCTIONS_VERSION,
+      run_instructions: buildRunInstructions(this)
+    };
   }
 
   async appendJournalRecord(record) {
@@ -710,6 +890,8 @@ class RunInstance {
         this.durationMs = record.duration_ms || null;
         this.maxActions = record.max_actions || null;
         this.winThreshold = record.win_threshold || null;
+        this.modelName = record.model_name || this.modelName || null;
+        this.harnessName = record.harness_name || this.harnessName || null;
         break;
 
       case "run_started":
@@ -718,6 +900,8 @@ class RunInstance {
         this.deadlineAt = record.deadline_at || null;
         this.maxLeaseEpoch = record.lease_epoch;
         this.declaredCli = record.declared_cli || record.controller_id?.split("-")[0] || "stdio-mcp";
+        this.modelName = record.model_name || this.modelName || null;
+        this.harnessName = this.declaredCli;
         this.currentLease = {
           controllerId: record.controller_id,
           declaredCli: this.declaredCli,
@@ -1128,13 +1312,17 @@ class RunInstance {
 
   // MCP & Action Protocol Implementation
 
-  async startOrAttach(controllerInfo, operationId = null, abortSignal = null) {
+  async startOrAttach(controllerInfo, operationId = null, abortSignal = null, startOptions = {}) {
     return await this.sessionMutex.withLock(async () => {
       if (abortSignal?.aborted) {
         throw { status: 499, code: "REQUEST_CANCELLED", message: "Request cancelled before WAL commit" };
       }
+      const requestedModelName = normalizeModelName(startOptions.modelName, { required: this.status === "armed" });
+      if (this.modelName && requestedModelName && this.modelName !== requestedModelName) {
+        throw { status: 409, code: "IDENTITY_MISMATCH", message: `Run ${this.runId} is already registered as ${this.modelName}` };
+      }
       const opId = operationId || `op-start-${crypto.randomUUID()}`;
-      const fingerprint = crypto.createHash("sha256").update(opId).digest("hex");
+      const fingerprint = crypto.createHash("sha256").update(JSON.stringify({ opId, modelName: requestedModelName })).digest("hex");
 
       if (this.operationIndex.has(opId)) {
         const cached = this.operationIndex.get(opId);
@@ -1147,6 +1335,7 @@ class RunInstance {
           lease_expires_at: cached.lease_expires_at,
           started_at: this.startedAt,
           ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
+          ...this._startResponseMetadata(),
           observation: cached.observation || currentObs,
           sanitized_result: cached.initial_sanitized_result || cached.sanitized_result
         };
@@ -1158,7 +1347,6 @@ class RunInstance {
         const deadlineAt = this.maxActions ? null : new Date(Date.now() + this.durationMs).toISOString();
         const expiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
         const declaredCli = controllerInfo?.declaredCli || controllerInfo?.name || "stdio-mcp";
-        this.declaredCli = declaredCli;
 
         const initialObs = this.gameSession ? sanitizeObservationForMcp(getBridge().sessionSnapshot(this.gameSession)) : {};
         const sanitizedResult = {
@@ -1170,6 +1358,7 @@ class RunInstance {
                 run_id: this.runId,
                 status: "active",
                 action_seq: 0,
+                ...this._startResponseMetadata({ modelName: requestedModelName, harnessName: declaredCli }),
                 observation: initialObs,
                 game_won: false,
                 ended: false,
@@ -1195,6 +1384,7 @@ class RunInstance {
           request_fingerprint: fingerprint,
           controller_id: controllerInfo.controllerId,
           declared_cli: declaredCli,
+          model_name: requestedModelName,
           lease_id: leaseId,
           lease_epoch: 1,
           started_at: startedAt,
@@ -1213,6 +1403,7 @@ class RunInstance {
           lease_expires_at: expiresAt,
           started_at: startedAt,
           ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: deadlineAt }),
+          ...this._startResponseMetadata(),
           observation: initialObs,
           sanitized_result: sanitizedResult
         };
@@ -1234,6 +1425,7 @@ class RunInstance {
             lease_expires_at: new Date(this.currentLease.expiresAt).toISOString(),
             started_at: this.startedAt,
             ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
+            ...this._startResponseMetadata(),
             observation: currentObs
           };
         }
@@ -1300,6 +1492,7 @@ class RunInstance {
           lease_expires_at: expiresAt,
           started_at: this.startedAt,
           ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
+          ...this._startResponseMetadata(),
           observation: currentObs
         };
       }
@@ -1721,8 +1914,13 @@ class RunInstance {
             rooms_visited: 1,
             rooms_total: 256,
             actions_total: 0,
-            declared_cli: this.declaredCli || "unknown",
+            declared_cli: this.harnessName || this.declaredCli || "unknown",
             declared_model: this.modelName || null,
+            ...(this.manifest.group_id ? {
+              group_id: this.manifest.group_id,
+              entry_id: this.manifest.entry_id,
+              group_mode: this.manifest.group_mode
+            } : {}),
             route: ["level_HxI"],
             progress_curve: [{ action_seq: 0, gems: 0, rooms: 1 }]
           };
@@ -1832,8 +2030,13 @@ class SummaryBuilder {
       rooms_visited: roomsVisited,
       rooms_total: roomsTotal,
       actions_total: actionsTotal,
-      declared_cli: run.declaredCli || run.currentLease?.declaredCli || run.currentLease?.controllerId || "unknown",
+      declared_cli: run.harnessName || run.declaredCli || run.currentLease?.declaredCli || run.currentLease?.controllerId || "unknown",
       declared_model: run.modelName || null,
+      ...(run.manifest.group_id ? {
+        group_id: run.manifest.group_id,
+        entry_id: run.manifest.entry_id,
+        group_mode: run.manifest.group_mode
+      } : {}),
       route,
       progress_curve: progressCurve
     };
