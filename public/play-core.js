@@ -209,7 +209,15 @@
         terrain: playData.terrain,
         actors: playData.actors.map((actor) => ({ ...actor })),
         effects: {
-          fuzzyEnabled: fuzzyToggle ? fuzzyToggle.getAttribute("aria-pressed") === "true" : true,
+          fuzzyEnabled: fuzzyToggle
+            ? fuzzyToggle.getAttribute("aria-pressed") === "true"
+            : (() => {
+                try {
+                  return localStorage.getItem("mazebench_spectator_minimal_mode") !== "true";
+                } catch (_) {
+                  return true;
+                }
+              })(),
           edgeOutlinesEnabled: edgeToggle ? edgeToggle.getAttribute("aria-pressed") === "true" : true,
           noisePhase: 0
         }

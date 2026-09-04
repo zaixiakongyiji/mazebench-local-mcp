@@ -2328,6 +2328,75 @@ function createAgentRunService({
     return readClaudeRunModelId(runId, requested) || resolveClaudeCatalogModelId(requested) || modelName;
   }
 
+  const noveltyCache = new Map();
+
+  function getRunFinalNovelty(runDir, summary = null) {
+    if (summary && summary.novelty != null && Number.isFinite(Number(summary.novelty))) {
+      return Math.min(100, Math.max(0, Math.round(Number(summary.novelty))));
+    }
+    if (!runDir || !fs.existsSync(runDir)) return 0;
+
+    const actionsPath = path.join(runDir, "actions.jsonl");
+    const journalPath = path.join(runDir, "journal.jsonl");
+    let targetPath = null;
+    if (fs.existsSync(actionsPath)) {
+      targetPath = actionsPath;
+    } else if (fs.existsSync(journalPath)) {
+      targetPath = journalPath;
+    }
+    if (!targetPath) return 0;
+
+    try {
+      const stat = fs.statSync(targetPath);
+      const cached = noveltyCache.get(targetPath);
+      if (cached && cached.mtime === stat.mtimeMs) {
+        return cached.novelty;
+      }
+
+      const content = fs.readFileSync(targetPath, "utf8");
+      const lines = content.split("\n");
+      const windowSize = 50;
+      const noveltyWindow = [];
+      const seen = new Set();
+      let lastNovelty = 0;
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          let room = null;
+          let player = null;
+          if (entry.type === "action_committed") {
+            const pv = entry.action_record?.post_viewer_state;
+            room = pv?.current_room || entry.action_record?.sanitized_status?.current_room || "level_HxI";
+            player = pv?.player;
+          } else if (entry.post_viewer_state) {
+            room = entry.post_viewer_state.current_room || "level_HxI";
+            player = entry.post_viewer_state.player;
+          } else if (entry.player && entry.room) {
+            room = entry.room;
+            player = entry.player;
+          }
+
+          if (player && typeof player.x === "number" && typeof player.y === "number") {
+            const cellKey = `${room || "level_HxI"}:${player.x}:${player.y}`;
+            const isNovel = seen.has(cellKey) ? 0 : 1;
+            seen.add(cellKey);
+            noveltyWindow.push(isNovel);
+            if (noveltyWindow.length > windowSize) noveltyWindow.shift();
+            const sum = noveltyWindow.reduce((a, b) => a + b, 0);
+            lastNovelty = Math.round((sum / noveltyWindow.length) * 100);
+          }
+        } catch (_err) {}
+      }
+
+      noveltyCache.set(targetPath, { mtime: stat.mtimeMs, novelty: lastNovelty });
+      return lastNovelty;
+    } catch (_e) {
+      return 0;
+    }
+  }
+
   function summarizeExternalRun(entryName, itemDir = null) {
     if (!entryName || typeof entryName !== "string") return null;
     const extDir = resolveExternalRunsDir(runsDir);
@@ -2392,6 +2461,7 @@ function createAgentRunService({
       summary?.rooms ??
       (Array.isArray(summary?.route) ? summary.route.length : 1);
     const roomTotal = summary?.rooms_total ?? 256;
+    const novelty = getRunFinalNovelty(runDir, summary);
 
     return {
       id: entryName,
@@ -2414,6 +2484,7 @@ function createAgentRunService({
       gem_total: gemTotal,
       room_count: roomCount,
       room_total: roomTotal,
+      novelty,
       favorited: isRunFavorite(entryName),
       deletable: true,
       url: `/external-play/${encodeURIComponent(entryName)}`
@@ -2500,6 +2571,7 @@ function createAgentRunService({
         ? Number(meta.gem_total)
         : null;
     const complete = collectedAllWorldGems(gemCount, gemTotal);
+    const novelty = getRunFinalNovelty(runDir, meta);
 
     const hasVideo = fs.existsSync(path.join(runDir, "maze_replay.mp4"));
     const storedVideoStatus =
@@ -2524,6 +2596,7 @@ function createAgentRunService({
       gem_total: gemTotal,
       room_count: scorecardStatsCurrent && Number.isFinite(scorecardRooms) ? scorecardRooms : observedRooms.size,
       room_total: Number.isFinite(scorecardRoomTotal) ? scorecardRoomTotal : meta.room_total ?? null,
+      novelty,
       progress: progressForRun(meta, turns),
       start_room_is_default: Boolean(defaultLevelId && meta.level_id === defaultLevelId),
       current_room: last ? last.current_room : meta.level_id,
@@ -2806,29 +2879,34 @@ function createAgentRunService({
       room_count: roomCount,
       room_total: roomTotal,
       room_percentage: roomPct,
+      novelty: Number(run.novelty ?? 0),
       created_at: run.created_at || "",
       url: run.url || (String(run.id).startsWith("ext-") ? `/external-play/${encodeURIComponent(run.id)}` : `/agent/runs/${encodeURIComponent(run.id)}`)
     };
   }
 
   function buildLeaderboardRankings(runsList) {
-    // 1. 最多房间排序: room_count DESC -> gem_count DESC -> turns ASC -> created_at DESC
+    // 1. 最多房间排序: room_count DESC -> gem_count DESC -> novelty DESC -> turns ASC -> created_at DESC
     const sortedByRooms = [...runsList].sort((left, right) => {
       const roomDiff = (Number(right.room_count) || 0) - (Number(left.room_count) || 0);
       if (roomDiff !== 0) return roomDiff;
       const gemDiff = (Number(right.gem_count) || 0) - (Number(left.gem_count) || 0);
       if (gemDiff !== 0) return gemDiff;
+      const noveltyDiff = (Number(right.novelty) || 0) - (Number(left.novelty) || 0);
+      if (noveltyDiff !== 0) return noveltyDiff;
       const turnDiff = (Number(left.turns ?? left.moves ?? 0) || 0) - (Number(right.turns ?? right.moves ?? 0) || 0);
       if (turnDiff !== 0) return turnDiff;
       return String(right.created_at || "").localeCompare(String(left.created_at || ""));
     });
 
-    // 2. 最多宝石排序: gem_count DESC -> room_count DESC -> turns ASC -> created_at DESC
+    // 2. 最多宝石排序: gem_count DESC -> room_count DESC -> novelty DESC -> turns ASC -> created_at DESC
     const sortedByGems = [...runsList].sort((left, right) => {
       const gemDiff = (Number(right.gem_count) || 0) - (Number(left.gem_count) || 0);
       if (gemDiff !== 0) return gemDiff;
       const roomDiff = (Number(right.room_count) || 0) - (Number(left.room_count) || 0);
       if (roomDiff !== 0) return roomDiff;
+      const noveltyDiff = (Number(right.novelty) || 0) - (Number(left.novelty) || 0);
+      if (noveltyDiff !== 0) return noveltyDiff;
       const turnDiff = (Number(left.turns ?? left.moves ?? 0) || 0) - (Number(right.turns ?? right.moves ?? 0) || 0);
       if (turnDiff !== 0) return turnDiff;
       return String(right.created_at || "").localeCompare(String(left.created_at || ""));

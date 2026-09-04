@@ -43,6 +43,7 @@ function createTestExternalRun(runId, data) {
       rooms_visited: data.rooms || 1,
       rooms_total: 100,
       actions_total: data.actions || 50,
+      novelty: data.novelty !== undefined ? data.novelty : 0,
       max_actions: data.max_actions !== undefined ? data.max_actions : 256,
       declared_cli: data.harness || "antigravity-mcp",
       declared_model: data.model_name || undefined,
@@ -95,7 +96,30 @@ createTestExternalRun("ext-gemini-1", {
   gems: 16,
   actions: 240,
   max_actions: 256,
+  novelty: 50,
   created_at: "2026-08-01T12:00:00.000Z"
+});
+
+// Model D: DeepSeek V4 Flash (2 rooms, 0 gems, 256 actions, novelty 30)
+createTestExternalRun("ext-deepseek-flash", {
+  model_name: "DeepSeek V4 Flash",
+  rooms: 2,
+  gems: 0,
+  actions: 256,
+  max_actions: 256,
+  novelty: 30,
+  created_at: "2026-08-01T08:00:00.000Z"
+});
+
+// Model E: DeepSeek V4 Pro (2 rooms, 0 gems, 256 actions, novelty 12, created_at 更晚)
+createTestExternalRun("ext-deepseek-pro", {
+  model_name: "DeepSeek V4 Pro",
+  rooms: 2,
+  gems: 0,
+  actions: 256,
+  max_actions: 256,
+  novelty: 12,
+  created_at: "2026-08-01T09:00:00.000Z"
 });
 
 // Model C: GPT-4o (run 1: 超长非标准 1000 步场次, 20 rooms, 20 gems, 500 actions)
@@ -132,14 +156,14 @@ const service = createAgentRunService({
 try {
   const leaderboard = service.getLeaderboard();
 
-  // 1. 验证总有效模型运行数 (应排除 ext-anon-1 和 ext-anon-2, 共 4 个有效运行)
-  assert.equal(leaderboard.total_named_runs, 4, "Should only count runs with a valid declared model name");
+  // 1. 验证总有效模型运行数 (应排除 ext-anon-1 和 ext-anon-2, 共 6 个有效运行)
+  assert.equal(leaderboard.total_named_runs, 6, "Should only count runs with a valid declared model name");
 
   // 2. 验证标准 256 步过滤 (GPT-4o 设了 1000 步且用了 500 步，不应出现在 standard 榜中)
   const standardRoomsPerModel = leaderboard.standard.by_rooms.per_model;
   const standardGemsPerModel = leaderboard.standard.by_gems.per_model;
-  assert.equal(standardRoomsPerModel.length, 2, "Standard 256 steps per-model should have Claude and Gemini");
-  assert.equal(standardGemsPerModel.length, 2, "Standard 256 steps per-model should have Claude and Gemini");
+  assert.equal(standardRoomsPerModel.length, 4, "Standard 256 steps per-model should have Claude, Gemini, DeepSeek Flash, DeepSeek Pro");
+  assert.equal(standardGemsPerModel.length, 4, "Standard 256 steps per-model should have Claude, Gemini, DeepSeek Flash, DeepSeek Pro");
 
   // 3. 验证标准 256 步下的最多房间榜 (Claude 最佳为 12 房间，应排名第一)
   assert.equal(standardRoomsPerModel[0].rank, 1);
@@ -156,6 +180,17 @@ try {
   assert.equal(standardRoomsPerModel[1].room_count, 9);
   assert.equal(standardRoomsPerModel[1].gem_count, 16);
 
+  // 验证房间数打平且宝石/步数相同时，看棋盘新颖度 (DeepSeek Flash 30% > DeepSeek Pro 12%)
+  assert.equal(standardRoomsPerModel[2].rank, 3);
+  assert.equal(standardRoomsPerModel[2].model_name, "DeepSeek V4 Flash");
+  assert.equal(standardRoomsPerModel[2].novelty, 30);
+  assert.equal(standardRoomsPerModel[2].id, "ext-deepseek-flash");
+
+  assert.equal(standardRoomsPerModel[3].rank, 4);
+  assert.equal(standardRoomsPerModel[3].model_name, "DeepSeek V4 Pro");
+  assert.equal(standardRoomsPerModel[3].novelty, 12);
+  assert.equal(standardRoomsPerModel[3].id, "ext-deepseek-pro");
+
   // 4. 验证标准 256 步下的最多宝石榜 (Gemini 为 16 颗宝石，应排名第一)
   assert.equal(standardGemsPerModel[0].rank, 1);
   assert.equal(standardGemsPerModel[0].model_name, "Gemini 2.5 Flash");
@@ -168,12 +203,25 @@ try {
   assert.equal(standardGemsPerModel[1].gem_count, 8);
   assert.equal(standardGemsPerModel[1].id, "ext-claude-2");
 
+  // 最多宝石榜中，两者宝石均为0，房间数同为2，总步数同为256，看新颖度 (Flash 30% > Pro 12%)
+  assert.equal(standardGemsPerModel[2].rank, 3);
+  assert.equal(standardGemsPerModel[2].model_name, "DeepSeek V4 Flash");
+  assert.equal(standardGemsPerModel[2].novelty, 30);
+  assert.equal(standardGemsPerModel[2].id, "ext-deepseek-flash");
+
+  assert.equal(standardGemsPerModel[3].rank, 4);
+  assert.equal(standardGemsPerModel[3].model_name, "DeepSeek V4 Pro");
+  assert.equal(standardGemsPerModel[3].novelty, 12);
+  assert.equal(standardGemsPerModel[3].id, "ext-deepseek-pro");
+
   // 5. 验证全部记录 (all_runs) 榜单保留所有满足条件的记录
   const standardRoomsAllRuns = leaderboard.standard.by_rooms.all_runs;
-  assert.equal(standardRoomsAllRuns.length, 3, "All runs in standard should contain 2 Claude runs and 1 Gemini run");
+  assert.equal(standardRoomsAllRuns.length, 5, "All runs in standard should contain 2 Claude runs, 1 Gemini run, and 2 DeepSeek runs");
   assert.equal(standardRoomsAllRuns[0].id, "ext-claude-2");
   assert.equal(standardRoomsAllRuns[1].id, "ext-gemini-1");
   assert.equal(standardRoomsAllRuns[2].id, "ext-claude-1");
+  assert.equal(standardRoomsAllRuns[3].id, "ext-deepseek-flash");
+  assert.equal(standardRoomsAllRuns[4].id, "ext-deepseek-pro");
 
   // 6. 验证全步数 (all steps) 榜单包含长局 (GPT-4o 20 房间排第一)
   const allRoomsPerModel = leaderboard.all.by_rooms.per_model;

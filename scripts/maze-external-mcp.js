@@ -9,6 +9,8 @@ const os = require("os");
 const PROTOCOL_VERSION = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
   PROTOCOL_VERSION,
+  "2025-06-18",
+  "2025-03-26",
   "2024-11-05"
 ]);
 const HEARTBEAT_INTERVAL_MS = 10000;

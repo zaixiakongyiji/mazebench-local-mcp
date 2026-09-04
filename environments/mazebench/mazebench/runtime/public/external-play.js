@@ -1,6 +1,22 @@
 (function () {
   "use strict";
 
+  const STORAGE_KEY_MINIMAL_MODE = "mazebench_spectator_minimal_mode";
+
+  function readMinimalModeFromStorage() {
+    try {
+      return localStorage.getItem(STORAGE_KEY_MINIMAL_MODE) === "true";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function writeMinimalModeToStorage(value) {
+    try {
+      localStorage.setItem(STORAGE_KEY_MINIMAL_MODE, value ? "true" : "false");
+    } catch (_) {}
+  }
+
   let viewerToken = null;
   let currentGenerationId = 0;
 
@@ -103,6 +119,49 @@
     const nextBtn = document.getElementById("playback-next-btn");
     const stepLabel = document.getElementById("playback-step-label");
     const liveBtn = document.getElementById("playback-live-btn");
+    const minimalBtn = document.getElementById("playback-minimal-btn");
+
+    let isMinimalMode = readMinimalModeFromStorage();
+
+    function updateMinimalButtonUI(active) {
+      if (!minimalBtn) return;
+      minimalBtn.classList.toggle("is-active", active);
+      minimalBtn.setAttribute("aria-pressed", active ? "true" : "false");
+    }
+
+    function applyMinimalModeToApp(app, minimalActive) {
+      if (!app || !app.state || !app.state.effects) return;
+      app.state.effects.fuzzyEnabled = !minimalActive;
+      if (typeof app.syncNoiseTicker === "function") {
+        app.syncNoiseTicker();
+      }
+      if (typeof app.render === "function") {
+        app.render();
+      } else if (typeof app.renderOncePerFrame === "function") {
+        app.renderOncePerFrame();
+      }
+    }
+
+    function syncAppMinimalMode() {
+      const app = window.__MAZEBENCH_APP__;
+      if (app) {
+        applyMinimalModeToApp(app, isMinimalMode);
+        return true;
+      }
+      return false;
+    }
+
+    // Read initial state on boot: if saved as "true", mark button as .is-active and aria-pressed="true"
+    updateMinimalButtonUI(isMinimalMode);
+
+    if (!syncAppMinimalMode()) {
+      const appPollStart = Date.now();
+      const appPollInterval = setInterval(() => {
+        if (syncAppMinimalMode() || Date.now() - appPollStart > 10000) {
+          clearInterval(appPollInterval);
+        }
+      }, 50);
+    }
 
     let baseViewerState = null;
     let historyActions = [];
@@ -371,6 +430,18 @@
         isPaused = false;
         stopAutoPlay();
         seekToStep(historyActions.length);
+      });
+    }
+
+    if (minimalBtn) {
+      minimalBtn.addEventListener("click", () => {
+        isMinimalMode = !isMinimalMode;
+        updateMinimalButtonUI(isMinimalMode);
+        writeMinimalModeToStorage(isMinimalMode);
+        const app = window.__MAZEBENCH_APP__;
+        if (app) {
+          applyMinimalModeToApp(app, isMinimalMode);
+        }
       });
     }
 

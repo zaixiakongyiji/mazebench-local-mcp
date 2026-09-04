@@ -92,24 +92,26 @@ async function runMcpTests() {
     assert.equal(externalPlay.runs.size, 0);
     const initialManualRun = await externalPlay.createRun();
 
-    // 1. Verify the legacy protocol remains compatible in a separate session.
-    console.log("  [Test 1] Legacy protocol compatibility");
-    const legacyChild = spawn(process.execPath, [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")], {
-      env: {
-        ...process.env,
-        MAZEBENCH_DATA_HOME: testDataHome
-      },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    try {
-      const legacyClient = new TestJsonRpcClient(legacyChild);
-      const legacyInitRes = await legacyClient.sendRequest(1, "initialize", {
-        protocolVersion: "2024-11-05",
-        clientInfo: { name: "legacy-test-client", version: "1.0.0" }
+    // 1. Verify Codex and legacy MCP protocol versions in separate sessions.
+    console.log("  [Test 1] Codex and legacy protocol compatibility");
+    for (const protocolVersion of ["2025-06-18", "2025-03-26", "2024-11-05"]) {
+      const compatibilityChild = spawn(process.execPath, [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")], {
+        env: {
+          ...process.env,
+          MAZEBENCH_DATA_HOME: testDataHome
+        },
+        stdio: ["pipe", "pipe", "pipe"]
       });
-      assert.equal(legacyInitRes.result?.protocolVersion, "2024-11-05");
-    } finally {
-      legacyChild.kill("SIGTERM");
+      try {
+        const compatibilityClient = new TestJsonRpcClient(compatibilityChild);
+        const compatibilityInitRes = await compatibilityClient.sendRequest(1, "initialize", {
+          protocolVersion,
+          clientInfo: { name: "compatibility-test-client", version: "1.0.0" }
+        });
+        assert.equal(compatibilityInitRes.result?.protocolVersion, protocolVersion);
+      } finally {
+        compatibilityChild.kill("SIGTERM");
+      }
     }
 
     // 2. Spawn the primary adapter and verify pre-init behavior.

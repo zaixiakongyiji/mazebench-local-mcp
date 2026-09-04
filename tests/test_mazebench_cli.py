@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 from pathlib import Path
 from unittest import TestCase, mock
 
@@ -5,6 +8,53 @@ import mazebench_cli
 
 
 class CliCommandTests(TestCase):
+    @mock.patch.object(mazebench_cli, "_pid_alive_windows", return_value=True)
+    def test_pid_alive_uses_windows_process_probe(self, windows_probe):
+        with mock.patch.object(mazebench_cli.os, "name", "nt"):
+            self.assertTrue(mazebench_cli._pid_alive(4321))
+
+        windows_probe.assert_called_once_with(4321)
+
+    @mock.patch.object(mazebench_cli, "_pid_alive", return_value=True)
+    def test_read_state_keeps_live_server_record(self, pid_alive):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "server.json"
+            state = {"pid": 4321, "url": "http://127.0.0.1:3000"}
+            state_file.write_text(json.dumps(state), encoding="utf-8")
+
+            with mock.patch.object(
+                mazebench_cli, "_state_file", return_value=state_file
+            ):
+                self.assertEqual(mazebench_cli._read_state(), state)
+
+            self.assertTrue(state_file.exists())
+
+        pid_alive.assert_called_once_with(4321)
+
+    @mock.patch.object(mazebench_cli, "_clear_state")
+    @mock.patch.object(mazebench_cli, "_pid_alive", return_value=False)
+    def test_read_state_clears_dead_server_record(self, pid_alive, clear_state):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "server.json"
+            state_file.write_text(
+                json.dumps({"pid": 4321, "url": "http://127.0.0.1:3000"}),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                mazebench_cli, "_state_file", return_value=state_file
+            ):
+                self.assertIsNone(mazebench_cli._read_state())
+
+        pid_alive.assert_called_once_with(4321)
+        clear_state.assert_called_once_with()
+
+    def test_windows_process_probe_detects_current_process(self):
+        if os.name != "nt":
+            self.skipTest("Windows-only regression test")
+
+        self.assertTrue(mazebench_cli._pid_alive_windows(os.getpid()))
+
     @mock.patch("builtins.print")
     @mock.patch.object(mazebench_cli, "resolve_root")
     def test_global_help_does_not_require_a_runtime(self, resolve_root, print_output):

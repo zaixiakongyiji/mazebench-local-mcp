@@ -302,6 +302,10 @@ def _server_log() -> Path:
 def _pid_alive(pid: int) -> bool:
     if not pid or pid <= 0:
         return False
+
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
+
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -311,6 +315,41 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """使用 Win32 API 检查进程，避免 os.kill(pid, 0) 在 Windows 上误报。"""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    error_access_denied = 5
+    still_active = 259
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        # 无权查询的系统进程仍然存在；其他错误表示 PID 当前不可用。
+        return ctypes.get_last_error() == error_access_denied
+
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            # 已获得有效句柄时采取保守判断，避免误删仍在使用的状态文件。
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _read_state() -> dict | None:
@@ -352,7 +391,7 @@ def _find_free_port(host: str, preferred: int, span: int = 50) -> int:
         return sock.getsockname()[1]
 
 
-def _wait_for_state(pid: int, timeout: float = 6.0) -> dict | None:
+def _wait_for_state(pid: int, timeout: float = 30.0) -> dict | None:
     """Poll until the just-started server writes its bound port, or it dies."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

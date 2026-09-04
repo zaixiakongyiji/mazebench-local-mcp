@@ -1632,6 +1632,7 @@ args = ["mcp"]</code></pre>
           </div>
           <div class="playback-controls-right">
             <button id="playback-summary-btn" class="playback-btn" type="button" title="View Summary" data-i18n="summary_btn" hidden>📊 Summary</button>
+            <button id="playback-minimal-btn" class="playback-btn playback-btn--toggle" type="button" title="Toggle Minimal Mode" aria-pressed="false" data-i18n="minimal_mode_btn">✨ Minimal Mode</button>
             <button id="playback-live-btn" class="playback-btn playback-btn--live is-active" type="button" title="Jump to Live">🔴 Live</button>
           </div>
         </nav>
