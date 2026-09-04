@@ -185,14 +185,31 @@ async function runTests() {
 
     console.log("  [Test 4] group result and run identity survive restart");
     service.shutdown();
+    const removedRunId = starts[1].run_id;
+    fs.rmSync(path.join(dataHome, "external-runs", removedRunId), { recursive: true, force: true });
+    const concurrentResultPath = path.join(dataHome, "external-groups", concurrent.group_id, "result.json");
+    fs.writeFileSync(concurrentResultPath, `${JSON.stringify({
+      ...concurrentResult.result,
+      group_id: competition.group_id
+    }, null, 2)}\n`, "utf8");
     const restarted = new ExternalPlayService({ dataHome, port: 3018, defaultMaxActions: 1 });
     await restarted.initialize();
     try {
       const recoveredCompetition = restarted.getGroup(competition.group_id);
       assert.equal(recoveredCompetition.status, "completed");
       assert.equal(JSON.stringify(recoveredCompetition.result.ranking), persistedRanking);
+      assert.equal(restarted.getRun(removedRunId), null);
+      assert.equal(
+        recoveredCompetition.entries.find((entry) => entry.run_id === removedRunId)?.status,
+        "action_limit",
+        "the immutable group result remains authoritative after a child run is deleted"
+      );
       assert.equal(restarted.getRun(starts[0].run_id).modelName, "duplicate-model");
       assert.equal(restarted.getRun(starts[0].run_id).harnessName, "harness-1");
+      const recoveredConcurrent = restarted.getGroup(concurrent.group_id);
+      assert.equal(recoveredConcurrent.status, "completed");
+      assert.equal(recoveredConcurrent.result.group_id, concurrent.group_id);
+      assert.equal(recoveredConcurrent.result.ranking, null);
       assert.ok(fs.existsSync(path.join(
         restarted.runsDir,
         starts[0].run_id,

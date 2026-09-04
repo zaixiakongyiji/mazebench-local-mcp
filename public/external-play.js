@@ -219,7 +219,7 @@
     }
 
     function render() {
-      const claimed = group.entries.filter((entry) => entry.status !== "armed").length;
+      const claimed = group.entries.filter((entry) => Boolean(entry.model_name || entry.started_at)).length;
       if (status) status.textContent = group.status;
       if (claimCount) claimCount.textContent = `${claimed} / ${group.entries.length} models claimed`;
       if (entriesRoot) entriesRoot.innerHTML = group.entries.map(renderEntry).join("");

@@ -600,6 +600,44 @@ async function runTests() {
       timedService.shutdown();
     }
 
+    console.log("  [Test 19] Frozen world bundle drives initial state and restart recovery");
+    const { buildGameWorldBundle } = require("../server/app");
+    const frozenBundle = JSON.parse(JSON.stringify(buildGameWorldBundle("maze")));
+    delete frozenBundle.worldRevision;
+    const frozenStartState = frozenBundle.levelStates[frozenBundle.defaultLevelId];
+    const frozenPlayer = frozenStartState.actors.find((actor) => actor.type === "player" || actor.type === "circle_player");
+    assert.ok(frozenPlayer);
+    const frozenPlayerX = (frozenPlayer.x + 1) % frozenStartState.width;
+    frozenPlayer.x = frozenPlayerX;
+
+    const frozenDataHome = path.join(testDataHome, "frozen-world");
+    const frozenService = new ExternalPlayService({
+      dataHome: frozenDataHome,
+      port: 3010,
+      worldBundleProvider: () => frozenBundle
+    });
+    await frozenService.initialize();
+    let frozenRunId;
+    try {
+      const frozenRun = await frozenService.createRun({ maxActions: 3 });
+      frozenRunId = frozenRun.runId;
+      assert.equal(frozenRun.baseViewerState.current_room, frozenBundle.defaultLevelId);
+      assert.equal(frozenRun.baseViewerState.player.x, frozenPlayerX);
+    } finally {
+      frozenService.shutdown();
+    }
+
+    const frozenRestart = new ExternalPlayService({ dataHome: frozenDataHome, port: 3011 });
+    await frozenRestart.initialize();
+    try {
+      const recoveredFrozenRun = frozenRestart.getRun(frozenRunId);
+      assert.ok(recoveredFrozenRun);
+      assert.equal(recoveredFrozenRun.currentViewerState.current_room, frozenBundle.defaultLevelId);
+      assert.equal(recoveredFrozenRun.currentViewerState.player.x, frozenPlayerX);
+    } finally {
+      frozenRestart.shutdown();
+    }
+
     console.log("All ExternalPlayService unit & integration tests PASSED!");
   } finally {
     fs.rmSync(testDataHome, { recursive: true, force: true });

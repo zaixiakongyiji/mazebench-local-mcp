@@ -1470,7 +1470,7 @@ function createPageRenderer({
             <div>
               <span class="badge">${escapeHtml(activeGroup.mode.toUpperCase())}</span>
               <h2 style="margin: 8px 0 4px 0; font-size: 1.25rem;">Run Group: <code>${escapeHtml(activeGroup.group_id)}</code></h2>
-              <p class="muted" style="margin: 0;">${activeGroup.entries.filter((entry) => entry.status !== "armed").length} / ${activeGroup.entries.length} models claimed</p>
+              <p class="muted" style="margin: 0;">${activeGroup.entries.filter((entry) => Boolean(entry.model_name || entry.started_at)).length} / ${activeGroup.entries.length} models claimed</p>
             </div>
             <a class="button button--primary" href="/external-play/groups/${encodeURIComponent(activeGroup.group_id)}">Open Run Group</a>
           </div>

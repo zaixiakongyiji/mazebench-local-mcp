@@ -332,14 +332,12 @@ class StdioMcpAdapter {
     // Exchange mcp_bootstrap_nonce for controller token if token not given or forced
     if (force || !this.controllerToken) {
       let exchanged = false;
-      for (let retry = 0; retry < 3; retry++) {
+      for (let retry = 0; retry < 12; retry++) {
+        try {
+          serverJson = JSON.parse(fs.readFileSync(this.serverJsonPath, "utf8"));
+        } catch (_e) {}
         if (!serverJson?.mcp_bootstrap_nonce) {
-          try {
-            serverJson = JSON.parse(fs.readFileSync(this.serverJsonPath, "utf8"));
-          } catch (_e) {}
-        }
-        if (!serverJson?.mcp_bootstrap_nonce) {
-          await new Promise((r) => setTimeout(r, 200));
+          await new Promise((r) => setTimeout(r, 50 + retry * 20));
           continue;
         }
 
@@ -359,10 +357,8 @@ class StdioMcpAdapter {
           break;
         } catch (err) {
           if (err.statusCode === 403) {
-            try {
-              serverJson = JSON.parse(fs.readFileSync(this.serverJsonPath, "utf8"));
-            } catch (_e) {}
-            await new Promise((r) => setTimeout(r, 200));
+            serverJson = null;
+            await new Promise((r) => setTimeout(r, 25 + Math.floor(Math.random() * 50) + retry * 20));
             continue;
           }
           logStderr(`Failed to exchange controller session token: ${err.message}`);
@@ -640,7 +636,7 @@ class StdioMcpAdapter {
         }
 
         try {
-          if (!this.activeRunId && !targetRunId) {
+          if (!this.controllerToken) {
             await this.connectServer(true);
           }
           proxyRes = await this.httpRequest(
@@ -740,11 +736,20 @@ class StdioMcpAdapter {
                     instructions_version: proxyRes.instructions_version,
                     run_instructions: proxyRes.run_instructions,
                     status: proxyRes.status,
-                    action_seq: 0,
+                    action_seq: proxyRes.action_seq ?? observation.action_count ?? 0,
                     observation,
-                    game_won: false,
-                    ended: false,
-                    ...(proxyRes.max_actions ? { max_actions: proxyRes.max_actions, actions_remaining: proxyRes.max_actions } : {}),
+                    game_won: Boolean(proxyRes.game_won),
+                    ended: Boolean(proxyRes.ended),
+                    ...(proxyRes.outcome ? { outcome: proxyRes.outcome } : {}),
+                    ...(proxyRes.max_actions ? {
+                      max_actions: proxyRes.max_actions,
+                      actions_remaining: proxyRes.actions_remaining
+                    } : {}),
+                    ...(proxyRes.duration_ms ? {
+                      duration_ms: proxyRes.duration_ms,
+                      deadline_at: proxyRes.deadline_at,
+                      time_remaining_ms: proxyRes.time_remaining_ms
+                    } : {}),
                     message: "MazeBench session armed and ready"
                   })
                 }

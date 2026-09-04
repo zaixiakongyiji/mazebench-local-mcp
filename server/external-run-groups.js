@@ -34,10 +34,17 @@ class ExternalRunGroupStore {
       const groupDir = path.join(this.groupsDir, entry.name);
       const manifest = readJson(path.join(groupDir, "manifest.json"));
       if (!manifest || !this.validateManifest(manifest)) continue;
+      const candidateResult = readJson(path.join(groupDir, "result.json"));
+      const result = candidateResult
+        && this.validateResult(candidateResult)
+        && candidateResult.group_id === manifest.group_id
+        && candidateResult.mode === manifest.mode
+        ? candidateResult
+        : null;
       this.groups.set(manifest.group_id, {
         groupDir,
         manifest,
-        result: readJson(path.join(groupDir, "result.json"))
+        result
       });
     }
   }
@@ -106,6 +113,14 @@ class ExternalRunGroupStore {
   describe(groupId) {
     const record = this.get(groupId);
     if (!record) return null;
+    if (record.result) {
+      return {
+        ...record.manifest,
+        status: "completed",
+        entries: record.result.entries,
+        result: record.result
+      };
+    }
     const entries = record.manifest.entries.map((entry) => this.entryResult(entry));
     const allTerminal = entries.every((entry) => TERMINAL_STATUSES.has(entry.status));
     const anyStarted = entries.some((entry) => entry.status !== "armed");

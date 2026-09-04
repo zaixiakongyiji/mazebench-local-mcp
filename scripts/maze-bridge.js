@@ -510,7 +510,8 @@ function createSession(options) {
     hideNames: options.hideNames,
     hideNamesSeed: options.hideNamesSeed,
     pitch: options.pitch,
-    yaw: options.yaw
+    yaw: options.yaw,
+    worldBundle: options.worldBundle
   });
   const session = {
     actionCount: 0,

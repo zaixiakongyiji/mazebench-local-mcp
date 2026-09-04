@@ -290,6 +290,17 @@ async function runMcpTests() {
     assert.equal(sequencePayload.ended, false);
     assert.ok(sequencePayload.final_observation?.level);
 
+    const resumedStartRes = await client.sendRequest(123, "tools/call", {
+      name: "start",
+      arguments: {}
+    });
+    assert.equal(resumedStartRes.result?.isError, false);
+    const resumedStartPayload = JSON.parse(resumedStartRes.result.content[0].text);
+    assert.equal(resumedStartPayload.action_seq, externalPlay.getRun(startPayload.run_id).lastActionSeq);
+    assert.equal(resumedStartPayload.actions_remaining, 256 - resumedStartPayload.action_seq);
+    assert.equal(resumedStartPayload.game_won, false);
+    assert.equal(resumedStartPayload.ended, false);
+
     // 10. Cancel notification handling
     console.log("  [Test 10] notifications/cancelled handling");
     client.sendNotification("notifications/cancelled", { requestId: 13 });
@@ -342,6 +353,10 @@ async function runMcpTests() {
     const reconfigPayload = JSON.parse(reconfigStartRes.result.content[0].text);
     assert.equal(reconfigPayload.run_id, replacementRun.runId);
     assert.equal(reconfigPayload.status, "active");
+    assert.equal(reconfigPayload.duration_ms, 1800000);
+    assert.ok(reconfigPayload.deadline_at);
+    assert.ok(reconfigPayload.time_remaining_ms > 0);
+    assert.equal(reconfigPayload.max_actions, undefined);
 
     // 12. Explicit run_id argument support
     console.log("  [Test 12] Explicit run_id argument support for start");
@@ -400,6 +415,47 @@ async function runMcpTests() {
     assert.equal(terminalSequencePayload.stop_reason, "action_limit");
     assert.equal(terminalSequencePayload.ended, true);
     assert.equal(terminalSequencePayload.steps.at(-1)?.action_seq, 2);
+
+    // 15. 八个适配器并发初始化和认领时，start 必须复用 initialize 阶段的 controller token。
+    console.log("  [Test 15] Eight concurrent adapters initialize and claim distinct group runs");
+    const concurrentGroup = await externalPlay.createGroup({ mode: "concurrent", count: 8, maxActions: 1 });
+    const controllerTokenCountBefore = externalPlay.controllerTokens.size;
+    const concurrentChildren = Array.from({ length: 8 }, () => spawn(
+      process.execPath,
+      [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")],
+      {
+        env: { ...process.env, MAZEBENCH_DATA_HOME: testDataHome },
+        stdio: ["pipe", "pipe", "pipe"]
+      }
+    ));
+    try {
+      const concurrentClients = concurrentChildren.map((proc) => new TestJsonRpcClient(proc));
+      const initializeResponses = await Promise.all(concurrentClients.map((concurrentClient, index) => (
+        concurrentClient.sendRequest(200 + index, "initialize", {
+          protocolVersion: "2025-06-18",
+          clientInfo: { name: `concurrent-harness-${index + 1}`, version: "1.0.0" }
+        })
+      )));
+      assert.ok(initializeResponses.every((response) => response.result?.serverInfo?.name === "mazebench"));
+
+      const startResponses = await Promise.all(concurrentClients.map((concurrentClient, index) => (
+        concurrentClient.sendRequest(300 + index, "tools/call", {
+          name: "start",
+          arguments: { model_name: `concurrent-model-${index + 1}` }
+        })
+      )));
+      assert.ok(startResponses.every((response) => response.result?.isError === false));
+      const concurrentPayloads = startResponses.map((response) => JSON.parse(response.result.content[0].text));
+      assert.equal(new Set(concurrentPayloads.map((payload) => payload.run_id)).size, 8);
+      assert.ok(concurrentPayloads.every((payload) => payload.group_id === concurrentGroup.group_id));
+      assert.equal(
+        externalPlay.controllerTokens.size - controllerTokenCountBefore,
+        8,
+        "start must reuse the controller token exchanged during initialize"
+      );
+    } finally {
+      concurrentChildren.forEach((proc) => proc.kill("SIGTERM"));
+    }
 
     console.log("All maze-external-mcp stdio adapter tests PASSED!");
   } finally {

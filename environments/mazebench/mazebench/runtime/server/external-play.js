@@ -38,6 +38,29 @@ const PROJECTION_WAIT_TIMEOUT_MS = 500;
 const CONTROLLER_TOKEN_TTL_MS = 24 * 3600 * 1000; // 24 hours
 const VIEWER_TOKEN_TTL_MS = 2 * 3600 * 1000; // 2 hours
 
+function isPlayableWorldBundle(bundle) {
+  return Boolean(
+    bundle
+    && typeof bundle === "object"
+    && typeof bundle.defaultLevelId === "string"
+    && Array.isArray(bundle.levels)
+    && bundle.levels.length > 0
+    && bundle.levelStates
+    && typeof bundle.levelStates === "object"
+    && bundle.levelStates[bundle.defaultLevelId]
+    && bundle.levels.every((level) => (
+      level
+      && typeof level.id === "string"
+      && bundle.levelStates[level.id]
+      && typeof bundle.levelStates[level.id] === "object"
+    ))
+  );
+}
+
+function hasWorldBundlePayload(bundle) {
+  return Boolean(bundle?.defaultLevelId || bundle?.levels || bundle?.levelStates);
+}
+
 function resolveDataHome() {
   const custom = process.env.MAZEBENCH_DATA_HOME || process.env.MAZEBENCH_HOME;
   if (custom) {
@@ -362,6 +385,10 @@ class ExternalPlayService {
 
     // Freeze world bundle at armed time
     const rawBundle = options.frozenWorldBundle || (this.worldBundleProvider ? this.worldBundleProvider() : { worldRevision: "0".repeat(64) });
+    const playableWorldBundle = isPlayableWorldBundle(rawBundle) ? rawBundle : null;
+    if (hasWorldBundlePayload(rawBundle) && !playableWorldBundle) {
+      throw new Error("Frozen world bundle is incomplete or malformed");
+    }
     const worldBundleStr = JSON.stringify(rawBundle, null, 2);
     const worldDigest = rawBundle.worldRevision || crypto.createHash("sha256").update(worldBundleStr, "utf8").digest("hex");
     fs.writeFileSync(path.join(runDir, "world-bundle.json"), worldBundleStr, "utf8");
@@ -392,11 +419,12 @@ class ExternalPlayService {
     // Create base session to get base viewer state
     const baseBridgeSession = getBridge().createSession({
       gameId: "maze",
-      gameWonGemCount: 100,
-      levelId: "level_HxI",
+      gameWonGemCount: winThreshold,
+      levelId: playableWorldBundle?.defaultLevelId || "level_HxI",
       pitch: 1,
       yaw: 0,
-      observationMode: "text"
+      observationMode: "text",
+      worldBundle: playableWorldBundle
     });
 
     const baseViewerState = extractViewerState(baseBridgeSession, 0, worldDigest);
@@ -407,6 +435,7 @@ class ExternalPlayService {
 
     const runInstance = new RunInstance(this, runId, runDir, manifest, {
       worldBundleDigest: worldDigest,
+      worldBundle: playableWorldBundle,
       baseViewerStateDigest: baseViewerStateHash,
       baseViewerState,
       durationMs,
@@ -755,6 +784,7 @@ class RunInstance {
     this.harnessName = initialOpts.harnessName || null;
 
     this.worldBundleDigest = initialOpts.worldBundleDigest || null;
+    this.worldBundle = Object.hasOwn(initialOpts, "worldBundle") ? initialOpts.worldBundle : undefined;
     this.baseViewerStateDigest = initialOpts.baseViewerStateDigest || null;
     this.baseViewerState = initialOpts.baseViewerState || null;
 
@@ -807,6 +837,59 @@ class RunInstance {
       instructions_version: INSTRUCTIONS_VERSION,
       run_instructions: buildRunInstructions(this)
     };
+  }
+
+  _startProgressMetadata({ deadlineAt = this.deadlineAt, observation = null, status = this.status } = {}) {
+    const ended = TERMINAL_STATUSES.has(status);
+    const progress = {
+      action_seq: this.lastActionSeq,
+      game_won: status === "won" || Boolean(observation?.game_won),
+      ended,
+      ...(ended && this.outcome ? { outcome: this.outcome } : {})
+    };
+
+    if (this.maxActions) {
+      return {
+        ...progress,
+        max_actions: this.maxActions,
+        actions_remaining: Math.max(0, this.maxActions - this.lastActionSeq)
+      };
+    }
+
+    const deadlineMs = Date.parse(deadlineAt || "");
+    return {
+      ...progress,
+      duration_ms: this.durationMs,
+      ...(deadlineAt ? { deadline_at: deadlineAt } : {}),
+      time_remaining_ms: Number.isFinite(deadlineMs)
+        ? Math.max(0, deadlineMs - Date.now())
+        : this.durationMs
+    };
+  }
+
+  _loadWorldBundle() {
+    if (this.worldBundle !== undefined) return this.worldBundle;
+    const candidate = fs.existsSync(this.worldBundlePath)
+      ? JSON.parse(fs.readFileSync(this.worldBundlePath, "utf8"))
+      : null;
+    if (hasWorldBundlePayload(candidate) && !isPlayableWorldBundle(candidate)) {
+      throw new Error(`Frozen world bundle for run ${this.runId} is incomplete or malformed`);
+    }
+    this.worldBundle = isPlayableWorldBundle(candidate) ? candidate : null;
+    return this.worldBundle;
+  }
+
+  _createGameSession() {
+    const worldBundle = this._loadWorldBundle();
+    return getBridge().createSession({
+      gameId: "maze",
+      gameWonGemCount: this.winThreshold,
+      levelId: worldBundle?.defaultLevelId || "level_HxI",
+      pitch: 1,
+      yaw: 0,
+      observationMode: "text",
+      worldBundle
+    });
   }
 
   async appendJournalRecord(record) {
@@ -1215,14 +1298,7 @@ class RunInstance {
       } catch (_e) {}
     }
     if (!this.baseViewerState) {
-      const baseSession = getBridge().createSession({
-        gameId: "maze",
-        gameWonGemCount: this.winThreshold,
-        levelId: "level_HxI",
-        pitch: 1,
-        yaw: 0,
-        observationMode: "text"
-      });
+      const baseSession = this._createGameSession();
       this.baseViewerState = extractViewerState(baseSession, 0, this.worldBundleDigest);
       this.baseViewerStateDigest = computeViewerStateHash(this.baseViewerState);
       fs.writeFileSync(this.baseViewerStatePath, JSON.stringify(this.baseViewerState, null, 2), "utf8");
@@ -1233,14 +1309,7 @@ class RunInstance {
   }
 
   _reconstructGameSession() {
-    this.gameSession = getBridge().createSession({
-      gameId: "maze",
-      gameWonGemCount: this.winThreshold,
-      levelId: "level_HxI",
-      pitch: 1,
-      yaw: 0,
-      observationMode: "text"
-    });
+    this.gameSession = this._createGameSession();
 
     if (!fs.existsSync(this.journalPath)) return;
     const content = fs.readFileSync(this.journalPath, "utf8");
@@ -1334,7 +1403,7 @@ class RunInstance {
           lease_epoch: cached.lease_epoch,
           lease_expires_at: cached.lease_expires_at,
           started_at: this.startedAt,
-          ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
+          ...this._startProgressMetadata({ observation: currentObs }),
           ...this._startResponseMetadata(),
           observation: cached.observation || currentObs,
           sanitized_result: cached.initial_sanitized_result || cached.sanitized_result
@@ -1357,18 +1426,9 @@ class RunInstance {
               text: JSON.stringify({
                 run_id: this.runId,
                 status: "active",
-                action_seq: 0,
                 ...this._startResponseMetadata({ modelName: requestedModelName, harnessName: declaredCli }),
+                ...this._startProgressMetadata({ deadlineAt, observation: initialObs, status: "active" }),
                 observation: initialObs,
-                game_won: false,
-                ended: false,
-                ...(this.maxActions
-                  ? { max_actions: this.maxActions, actions_remaining: this.maxActions }
-                  : (deadlineAt ? {
-                      duration_ms: this.durationMs,
-                      deadline_at: deadlineAt,
-                      time_remaining_ms: Math.max(0, Date.parse(deadlineAt) - Date.now())
-                    } : {}))
               })
             }
           ],
@@ -1402,7 +1462,7 @@ class RunInstance {
           lease_epoch: 1,
           lease_expires_at: expiresAt,
           started_at: startedAt,
-          ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: deadlineAt }),
+          ...this._startProgressMetadata({ deadlineAt, observation: initialObs, status: "active" }),
           ...this._startResponseMetadata(),
           observation: initialObs,
           sanitized_result: sanitizedResult
@@ -1424,7 +1484,7 @@ class RunInstance {
             lease_epoch: this.currentLease.leaseEpoch,
             lease_expires_at: new Date(this.currentLease.expiresAt).toISOString(),
             started_at: this.startedAt,
-            ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
+            ...this._startProgressMetadata({ observation: currentObs, status: "active" }),
             ...this._startResponseMetadata(),
             observation: currentObs
           };
@@ -1491,7 +1551,7 @@ class RunInstance {
           lease_epoch: nextEpoch,
           lease_expires_at: expiresAt,
           started_at: this.startedAt,
-          ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: this.deadlineAt }),
+          ...this._startProgressMetadata({ observation: currentObs, status: "active" }),
           ...this._startResponseMetadata(),
           observation: currentObs
         };

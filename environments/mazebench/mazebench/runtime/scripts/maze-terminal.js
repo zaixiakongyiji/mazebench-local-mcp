@@ -420,7 +420,55 @@ function loadMazeSolver() {
   return global.window.MazeSolver;
 }
 
+function resolveBundledPlayData(options) {
+  const bundle = options.worldBundle;
+  if (!bundle) return null;
+
+  const levels = Array.isArray(bundle.levels) ? bundle.levels : [];
+  const levelId = options.levelId || bundle.defaultLevelId;
+  const level = levels.find((candidate) => candidate?.id === levelId);
+  const playData = bundle.levelStates?.[levelId];
+
+  if (!level) {
+    throw new Error(`Unknown bundled level: ${levelId}`);
+  }
+  if (!playData || typeof playData !== "object") {
+    throw new Error(`Missing bundled level state: ${levelId}`);
+  }
+
+  return {
+    game: {
+      id: bundle.game?.id || options.gameId,
+      name: bundle.game?.name || bundle.game?.id || options.gameId,
+      levels
+    },
+    level,
+    playData
+  };
+}
+
+function resolveLevelState(game, level, options) {
+  if (options.worldBundle) {
+    const state = options.worldBundle.levelStates?.[level?.id];
+    if (!state || typeof state !== "object") {
+      throw new Error(`Missing bundled level state: ${level?.id || "unknown"}`);
+    }
+    return state;
+  }
+  return getLevelState(game, level);
+}
+
+function resolveLevel(game, levelId, options) {
+  if (options.worldBundle) {
+    return (game.levels || []).find((candidate) => candidate?.id === levelId) || null;
+  }
+  return getLevel(game, levelId);
+}
+
 function resolvePlayData(options) {
+  const bundled = resolveBundledPlayData(options);
+  if (bundled) return bundled;
+
   const game = getGame(options.gameId);
 
   if (!game) {
@@ -598,7 +646,7 @@ function createTerminalContext(mazeEngine, options) {
       try {
         return mergeDynamicIdentitySets(
           identities,
-          dynamicIdentitySetsForPlayData(getLevelState(game, candidateLevel))
+          dynamicIdentitySetsForPlayData(resolveLevelState(game, candidateLevel, normalizedOptions))
         );
       } catch (_error) {
         return identities;
@@ -615,7 +663,7 @@ function createTerminalContext(mazeEngine, options) {
   const worldJsonNames = new Set(JSON_OBJECT_NAME_UNIVERSE);
   (game.levels || []).forEach((candidateLevel) => {
     try {
-      semanticNamesForPlayData(getLevelState(game, candidateLevel)).forEach((name) => {
+      semanticNamesForPlayData(resolveLevelState(game, candidateLevel, normalizedOptions)).forEach((name) => {
         worldJsonNames.add(name);
       });
     } catch (_error) {
@@ -3415,13 +3463,13 @@ function edgeTransitionForMove(context, dx, dy) {
     return null;
   }
 
-  const nextLevel = getLevel(context.game, nextLevelId);
+  const nextLevel = resolveLevel(context.game, nextLevelId, context.options);
 
   if (!nextLevel) {
     return false;
   }
 
-  const nextPlayData = getLevelState(context.game, nextLevel);
+  const nextPlayData = resolveLevelState(context.game, nextLevel, context.options);
   const nextRoom = buildRuntimeRoom(context.mazeEngine, nextPlayData);
   const targetX = dx < 0
     ? nextRoom.playData.width - 1
@@ -3760,10 +3808,10 @@ async function buildModelJsonPayload(context) {
   return payload;
 }
 
-function countTotalGems(game) {
-  return (game?.levels || []).reduce((total, level) => {
+function countTotalGems(context) {
+  return (context.game?.levels || []).reduce((total, level) => {
     try {
-      const state = getLevelState(game, level);
+      const state = resolveLevelState(context.game, level, context.options);
       return total + (state.actors || []).filter((actor) => actor.type === "gem").length;
     } catch (_error) {
       return total;
@@ -3780,7 +3828,7 @@ function buildScorecard(context, nowMs = Date.now()) {
   normalizeCollectedGemIds(stats.collectedGemIds);
   const player = activePlayerEntry(context);
   const durationMs = nowMs - stats.startedAtMs;
-  const totalGems = countTotalGems(context.game);
+  const totalGems = countTotalGems(context);
   const totalRooms = totalRoomCount(context.game);
   const collectedGemCount = stats.collectedGemIds.size;
   const gameWonGemCount = normalizeGameWonGemCount(context.options?.gameWonGemCount);
