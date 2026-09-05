@@ -245,6 +245,7 @@
 
     const nameStrong = document.createElement("strong");
     nameStrong.textContent = entry.model_name || entry.model || "Unknown";
+    nameStrong.title = nameStrong.textContent;
     nameStrong.style.color = color;
 
     const configSmall = document.createElement("small");
@@ -253,7 +254,7 @@
     if (entry.is_time_limited && entry.duration_ms) {
       const mins = Math.round(Number(entry.duration_ms) / 60000);
       metaParts.push(mins >= 1 ? `⏱️ ${mins}m` : `⏱️ ${Math.round(Number(entry.duration_ms) / 1000)}s`);
-    } else if (entry.max_actions) {
+    } else if (entry.max_actions && state.scope !== "standard" && entry.max_actions !== 256) {
       metaParts.push(`🎯 ${entry.max_actions}`);
     }
     if (entry.elapsed_seconds) {

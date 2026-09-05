@@ -6809,7 +6809,7 @@ button.run-tools__file:focus-visible {
 }
 
 .ai-page .page-shell {
-  --page-max: min(95vw, 1680px);
+  --page-max: min(96vw, 1800px);
   max-width: var(--page-max);
   padding: clamp(16px, 2.5vw, 32px) clamp(12px, 2vw, 28px) 64px;
 }
@@ -6970,7 +6970,7 @@ button.run-tools__file:focus-visible {
 }
 
 .leaderboard-bars {
-  --bar-label-width: clamp(180px, 24vw, 260px);
+  --bar-label-width: clamp(260px, 34vw, 480px);
   background: transparent;
   display: grid;
   gap: 4px;

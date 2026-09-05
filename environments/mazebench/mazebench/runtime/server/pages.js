@@ -1473,12 +1473,12 @@ function createPageRenderer({
               <p class="muted" style="margin: 0;">${activeGroup.entries.filter((entry) => Boolean(entry.model_name || entry.started_at)).length} / ${activeGroup.entries.length} models claimed</p>
             </div>
             <a class="button button--primary" href="/external-play/groups/${encodeURIComponent(activeGroup.group_id)}">Open Run Group</a>
-          </div>
+            </div>
         </section>`
       : "";
     const groupHistoryHtml = groups.length
       ? `<section class="panel" style="margin-top: 24px;">
-          <h2>Run Group History</h2>
+          <h2 data-i18n="ext_history_title">Run Group History</h2>
           <div class="external-group-list">
             ${groups.map((group) => `<a class="external-group-list__item" href="/external-play/groups/${encodeURIComponent(group.group_id)}">
               <span><strong>${escapeHtml(group.mode === "competition" ? "Competition" : "Concurrent")}</strong><small>${escapeHtml(group.group_id)}</small></span>
@@ -1493,7 +1493,7 @@ function createPageRenderer({
       bodyClass: "external-play-landing-page",
       extraHeadHtml: '<link rel="stylesheet" href="/external-play.css">',
       main: `<div class="page-head">
-          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;"><span class="badge">EXTERNAL · LOCAL MCP</span></div>
+          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;"><span class="badge" data-i18n="ext_badge_local">EXTERNAL · LOCAL MCP</span></div>
           <h1 data-i18n="ext_landing_title">External Play — Local MCP</h1>
           <p class="card-by" style="font-size: 1rem; color: #94a3b8; max-width: 720px;" data-i18n="ext_landing_subtitle">
             Control the authoritative MazeBench game session locally via stdio MCP (Codex, Claude Desktop, etc.) and spectate the full 3D game in real time.
@@ -1530,15 +1530,27 @@ args = ["mcp"]</code></pre>
           <h2 data-i18n="create_session_title">Create New Session</h2>
           <form id="create-external-run-form" style="display: flex; flex-direction: column; gap: 14px; max-width: 480px; margin-top: 12px;">
             <div class="field">
-              <span>Session Type</span>
+              <span data-i18n="session_type_label">Session Type</span>
               <div class="external-session-type" role="radiogroup" aria-label="Session type">
-                <label><input type="radio" name="ext-session-type" value="single" checked> Single</label>
-                <label><input type="radio" name="ext-session-type" value="concurrent"> Concurrent</label>
-                <label><input type="radio" name="ext-session-type" value="competition"> Competition</label>
+                <label class="session-type-option is-selected">
+                  <input type="radio" name="ext-session-type" value="single" checked style="display: none;">
+                  <span class="session-type-icon">🎯</span>
+                  <span data-i18n="session_type_single">Single</span>
+                </label>
+                <label class="session-type-option">
+                  <input type="radio" name="ext-session-type" value="concurrent" style="display: none;">
+                  <span class="session-type-icon">⚡</span>
+                  <span data-i18n="session_type_concurrent">Concurrent</span>
+                </label>
+                <label class="session-type-option">
+                  <input type="radio" name="ext-session-type" value="competition" style="display: none;">
+                  <span class="session-type-icon">🏆</span>
+                  <span data-i18n="session_type_competition">Competition</span>
+                </label>
               </div>
             </div>
             <label class="field" id="field-group-count" hidden>
-              <span>Model Slots</span>
+              <span data-i18n="model_slots_label">Model Slots</span>
               <input type="number" id="ext-group-count" min="2" max="8" value="2">
             </label>
             <div class="field">
@@ -1587,23 +1599,23 @@ args = ["mcp"]</code></pre>
       extraHeadHtml: '<link rel="stylesheet" href="/external-play.css">',
       main: `<div class="page-head external-group-head">
           <div>
-            <span class="badge">${escapeHtml(group.mode === "competition" ? "COMPETITION" : "CONCURRENT")}</span>
-            <h1>External Run Group</h1>
+            <span class="badge" data-i18n="ext_badge_mode">${escapeHtml(group.mode === "competition" ? "COMPETITION" : "CONCURRENT")}</span>
+            <h1 data-i18n="ext_group_page_title">External Run Group</h1>
             <p class="muted"><code>${escapeHtml(group.group_id)}</code> · <span id="external-group-status">${escapeHtml(group.status)}</span></p>
           </div>
-          <button id="cancel-external-group" class="button--danger" type="button">Cancel unfinished runs</button>
+          <button id="cancel-external-group" class="button--danger" type="button" data-i18n="ext_cancel_group_btn">Cancel unfinished runs</button>
         </div>
         <section class="panel external-group-bootstrap">
-          <h2>Model bootstrap prompt</h2>
+          <h2 data-i18n="ext_bootstrap_title">Model bootstrap prompt</h2>
           <pre><code>调用 MazeBench 的 start 工具，填写指定的 model_name，然后严格按照返回的 run_instructions 继续游戏。</code></pre>
-          <p class="muted">Open one model client per slot. Each first start call claims exactly one available run.</p>
+          <p class="muted" data-i18n="ext_bootstrap_desc">Open one model client per slot. Each first start call claims exactly one available run.</p>
         </section>
         <section class="external-group-results" aria-labelledby="external-group-results-title">
-          <div class="section-heading"><h2 id="external-group-results-title">Runs</h2><span id="external-group-claim-count"></span></div>
+          <div class="section-heading"><h2 id="external-group-results-title" data-i18n="ext_runs_title">Runs</h2><span id="external-group-claim-count"></span></div>
           <div id="external-group-entries" class="external-group-entry-grid"></div>
         </section>
         <section id="external-group-ranking-section" class="external-group-ranking" ${group.mode === "competition" ? "" : "hidden"}>
-          <div class="section-heading"><h2>Competition ranking</h2></div>
+          <div class="section-heading"><h2 data-i18n="ext_ranking_title">Competition ranking</h2></div>
           <div id="external-group-ranking"></div>
         </section>
         <script>window.__EXTERNAL_PLAY_GROUP__ = ${serializeForScript(group)};</script>

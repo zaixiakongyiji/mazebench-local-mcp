@@ -59,14 +59,48 @@
     let currentMode = "actions";
     let currentSessionType = "single";
 
+    function isZh() {
+      if (window.MazeBenchI18n && typeof window.MazeBenchI18n.getLanguage === "function") {
+        return window.MazeBenchI18n.getLanguage() === "zh";
+      }
+      try {
+        return localStorage.getItem("mazebench_lang") === "zh";
+      } catch (_) {
+        return true;
+      }
+    }
+
+    function updateSessionTypeButtons(type) {
+      sessionTypeInputs.forEach((input) => {
+        const parentLabel = input.closest("label");
+        if (!parentLabel) return;
+        if (input.value === type) {
+          parentLabel.classList.add("is-selected");
+        } else {
+          parentLabel.classList.remove("is-selected");
+        }
+      });
+    }
+
+    function getSubmitButtonText(type) {
+      if (isZh()) {
+        if (type === "single") return "创建并启动会话";
+        if (type === "competition") return "创建同台竞技赛";
+        return "创建多模型并发组";
+      } else {
+        if (type === "single") return "Create Armed Session";
+        if (type === "competition") return "Create Competition";
+        return "Create Concurrent Group";
+      }
+    }
+
     function setSessionType(type) {
       currentSessionType = type;
+      updateSessionTypeButtons(type);
       if (groupCountField) groupCountField.hidden = type === "single";
       if (groupCountInput) groupCountInput.required = type !== "single";
       if (submitBtn) {
-        submitBtn.textContent = type === "single"
-          ? "Create Armed Session"
-          : (type === "competition" ? "Create Competition" : "Create Concurrent Group");
+        submitBtn.textContent = getSubmitButtonText(type);
       }
     }
 
@@ -136,7 +170,7 @@
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       submitBtn.disabled = true;
-      statusText.textContent = "Creating armed session...";
+      statusText.textContent = isZh() ? "正在创建会话并启动..." : "Creating armed session...";
 
       try {
         const payload = {};
@@ -167,12 +201,12 @@
         }
 
         const data = await res.json();
-        statusText.textContent = "Created. Redirecting...";
+        statusText.textContent = isZh() ? "创建成功，正在跳转..." : "Created. Redirecting...";
         window.location.assign(currentSessionType === "single"
           ? `/external-play/${encodeURIComponent(data.run_id)}`
           : `/external-play/groups/${encodeURIComponent(data.group_id)}`);
       } catch (err) {
-        statusText.textContent = `Error: ${err.message}`;
+        statusText.textContent = (isZh() ? "创建失败: " : "Error: ") + err.message;
         submitBtn.disabled = false;
       }
     });
@@ -181,6 +215,17 @@
   function initGroupPage() {
     let group = window.__EXTERNAL_PLAY_GROUP__;
     if (!group) return;
+
+    function isZh() {
+      if (window.MazeBenchI18n && typeof window.MazeBenchI18n.getLanguage === "function") {
+        return window.MazeBenchI18n.getLanguage() === "zh";
+      }
+      try {
+        return localStorage.getItem("mazebench_lang") === "zh";
+      } catch (_) {
+        return true;
+      }
+    }
 
     const status = document.getElementById("external-group-status");
     const claimCount = document.getElementById("external-group-claim-count");
@@ -191,20 +236,26 @@
     let pollTimer = null;
 
     function renderEntry(entry) {
-      const model = entry.model_name || "Waiting for model";
-      const stats = `${entry.rooms_visited || 0} rooms · ${entry.gems_collected || 0} gems · ${entry.actions_total || 0} actions`;
+      const model = entry.model_name || (isZh() ? "等待模型连接" : "Waiting for model");
+      const stats = isZh()
+        ? `${entry.rooms_visited || 0} 房间 · ${entry.gems_collected || 0} 宝石 · ${entry.actions_total || 0} 步`
+        : `${entry.rooms_visited || 0} rooms · ${entry.gems_collected || 0} gems · ${entry.actions_total || 0} actions`;
+      const harnessText = entry.harness || (isZh() ? "MCP 客户端未连接" : "MCP client not connected");
+      const replayText = isZh() ? "观战 / 回放" : "Watch / replay";
       return `<article class="external-group-entry">
         <div class="external-group-entry__head"><strong>${escapeHtml(model)}</strong><span class="status-pill status-pill--${escapeHtml(entry.status)}">${escapeHtml(entry.status)}</span></div>
-        <p>${escapeHtml(entry.harness || "MCP client not connected")}</p>
+        <p>${escapeHtml(harnessText)}</p>
         <p>${escapeHtml(stats)}</p>
-        <a class="text-link" href="${escapeHtml(entry.replay_url)}">Watch / replay</a>
+        <a class="text-link" href="${escapeHtml(entry.replay_url)}">${escapeHtml(replayText)}</a>
       </article>`;
     }
 
     function renderRanking(ranking) {
       if (!rankingRoot || !rankingSection) return;
       if (!Array.isArray(ranking)) {
-        rankingRoot.innerHTML = '<p class="muted">Ranking is finalized after every run ends.</p>';
+        rankingRoot.innerHTML = isZh()
+          ? '<p class="muted">所有运行结束后将生成最终排名。</p>'
+          : '<p class="muted">Ranking is finalized after every run ends.</p>';
         return;
       }
       rankingSection.hidden = false;
@@ -212,16 +263,20 @@
         <div class="external-ranking-row">
           <strong>#${entry.rank}</strong>
           <span>${escapeHtml(entry.model_name || entry.entry_id)}</span>
-          <span>${entry.rooms_visited} rooms</span>
-          <span>${entry.gems_collected} gems</span>
-          <span>${entry.actions_total} actions</span>
+          <span>${entry.rooms_visited} ${isZh() ? "房间" : "rooms"}</span>
+          <span>${entry.gems_collected} ${isZh() ? "宝石" : "gems"}</span>
+          <span>${entry.actions_total} ${isZh() ? "步" : "actions"}</span>
         </div>`).join("")}</div>`;
     }
 
     function render() {
       const claimed = group.entries.filter((entry) => Boolean(entry.model_name || entry.started_at)).length;
       if (status) status.textContent = group.status;
-      if (claimCount) claimCount.textContent = `${claimed} / ${group.entries.length} models claimed`;
+      if (claimCount) {
+        claimCount.textContent = isZh()
+          ? `${claimed} / ${group.entries.length} 个模型已认领`
+          : `${claimed} / ${group.entries.length} models claimed`;
+      }
       if (entriesRoot) entriesRoot.innerHTML = group.entries.map(renderEntry).join("");
       if (group.mode === "competition") renderRanking(group.result?.ranking || null);
       if (cancelButton) cancelButton.hidden = group.status === "completed";
