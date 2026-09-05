@@ -1625,19 +1625,25 @@ args = ["mcp"]</code></pre>
 
   function renderExternalPlayRunPage(run) {
     const game = getGame("maze");
-    const defaultLevelId = defaultLevelIdForGame(game) || "level_HxI";
+    const worldBundle = run._loadWorldBundle ? run._loadWorldBundle() : null;
+    const defaultLevelId = worldBundle?.defaultLevelId || defaultLevelIdForGame(game) || "level_HxI";
     const level = getLevel ? getLevel(game, defaultLevelId) : { id: defaultLevelId, fileName: `${defaultLevelId}.json` };
-    const levelState = getLevelState(game, level);
+    const levelState = (worldBundle?.levelStates && worldBundle.levelStates[defaultLevelId])
+      ? worldBundle.levelStates[defaultLevelId]
+      : getLevelState(game, level);
     const authorData = game.worldMap ? buildAuthorPageData(game, level) : null;
+    const existingLevels = (worldBundle && Array.isArray(worldBundle.levels) && worldBundle.levels.length > 0)
+      ? worldBundle.levels
+      : authorData?.existingLevels;
     const playWorldData = authorData
       ? {
           blockAdder: authorData.blockAdder,
           defaultFloorToken: authorData.defaultFloorToken,
-          existingLevels: authorData.existingLevels,
+          existingLevels,
           game: authorData.game,
           palette: authorData.palette,
           toolboxCatalog: authorData.toolboxCatalog,
-          playApiBaseUrl: `/api/play/${encodeURIComponent(game.id)}`,
+          playApiBaseUrl: `/api/external-play/runs/${encodeURIComponent(run.runId)}/maze`,
           worldColumns: authorData.worldColumns,
           worldRows: authorData.worldRows
         }

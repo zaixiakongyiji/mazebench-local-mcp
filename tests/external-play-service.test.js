@@ -638,6 +638,123 @@ async function runTests() {
       frozenRestart.shutdown();
     }
 
+    console.log("  [Test 20] Quarantine recovery cleans up timers without unhandled ENOENT");
+    const test20DataHome = fs.mkdtempSync(path.join(os.tmpdir(), "mazebench-test20-"));
+    const test20InitService = new ExternalPlayService({ dataHome: test20DataHome, port: 3021, defaultMaxActions: null });
+    await test20InitService.initialize();
+    const test20Run = await test20InitService.createRun({ durationMs: 60000 });
+    const test20Controller = await test20InitService.handleControllerSession(test20InitService.mcpBootstrapNonce, { name: "test20-ctrl" });
+    const test20ControllerInfo = test20InitService.validateControllerToken(`Bearer ${test20Controller.controller_token}`);
+    await test20Run.startOrAttach(test20ControllerInfo, "test20-start", null, { modelName: "test20-model" });
+    test20InitService.shutdown();
+
+    // Adjust journal seq 2 deadline_at to past (remaining <= 0) and append a corrupt line (seq 3)
+    const test20JournalPath = path.join(test20DataHome, "external-runs", test20Run.runId, "journal.jsonl");
+    const test20JournalLines = fs.readFileSync(test20JournalPath, "utf8").trim().split("\n");
+    const test20StartedRecord = JSON.parse(test20JournalLines[1]);
+    test20StartedRecord.deadline_at = new Date(Date.now() - 5000).toISOString();
+    test20JournalLines[1] = JSON.stringify(test20StartedRecord);
+    test20JournalLines.push("MALFORMED_JSON_LINE");
+    fs.writeFileSync(test20JournalPath, test20JournalLines.join("\n") + "\n", "utf8");
+
+    const test20Service = new ExternalPlayService({ dataHome: test20DataHome, port: 3021 });
+    await test20Service.initialize();
+    try {
+      assert.equal(test20Service.serviceState, "READY");
+      assert.equal(test20Service.getRun(test20Run.runId), null);
+      assert.ok(fs.existsSync(path.join(test20DataHome, "external-quarantine", test20Run.runId)));
+      // Wait past zero-delay deadline timeout to confirm no unhandled ENOENT crash happens
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(test20Service.serviceState, "READY");
+    } finally {
+      test20Service.shutdown();
+      fs.rmSync(test20DataHome, { recursive: true, force: true });
+    }
+
+    console.log("  [Test 21] Clear active run failure does not corrupt child run summary");
+    const test21Run = await service.createRun({ maxActions: 1 });
+    const test21Controller = { controllerId: "ctrl-test21", declaredCli: "test21-harness" };
+    const test21Start = await test21Run.startOrAttach(test21Controller, "test21-start", null, { modelName: "test21-model" });
+
+    // Mock _clearActiveRun to throw an error simulating result.json storage failure
+    const originalClear = service._clearActiveRun.bind(service);
+    service._clearActiveRun = () => {
+      throw new Error("Synthetic _clearActiveRun failure from groupStore");
+    };
+
+    try {
+      await test21Run.executeAction(
+        test21Controller,
+        test21Start.lease_id,
+        test21Start.lease_epoch,
+        "rotate_camera_left",
+        {},
+        "test21-action"
+      );
+      const deadline = Date.now() + 3000;
+      while (!["action_limit", "failed"].includes(test21Run.status)) {
+        if (Date.now() > deadline) throw new Error("Test 21 timeout waiting for action_limit");
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(test21Run.status, "action_limit");
+      const summaryContent = JSON.parse(fs.readFileSync(test21Run.summaryPath, "utf8"));
+      assert.equal(summaryContent.outcome, "action_limit");
+      assert.equal(summaryContent.is_partial, false);
+      assert.equal(summaryContent.actions_total, 1);
+    } finally {
+      service._clearActiveRun = originalClear;
+    }
+
+    console.log("  [Test 22] Spectator page and API serve frozen level state");
+    const { createPageRenderer } = require("../server/pages");
+    const { createRequestRouter } = require("../server/router");
+
+    const bundle22 = JSON.parse(JSON.stringify(buildGameWorldBundle("maze")));
+    const defaultLevelId22 = bundle22.defaultLevelId;
+    bundle22.levelStates[defaultLevelId22].levelLabel = "FROZEN_LEVEL_MARKER_TEST";
+
+    const pageRenderer = createPageRenderer({
+      capabilities: { external_play: true, local_mcp: true },
+      getGame: () => ({ id: "maze", name: "Maze", worldMap: { levels: [{ id: defaultLevelId22 }] } }),
+      getLevel: () => ({ id: defaultLevelId22, fileName: `${defaultLevelId22}.json` }),
+      getLevelState: () => ({ width: 10, height: 10, levelLabel: "LIVE_LEAK_MARKER" }),
+      buildAuthorPageData: () => ({ blockAdder: {}, defaultFloorToken: "F", existingLevels: [], game: { id: "maze" }, palette: [], toolboxCatalog: [] }),
+      worldMaps: { defaultLevelIdForGame: () => defaultLevelId22 }
+    });
+
+    const frozenRunSample = await service.createRun({ maxActions: 1, frozenWorldBundle: bundle22 });
+    const spectatorHtml = pageRenderer.renderExternalPlayRunPage(frozenRunSample);
+    assert.ok(spectatorHtml.includes("/api/external-play/runs/" + encodeURIComponent(frozenRunSample.runId) + "/maze"));
+    assert.ok(spectatorHtml.includes("FROZEN_LEVEL_MARKER_TEST"), "spectator page must use frozen level state");
+    assert.ok(!spectatorHtml.includes("LIVE_LEAK_MARKER"), "spectator page must not use live getLevelState");
+
+    let apiStatus = null;
+    let apiJson = null;
+    const mockReq = {
+      method: "GET",
+      url: `/api/external-play/runs/${encodeURIComponent(frozenRunSample.runId)}/maze/${encodeURIComponent(defaultLevelId22)}`,
+      headers: { host: "127.0.0.1:3000", "sec-fetch-site": "same-origin" },
+      socket: { remoteAddress: "127.0.0.1" }
+    };
+    const mockRes = {
+      writeHead(status) { apiStatus = status; },
+      end(body) { if (body) apiJson = JSON.parse(body); }
+    };
+    const { handleRequest } = createRequestRouter({
+      externalPlay: service,
+      publicFileRoutes: new Map(),
+      sendJson: (res, status, payload) => {
+        res.writeHead(status);
+        res.end(JSON.stringify(payload));
+      },
+      getLevelState: () => ({ width: 10, height: 10, levelLabel: "LIVE_LEAK_MARKER" }),
+      getLevel: () => ({ id: defaultLevelId22 }),
+      getGame: () => ({ id: "maze" })
+    });
+    await handleRequest(mockReq, mockRes);
+    assert.equal(apiStatus, 200);
+    assert.equal(apiJson.levelLabel, "FROZEN_LEVEL_MARKER_TEST");
+
     console.log("All ExternalPlayService unit & integration tests PASSED!");
   } finally {
     fs.rmSync(testDataHome, { recursive: true, force: true });

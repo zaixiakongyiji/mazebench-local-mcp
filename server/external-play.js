@@ -214,9 +214,7 @@ class ExternalPlayService {
     // 3. Initialize viewer signing key
     this._loadOrGenerateViewerKey();
 
-    // 4. Scan & Recover existing runs
-    await this._recoverRuns();
-
+    // 4. Initialize group store before recovering runs so isolated runs can mark seat failure
     this.groupStore = new ExternalRunGroupStore({
       groupsDir: this.groupsDir,
       getRun: (runId) => this.getRun(runId),
@@ -225,7 +223,10 @@ class ExternalPlayService {
     });
     this.groupStore.initialize();
 
-    // 5. Recover every independent run and rebuild the claim queue.
+    // 5. Scan & Recover existing runs
+    await this._recoverRuns();
+
+    // 6. Recover every independent run and rebuild the claim queue.
     await this._recoverActiveRuns();
     this._refreshClaimState();
 
@@ -318,15 +319,20 @@ class ExternalPlayService {
 
       if (!fs.existsSync(manifestPath) || !fs.existsSync(journalPath)) continue;
 
+      let runInstance = null;
       try {
         const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-        const runInstance = new RunInstance(this, runId, runDir, manifest);
+        runInstance = new RunInstance(this, runId, runDir, manifest);
         await runInstance.replayJournal();
         this.runs.set(runId, runInstance);
       } catch (err) {
+        if (runInstance) {
+          runInstance.cleanup();
+        }
         console.error(`Failed to recover run ${runId}, isolating:`, err);
         const qTarget = path.join(this.quarantineDir, runId);
         fs.renameSync(runDir, qTarget);
+        this.groupStore.markEntryFailed(runId, { outcome: "failed", status: "failed" });
       }
     }
   }
@@ -597,6 +603,7 @@ class ExternalPlayService {
       }
 
       const run = await this._createArmedRunInternal({
+        frozenWorldBundle: options.frozenWorldBundle,
         durationMs: normalized.durationMs,
         maxActions: normalized.maxActions,
         winThreshold: normalized.winThreshold
@@ -687,9 +694,17 @@ class ExternalPlayService {
     if (!group) throw { status: 404, code: "NOT_FOUND", message: `Run group not found: ${groupId}` };
     await Promise.all(group.entries.map(async (entry) => {
       const run = this.getRun(entry.run_id);
-      if (run && !TERMINAL_STATUSES.has(run.status)) await run.cancelRun();
+      if (run && !TERMINAL_STATUSES.has(run.status)) {
+        await run.cancelRun();
+      } else if (!run) {
+        const failure = this.groupStore.getSeatFailure(entry.run_id);
+        if (!failure || !TERMINAL_STATUSES.has(failure.status)) {
+          this.groupStore.markEntryFailed(entry.run_id, { outcome: "cancelled", status: "cancelled" });
+        }
+      }
     }));
     this._refreshClaimState();
+    this.groupStore.maybeFinalize(groupId);
     return this.getGroup(groupId);
   }
 
@@ -749,6 +764,7 @@ class ExternalPlayService {
     for (const [, run] of this.runs.entries()) {
       run.cleanup();
     }
+    this.groupStore.cleanup();
     this.controllerRunBindings.clear();
     this._releaseServerLock();
     this._clearServerJson();
@@ -817,6 +833,7 @@ class RunInstance {
 
     this.leaseTimer = null;
     this.deadlineTimer = null;
+    this.disposed = false;
 
     this.operationIndex = new Map(); // operation_id -> final record / response
   }
@@ -1176,16 +1193,13 @@ class RunInstance {
     if (!this.deadlineAt) return;
     const remaining = Date.parse(this.deadlineAt) - Date.now();
     this.deadlineMonotonicMs = Number(process.hrtime.bigint() / 1000000n) + Math.max(0, remaining);
-    if (remaining <= 0) {
-      setTimeout(() => this._handleDeadlineTimeout(), 0);
-    } else {
-      this.deadlineTimer = setTimeout(() => this._handleDeadlineTimeout(), remaining);
-    }
+    const delay = Math.max(0, remaining);
+    this.deadlineTimer = setTimeout(() => this._handleDeadlineTimeout(), delay);
   }
 
   async _handleLeaseTimeout() {
     await this.sessionMutex.withLock(async () => {
-      if (this.status !== "active" || !this.currentLease) return;
+      if (this.disposed || this.status !== "active" || !this.currentLease) return;
       if (Date.now() >= this.currentLease.expiresAt) {
         const revokeRecord = {
           journal_seq: this.lastJournalSeq + 1,
@@ -1211,7 +1225,7 @@ class RunInstance {
 
   async _handleDeadlineTimeout() {
     await this.sessionMutex.withLock(async () => {
-      if (this.status !== "active") return;
+      if (this.disposed || this.status !== "active") return;
       if (Date.now() >= Date.parse(this.deadlineAt)) {
         await this._startFinalize("timed_out", "Session reached wall-clock time limit");
       } else {
@@ -1223,89 +1237,94 @@ class RunInstance {
   }
 
   async replayJournal() {
-    if (!fs.existsSync(this.journalPath)) return;
-    const content = fs.readFileSync(this.journalPath, "utf8");
-    const lines = content.split("\n").filter((l) => l.trim().length > 0);
+    try {
+      if (!fs.existsSync(this.journalPath)) return;
+      const content = fs.readFileSync(this.journalPath, "utf8");
+      const lines = content.split("\n").filter((l) => l.trim().length > 0);
 
-    const actionRecords = [];
-    let expectedSeq = 1;
-    for (const line of lines) {
-      const record = JSON.parse(line);
-      if (!validateJournalRecord(record)) {
-        throw new Error(`Corrupt journal record at seq ${expectedSeq}: ` + JSON.stringify(validateJournalRecord.errors));
+      const actionRecords = [];
+      let expectedSeq = 1;
+      for (const line of lines) {
+        const record = JSON.parse(line);
+        if (!validateJournalRecord(record)) {
+          throw new Error(`Corrupt journal record at seq ${expectedSeq}: ` + JSON.stringify(validateJournalRecord.errors));
+        }
+        if (record.journal_seq !== expectedSeq) {
+          throw new Error(`Non-contiguous journal seq: expected ${expectedSeq}, got ${record.journal_seq}`);
+        }
+
+        this.lastJournalSeq = record.journal_seq;
+        this.projectedJournalSeq = record.journal_seq;
+
+        if (record.operation_id) {
+          this.operationIndex.set(record.operation_id, record);
+        }
+
+        if (record.type === "action_committed" && record.action_record) {
+          actionRecords.push(record.action_record);
+        }
+
+        this._applyJournalRecord(record);
+        expectedSeq += 1;
       }
-      if (record.journal_seq !== expectedSeq) {
-        throw new Error(`Non-contiguous journal seq: expected ${expectedSeq}, got ${record.journal_seq}`);
-      }
 
-      this.lastJournalSeq = record.journal_seq;
-      this.projectedJournalSeq = record.journal_seq;
-
-      if (record.operation_id) {
-        this.operationIndex.set(record.operation_id, record);
-      }
-
-      if (record.type === "action_committed" && record.action_record) {
-        actionRecords.push(record.action_record);
-      }
-
-      this._applyJournalRecord(record);
-      expectedSeq += 1;
-    }
-
-    // Always reconcile actions.jsonl against authoritative WAL actionRecords
-    let isActionsValid = false;
-    if (fs.existsSync(this.actionsPath)) {
-      try {
-        const content = fs.readFileSync(this.actionsPath, "utf8");
-        if (actionRecords.length === 0 && content.trim().length === 0) {
-          isActionsValid = true;
-        } else if (content.endsWith("\n")) {
-          const lines = content.trim().split("\n").filter((l) => l.trim().length > 0);
-          if (lines.length === actionRecords.length) {
-            let allMatch = true;
-            for (let i = 0; i < lines.length; i++) {
-              const parsed = JSON.parse(lines[i]);
-              const authoritativeLine = JSON.stringify(actionRecords[i]);
-              if (!parsed || parsed.seq !== actionRecords[i].seq || lines[i] !== authoritativeLine) {
-                allMatch = false;
-                break;
+      // Always reconcile actions.jsonl against authoritative WAL actionRecords
+      let isActionsValid = false;
+      if (fs.existsSync(this.actionsPath)) {
+        try {
+          const content = fs.readFileSync(this.actionsPath, "utf8");
+          if (actionRecords.length === 0 && content.trim().length === 0) {
+            isActionsValid = true;
+          } else if (content.endsWith("\n")) {
+            const lines = content.trim().split("\n").filter((l) => l.trim().length > 0);
+            if (lines.length === actionRecords.length) {
+              let allMatch = true;
+              for (let i = 0; i < lines.length; i++) {
+                const parsed = JSON.parse(lines[i]);
+                const authoritativeLine = JSON.stringify(actionRecords[i]);
+                if (!parsed || parsed.seq !== actionRecords[i].seq || lines[i] !== authoritativeLine) {
+                  allMatch = false;
+                  break;
+                }
+              }
+              if (allMatch) {
+                isActionsValid = true;
               }
             }
-            if (allMatch) {
-              isActionsValid = true;
-            }
           }
+        } catch (_e) {
+          isActionsValid = false;
         }
-      } catch (_e) {
-        isActionsValid = false;
       }
-    }
-    if (!isActionsValid) {
-      const tmpPath = `${this.actionsPath}.tmp-${Date.now()}`;
-      const actionContent = actionRecords.length > 0
-        ? actionRecords.map((a) => JSON.stringify(a)).join("\n") + "\n"
-        : "";
-      fs.writeFileSync(tmpPath, actionContent, "utf8");
-      fs.renameSync(tmpPath, this.actionsPath);
-    }
+      if (!isActionsValid) {
+        const tmpPath = `${this.actionsPath}.tmp-${Date.now()}`;
+        const actionContent = actionRecords.length > 0
+          ? actionRecords.map((a) => JSON.stringify(a)).join("\n") + "\n"
+          : "";
+        fs.writeFileSync(tmpPath, actionContent, "utf8");
+        fs.renameSync(tmpPath, this.actionsPath);
+      }
 
-    // Reconstruct or restore base viewer state
-    if (fs.existsSync(this.baseViewerStatePath)) {
-      try {
-        this.baseViewerState = JSON.parse(fs.readFileSync(this.baseViewerStatePath, "utf8"));
+      // Reconstruct or restore base viewer state
+      if (fs.existsSync(this.baseViewerStatePath)) {
+        try {
+          this.baseViewerState = JSON.parse(fs.readFileSync(this.baseViewerStatePath, "utf8"));
+          this.baseViewerStateDigest = computeViewerStateHash(this.baseViewerState);
+        } catch (_e) {}
+      }
+      if (!this.baseViewerState) {
+        const baseSession = this._createGameSession();
+        this.baseViewerState = extractViewerState(baseSession, 0, this.worldBundleDigest);
         this.baseViewerStateDigest = computeViewerStateHash(this.baseViewerState);
-      } catch (_e) {}
-    }
-    if (!this.baseViewerState) {
-      const baseSession = this._createGameSession();
-      this.baseViewerState = extractViewerState(baseSession, 0, this.worldBundleDigest);
-      this.baseViewerStateDigest = computeViewerStateHash(this.baseViewerState);
-      fs.writeFileSync(this.baseViewerStatePath, JSON.stringify(this.baseViewerState, null, 2), "utf8");
-    }
+        fs.writeFileSync(this.baseViewerStatePath, JSON.stringify(this.baseViewerState, null, 2), "utf8");
+      }
 
-    // Reconstruct game session
-    this._reconstructGameSession();
+      // Reconstruct game session
+      this._reconstructGameSession();
+    } catch (err) {
+      this.cleanup();
+      throw err;
+    }
   }
 
   _reconstructGameSession() {
@@ -1943,7 +1962,11 @@ class RunInstance {
           };
 
           await this.appendJournalRecord(finalizeRecord);
-          this.service._clearActiveRun(this.runId);
+          try {
+            this.service._clearActiveRun(this.runId);
+          } catch (clearErr) {
+            console.error(`Failed to clear active run or update run group for ${this.runId}:`, clearErr);
+          }
         });
       } catch (err) {
         console.error("Finalize worker failed:", err);
@@ -1953,6 +1976,9 @@ class RunInstance {
   }
 
   async _recordFinalizeFailure(error) {
+    if (["won", "action_limit", "timed_out", "cancelled", "failed"].includes(this.status)) {
+      return;
+    }
     try {
       let partialSummaryDigest = null;
       let summaryAvailable = false;
@@ -2033,6 +2059,7 @@ class RunInstance {
   }
 
   cleanup() {
+    this.disposed = true;
     if (this.leaseTimer) {
       clearTimeout(this.leaseTimer);
       this.leaseTimer = null;

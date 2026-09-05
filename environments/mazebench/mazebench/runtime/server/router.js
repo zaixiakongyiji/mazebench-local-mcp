@@ -444,6 +444,29 @@ function createRequestRouter({
           return;
         }
 
+        // Level state: GET /api/external-play/runs/:runId/maze/:levelId or /levels/:levelId
+        if (segments.length === 6 && (segments[4] === "maze" || segments[4] === "levels")) {
+          if (request.method !== "GET") {
+            response.writeHead(405, { Allow: "GET" });
+            response.end();
+            return;
+          }
+          const levelId = segments[5];
+          const worldBundle = run._loadWorldBundle ? run._loadWorldBundle() : null;
+          if (worldBundle?.levelStates && worldBundle.levelStates[levelId]) {
+            sendJson(response, 200, worldBundle.levelStates[levelId]);
+            return;
+          }
+          const game = getGame("maze");
+          const level = getLevel ? getLevel(game, levelId) : null;
+          if (level) {
+            sendJson(response, 200, getLevelState(game, level));
+            return;
+          }
+          sendJson(response, 404, { error: "Level not found", code: "NOT_FOUND" });
+          return;
+        }
+
         // Helper for viewer auth
         const authHeader = request.headers.authorization || "";
         const tokenMatch = authHeader.match(/^Bearer\s+(.+)$/i);
@@ -690,6 +713,8 @@ function createRequestRouter({
           sendFile(request, response, run.summaryPath, "application/json");
           return;
         }
+
+
       }
 
       sendJson(response, 404, { error: "Endpoint not found", code: "NOT_FOUND" });

@@ -2346,6 +2346,9 @@ function createAgentRunService({
     let manifest = {};
     let summary = null;
     let journalMeta = null;
+    let journalStarted = null;
+    let journalOutcome = null;
+    let journalTurns = 0;
     try {
       if (fs.existsSync(manifestPath)) manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     } catch (_e) {}
@@ -2355,8 +2358,27 @@ function createAgentRunService({
     try {
       const journalPath = path.join(runDir, "journal.jsonl");
       if (fs.existsSync(journalPath)) {
-        const firstLine = fs.readFileSync(journalPath, "utf8").split("\n")[0];
-        if (firstLine) journalMeta = JSON.parse(firstLine);
+        const lines = fs.readFileSync(journalPath, "utf8").split("\n").filter((l) => l.trim().length > 0);
+        for (const line of lines) {
+          try {
+            const rec = JSON.parse(line);
+            if (!journalMeta && rec.type === "run_armed") {
+              journalMeta = rec;
+            }
+            if (rec.type === "run_started") {
+              journalStarted = rec;
+            }
+            if (rec.type === "action_committed") {
+              if (rec.action_seq != null) journalTurns = Math.max(journalTurns, rec.action_seq);
+            }
+            if (rec.type === "run_finalized" || rec.type === "run_failed") {
+              journalOutcome = rec.outcome || (rec.type === "run_failed" ? "failed" : null);
+            }
+          } catch (_err) {}
+        }
+        if (!journalMeta && lines[0]) {
+          try { journalMeta = JSON.parse(lines[0]); } catch (_e) {}
+        }
       }
     } catch (_e) {}
 
@@ -2364,15 +2386,18 @@ function createAgentRunService({
       manifest.model_name ||
       summary?.model_name ||
       summary?.declared_model ||
+      journalStarted?.model_name ||
       journalMeta?.model_name ||
       "External MCP";
     const harnessName =
       manifest.harness_name ||
       summary?.harness_name ||
       summary?.declared_cli ||
+      journalStarted?.declared_cli ||
+      journalStarted?.harness_name ||
       journalMeta?.harness_name ||
       "stdio-mcp";
-    const createdAt = manifest.created_at || summary?.started_at || journalMeta?.timestamp || entryName;
+    const createdAt = manifest.created_at || summary?.started_at || journalStarted?.started_at || journalMeta?.timestamp || entryName;
 
     let status = "waiting";
     if (summary) {
@@ -2380,11 +2405,16 @@ function createAgentRunService({
       else if (["action_limit", "timed_out", "cancelled"].includes(summary.outcome)) status = "stopped";
       else if (summary.outcome === "failed") status = "failed";
       else status = "finished";
-    } else if (manifest.claimed_at) {
+    } else if (journalOutcome) {
+      if (journalOutcome === "won") status = "finished";
+      else if (["action_limit", "timed_out", "cancelled"].includes(journalOutcome)) status = "stopped";
+      else if (journalOutcome === "failed") status = "failed";
+      else status = "finished";
+    } else if (journalStarted || manifest.claimed_at) {
       status = "running";
     }
 
-    const turns = summary?.actions_total ?? summary?.turns ?? summary?.actions ?? 0;
+    const turns = summary?.actions_total ?? summary?.turns ?? summary?.actions ?? journalTurns ?? 0;
     const gemCount = summary?.gems_collected ?? summary?.gem_count ?? summary?.gems ?? 0;
     const gemTotal = summary?.gems_total ?? manifest.win_threshold ?? 90;
     const roomCount =

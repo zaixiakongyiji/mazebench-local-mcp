@@ -279,7 +279,7 @@
       }
       if (entriesRoot) entriesRoot.innerHTML = group.entries.map(renderEntry).join("");
       if (group.mode === "competition") renderRanking(group.result?.ranking || null);
-      if (cancelButton) cancelButton.hidden = group.status === "completed";
+      if (cancelButton) cancelButton.hidden = group.status === "completed" || group.status === "finalizing";
       if (group.status === "completed" && pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;

@@ -137,6 +137,58 @@ try {
   service.deleteRun(legacyRunId);
   assert.equal(service.listRuns().total, 0, "Runs list must be empty after both deletions");
 
+  // 5. Test active claimed run without summary preserves model identity and running status
+  const activeRunId = "ext-active-12345678-abcd-ef01-23456789";
+  const activeRunDir = path.join(extRunsDir, activeRunId);
+  fs.mkdirSync(activeRunDir, { recursive: true });
+  fs.writeFileSync(path.join(activeRunDir, "manifest.json"), JSON.stringify({
+    run_id: activeRunId,
+    run_kind: "external_play",
+    execution_class: "external",
+    benchmark_eligible: false,
+    created_at: "2026-08-02T10:00:00.000Z"
+  }));
+  const journalLines = [
+    JSON.stringify({
+      journal_seq: 1,
+      timestamp: "2026-08-02T10:00:00.000Z",
+      run_id: activeRunId,
+      type: "run_armed",
+      manifest: { run_id: activeRunId }
+    }),
+    JSON.stringify({
+      journal_seq: 2,
+      timestamp: "2026-08-02T10:00:01.000Z",
+      run_id: activeRunId,
+      type: "run_started",
+      started_at: "2026-08-02T10:00:01.000Z",
+      model_name: "gemini-2.5-pro",
+      declared_cli: "my-custom-cli",
+      controller_id: "my-custom-cli-abcd1234",
+      lease_id: "lease-1",
+      lease_epoch: 1,
+      lease_expires_at: new Date(Date.now() + 60000).toISOString()
+    }),
+    JSON.stringify({
+      journal_seq: 3,
+      timestamp: "2026-08-02T10:00:02.000Z",
+      run_id: activeRunId,
+      type: "action_committed",
+      action_seq: 3,
+      event_id: 1,
+      viewer_state_hash: "0".repeat(64),
+      action_record: { seq: 3, message: { action: "right" } }
+    })
+  ].join("\n") + "\n";
+  fs.writeFileSync(path.join(activeRunDir, "journal.jsonl"), journalLines, "utf8");
+
+  const activeCard = service.summarizeRun(activeRunId);
+  assert.equal(activeCard.model_name, "gemini-2.5-pro");
+  assert.equal(activeCard.harness_label, "my-custom-cli");
+  assert.equal(activeCard.status, "running");
+  assert.equal(activeCard.turns, 3);
+  service.deleteRun(activeRunId);
+
   console.log("external-runs-display tests passed");
 } finally {
   try {

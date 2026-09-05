@@ -155,6 +155,12 @@ async function runTests() {
     assert.equal(service.activeGroupId, concurrent.group_id);
     assert.ok(groupRuns.every((run) => run.status === "active"));
 
+    // Verify active entries report live rooms_visited and gems_collected without summary
+    const activeRunningGroup = service.getGroup(competition.group_id);
+    assert.equal(activeRunningGroup.status, "running");
+    assert.ok(activeRunningGroup.entries.every((entry) => entry.rooms_visited >= 1), "Active run must show rooms_visited >= 1");
+    assert.ok(activeRunningGroup.entries.every((entry) => entry.gems_collected >= 0));
+
     await Promise.all(starts.map((start, index) => groupRuns[index].executeAction(
       controllers[index],
       start.lease_id,
@@ -217,6 +223,102 @@ async function runTests() {
       )));
     } finally {
       restarted.shutdown();
+    }
+
+    console.log("  [Test 5] isolated child run after recovery allows group and cancelGroup to finalize");
+    const test5Service = new ExternalPlayService({ dataHome, port: 3019, defaultMaxActions: 1 });
+    await test5Service.initialize();
+    try {
+      const test5Group = await test5Service.createGroup({ mode: "competition", count: 2, maxActions: 1 });
+      const c1 = await createController(test5Service, "test5-h1");
+      const c2 = await createController(test5Service, "test5-h2");
+      const s1 = await test5Service.claimOrAttachRun(c1, { model_name: "test5-m1" }, "t5-s1");
+      const s2 = await test5Service.claimOrAttachRun(c2, { model_name: "test5-m2" }, "t5-s2");
+
+      // Corrupt s1 run journal so restart recovery isolates it
+      test5Service.shutdown();
+      const s1Journal = path.join(dataHome, "external-runs", s1.run_id, "journal.jsonl");
+      fs.appendFileSync(s1Journal, "INVALID_JSON_LINE\n", "utf8");
+
+      const test5Recovered = new ExternalPlayService({ dataHome, port: 3020, defaultMaxActions: 1 });
+      await test5Recovered.initialize();
+      try {
+        const groupAfterRestart = test5Recovered.getGroup(test5Group.group_id);
+        const s1Entry = groupAfterRestart.entries.find((e) => e.run_id === s1.run_id);
+        assert.equal(s1Entry.status, "failed");
+        assert.equal(s1Entry.outcome, "failed");
+
+        // Cancel group should finalize even with the isolated missing run
+        await test5Recovered.cancelGroup(test5Group.group_id);
+        const s2Run = test5Recovered.getRun(s2.run_id);
+        if (s2Run) await waitForTerminal(s2Run);
+        const groupFinal = test5Recovered.getGroup(test5Group.group_id);
+        assert.equal(groupFinal.status, "completed");
+        assert.ok(groupFinal.result, "Run group must have finalized result ranking snapshot");
+        assert.equal(groupFinal.result.ranking.length, 2);
+      } finally {
+        test5Recovered.shutdown();
+      }
+    } finally {
+      if (test5Service.serviceState !== "SHUTDOWN") test5Service.shutdown();
+    }
+
+    console.log("  [Test 6] Group settlement failure preserves finalizing state and auto-recovers ranking");
+    const test6DataHome = fs.mkdtempSync(path.join(os.tmpdir(), "mazebench-test6-"));
+    const test6Service = new ExternalPlayService({ dataHome: test6DataHome, port: 3022, defaultMaxActions: 1 });
+    await test6Service.initialize();
+    try {
+      const test6Group = await test6Service.createGroup({ mode: "competition", count: 2, maxActions: 1 });
+      const c1 = await createController(test6Service, "test6-h1");
+      const c2 = await createController(test6Service, "test6-h2");
+      const s1 = await test6Service.claimOrAttachRun(c1, { model_name: "test6-m1" }, "t6-s1");
+      const s2 = await test6Service.claimOrAttachRun(c2, { model_name: "test6-m2" }, "t6-s2");
+
+      let failResultRename = true;
+      const originalRenameSync = fs.renameSync;
+      fs.renameSync = function(oldPath, newPath) {
+        if (failResultRename && typeof newPath === "string" && newPath.endsWith("result.json")) {
+          throw new Error("Synthetic result.json rename failure");
+        }
+        return originalRenameSync.apply(this, arguments);
+      };
+
+      try {
+        const r1 = test6Service.getRun(s1.run_id);
+        const r2 = test6Service.getRun(s2.run_id);
+        await r1.executeAction(c1, s1.lease_id, s1.lease_epoch, "rotate_camera_left", {}, "t6-act1");
+        await r2.executeAction(c2, s2.lease_id, s2.lease_epoch, "rotate_camera_left", {}, "t6-act2");
+        await waitForTerminal(r1);
+        await waitForTerminal(r2);
+
+        // Both child runs should have completed cleanly with summaries
+        assert.equal(r1.status, "action_limit");
+        assert.equal(r2.status, "action_limit");
+        assert.ok(fs.existsSync(r1.summaryPath));
+        assert.ok(fs.existsSync(r2.summaryPath));
+
+        // Group status must be 'finalizing', result must be null, and result.json must not exist yet
+        const groupWhileFailing = test6Service.getGroup(test6Group.group_id);
+        assert.equal(groupWhileFailing.status, "finalizing");
+        assert.equal(groupWhileFailing.result, null);
+        const resultJsonPath = path.join(test6DataHome, "external-groups", test6Group.group_id, "result.json");
+        assert.ok(!fs.existsSync(resultJsonPath));
+
+        // Now lift the synthetic storage error
+        failResultRename = false;
+
+        // Querying getGroup (simulating next frontend poll) should trigger read-through recovery
+        const recoveredGroup = test6Service.getGroup(test6Group.group_id);
+        assert.equal(recoveredGroup.status, "completed");
+        assert.ok(recoveredGroup.result);
+        assert.equal(recoveredGroup.result.ranking.length, 2);
+        assert.ok(fs.existsSync(resultJsonPath));
+      } finally {
+        fs.renameSync = originalRenameSync;
+      }
+    } finally {
+      test6Service.shutdown();
+      fs.rmSync(test6DataHome, { recursive: true, force: true });
     }
   } finally {
     if (service.serviceState !== "SHUTDOWN") service.shutdown();
