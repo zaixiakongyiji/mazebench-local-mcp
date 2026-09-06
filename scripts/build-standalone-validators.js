@@ -73,6 +73,9 @@ const bundleSchema = {
             "lease_id": { "type": "string", "maxLength": 128 },
             "lease_epoch": { "type": "integer", "minimum": 2 },
             "lease_expires_at": { "type": "string", "format": "date-time" },
+            "request_id": { "type": "string", "maxLength": 128 },
+            "previous_controller_id": { "type": ["string", "null"], "maxLength": 128 },
+            "forced": { "type": "boolean" },
             "sanitized_result": { "$ref": "#/$defs/mcp_call_result" }
           },
           "required": ["journal_seq", "timestamp", "run_id", "type", "operation_id", "request_fingerprint", "controller_id", "lease_id", "lease_epoch", "lease_expires_at", "sanitized_result"],

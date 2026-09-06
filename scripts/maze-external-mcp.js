@@ -5,6 +5,7 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 
 const PROTOCOL_VERSION = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
@@ -34,12 +35,24 @@ function sendStdout(jsonRpcObj) {
 const TOOLS_MANIFEST = [
   {
     name: "start",
-    description: "Claim and start an armed MazeBench game. Provide the model name specified by the user; the result contains the authoritative run instructions and initial observation.",
+    description: "Claim an armed MazeBench run for the current controller. Provide the model name specified by the user; the result contains authoritative run instructions and initial observation.",
     inputSchema: {
       type: "object",
+      required: ["model_name"],
       properties: {
-        model_name: { type: "string", minLength: 1, maxLength: 128, description: "Model name specified by the user. Required when claiming a new run." },
-        run_id: { type: "string", description: "Optional prior run ID used only to reconnect to that run." }
+        model_name: { type: "string", minLength: 1, maxLength: 128, description: "Model name specified by the user. Required when claiming a new run." }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "resume",
+    description: "Request authorization to resume an existing MazeBench run across sessions. Initiates an approval request and polls until approved on the local dashboard, then attaches to the run.",
+    inputSchema: {
+      type: "object",
+      required: ["run_id"],
+      properties: {
+        run_id: { type: "string", minLength: 1, maxLength: 128, description: "Run ID to resume." }
       },
       additionalProperties: false
     }
@@ -166,12 +179,26 @@ function validateToolArguments(toolName, args = {}) {
     }
   }
 
-  if (toolName === "start" && args.model_name !== undefined) {
-    if (typeof args.model_name !== "string" || !args.model_name.trim() || args.model_name.trim().length > 128) {
-      return { valid: false, error: "start model_name must be a non-empty string of at most 128 characters" };
+  if (toolName === "start") {
+    if (args.run_id !== undefined) {
+      return { valid: false, error: "start does not accept run_id; use resume({run_id}) to request run resumption" };
     }
-    if (/[\u0000-\u001f\u007f]/.test(args.model_name.trim())) {
-      return { valid: false, error: "start model_name must not contain control characters" };
+    if (args.model_name !== undefined) {
+      if (typeof args.model_name !== "string" || !args.model_name.trim() || args.model_name.trim().length > 128) {
+        return { valid: false, error: "start model_name must be a non-empty string of at most 128 characters" };
+      }
+      if (/[\u0000-\u001f\u007f]/.test(args.model_name.trim())) {
+        return { valid: false, error: "start model_name must not contain control characters" };
+      }
+    }
+  }
+
+  if (toolName === "resume") {
+    if (typeof args.run_id !== "string" || !args.run_id.trim() || args.run_id.trim().length > 128) {
+      return { valid: false, error: "resume run_id must be a non-empty string of at most 128 characters" };
+    }
+    if (/[\u0000-\u001f\u007f]/.test(args.run_id.trim())) {
+      return { valid: false, error: "resume run_id must not contain control characters" };
     }
   }
 
@@ -220,14 +247,21 @@ function parseToolResultPayload(result) {
 
 class StdioMcpAdapter {
   constructor() {
+    if (process.env.MAZEBENCH_LOCAL_MCP_TOKEN) {
+      logStderr("Error: MAZEBENCH_LOCAL_MCP_TOKEN environment variable is deprecated and unsupported. Each MCP adapter instance automatically negotiates an isolated controller session.");
+      process.exit(1);
+    }
     this.serverUrl = process.env.MAZEBENCH_SERVER_URL || null;
-    this.controllerToken = process.env.MAZEBENCH_LOCAL_MCP_TOKEN || null;
+    this.controllerToken = null;
     this.controllerId = null;
     this.instanceId = null;
 
     this.initialized = false;
     this.clientInfo = null;
 
+    this.claimedState = null;
+    this.authorizationRequired = false;
+    this.pendingResume = null;
     this.activeRunId = null;
     this.leaseId = null;
     this.leaseEpoch = null;
@@ -306,7 +340,11 @@ class StdioMcpAdapter {
     });
   }
 
-  async connectServer(force = false) {
+  async connectServer(force = false, { forResume = false } = {}) {
+    if (this.claimedState && (force || !this.controllerToken)) {
+      this.requireResumption();
+      if (!forResume) throw new Error("Controller authentication lost. Use resume to request resumption approval.");
+    }
     let serverJson = null;
     for (let retry = 0; retry < 3; retry++) {
       if (fs.existsSync(this.serverJsonPath)) {
@@ -393,6 +431,7 @@ class StdioMcpAdapter {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = setInterval(async () => {
       if (!this.activeRunId || !this.leaseId || !this.leaseEpoch) return;
+      const heartbeatLeaseId = this.leaseId;
       try {
         await this.httpRequest("POST", "/api/external-play/lease/heartbeat", {
           run_id: this.activeRunId,
@@ -400,10 +439,11 @@ class StdioMcpAdapter {
           lease_epoch: this.leaseEpoch
         });
       } catch (err) {
+        if (this.leaseId !== heartbeatLeaseId) return;
         logStderr(`Heartbeat failed: ${err.message}`);
-        if (err.statusCode === 409) {
-          // Lease was revoked or expired
-          this.stopHeartbeat();
+        if ([401, 403, 404, 409].includes(err.statusCode)) {
+          if (err.statusCode === 401 || err.statusCode === 403) this.controllerToken = null;
+          this.requireResumption();
         }
       }
     }, HEARTBEAT_INTERVAL_MS);
@@ -416,7 +456,75 @@ class StdioMcpAdapter {
     }
   }
 
+  requireResumption() {
+    this.authorizationRequired = true;
+    this.leaseId = null;
+    this.leaseEpoch = null;
+    this.stopHeartbeat();
+    this.stopResumePolling();
+  }
+
+  stopResumePolling() {
+    const pending = this.pendingResume;
+    this.pendingResume = null;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    const active = this.activeRequests.get(pending.httpRequestId);
+    if (active) {
+      this.activeRequests.delete(pending.httpRequestId);
+      active.abort();
+    }
+  }
+
+  attachResumedLease(data) {
+    this.stopResumePolling();
+    this.activeRunId = data.run_id;
+    this.leaseId = data.lease_id;
+    this.leaseEpoch = data.lease_epoch;
+    this.claimedState = this.activeRunId;
+    this.authorizationRequired = false;
+    this.startHeartbeat();
+  }
+
+  startResumePolling(requestId) {
+    this.stopResumePolling();
+    const pending = { requestId, token: this.controllerToken, httpRequestId: Symbol("resume-poll"), timer: null };
+    this.pendingResume = pending;
+    const poll = async () => {
+      if (this.pendingResume !== pending) return;
+      try {
+        const data = await this.httpRequest(
+          "GET", `/api/external-play/resume-requests/${encodeURIComponent(requestId)}/status`,
+          null, {}, pending.httpRequestId
+        );
+        // 取消或换会话后，迟到的审批响应不能重新附着租约。
+        if (this.pendingResume !== pending || this.controllerToken !== pending.token) return;
+        if (data.status === "approved") {
+          this.attachResumedLease(data);
+          logStderr(`Resume approved for ${data.run_id}. Lease attached; call observe or resume to retrieve the current state.`);
+          return;
+        }
+        if (data.status !== "pending_approval") {
+          this.stopResumePolling();
+          logStderr(`Resume request ${requestId} ended: ${data.status}. Call resume to request approval again.`);
+          return;
+        }
+        pending.timer = setTimeout(poll, 2000);
+      } catch (err) {
+        if (this.pendingResume !== pending) return;
+        this.stopResumePolling();
+        if (err.statusCode === 401 || err.statusCode === 403) {
+          this.controllerToken = null;
+          if (this.claimedState) this.requireResumption();
+        }
+        logStderr(`Resume polling stopped: ${err.message}. Call resume to request approval again.`);
+      }
+    };
+    pending.timer = setTimeout(poll, 2000);
+  }
+
   async detach() {
+    this.stopResumePolling();
     this.stopHeartbeat();
     if (this.activeRunId && this.leaseId && this.leaseEpoch) {
       try {
@@ -479,7 +587,7 @@ class StdioMcpAdapter {
             name: "mazebench",
             version: "1.0.0"
           },
-          instructions: "Create a MazeBench session first. Call start with the model_name specified by the user, then follow the returned run_instructions until the run reaches a terminal state.",
+          instructions: "Create a MazeBench session first. Call start with the model_name specified by the user, or call resume with run_id to resume an existing run across sessions. Then follow the returned run_instructions until the run reaches a terminal state.",
           capabilities: {
             tools: { listChanged: false }
           }
@@ -551,9 +659,14 @@ class StdioMcpAdapter {
         let proxyRes;
         let targetRunId = toolArgs?.run_id || null;
 
+        if (toolName !== "resume" && (this.authorizationRequired || this.pendingResume ||
+            (this.claimedState && !this.controllerToken))) {
+          throw new Error("Run authorization required. Use resume and wait for approval before continuing.");
+        }
+
         if (toolName === "action_sequence") {
           if (!this.activeRunId || !this.leaseId || !this.leaseEpoch) {
-            throw new Error("Call start before action_sequence.");
+            throw new Error("Call start or resume before action_sequence.");
           }
           const includeIntermediate = toolArgs.include_intermediate_observations === true;
           const steps = [];
@@ -578,7 +691,7 @@ class StdioMcpAdapter {
                 arguments: parsedAction.arguments,
                 lease_id: this.leaseId,
                 lease_epoch: this.leaseEpoch,
-                operation_id: `mcp-sequence-${id}-${index}-${Date.now()}`
+                operation_id: `mcp-seq-${crypto.randomUUID()}-${index}`
               },
               {},
               id
@@ -635,6 +748,147 @@ class StdioMcpAdapter {
           return;
         }
 
+        if (toolName === "resume") {
+          this.stopResumePolling();
+          const targetRunId = toolArgs?.run_id;
+          if (!targetRunId || typeof targetRunId !== "string") {
+            sendStdout({
+              jsonrpc: "2.0",
+              id,
+              error: {
+                code: -32602,
+                message: "Missing or invalid required argument: run_id"
+              }
+            });
+            return;
+          }
+
+          if (!this.controllerToken) {
+            await this.connectServer(true, { forResume: true });
+          }
+
+          const resumeOpId = `mcp-resume-${id}-${crypto.randomUUID()}`;
+          let initialRes;
+          try {
+            initialRes = await this.httpRequest(
+              "POST",
+              "/api/external-play/mcp",
+              {
+                tool: "resume",
+                arguments: { run_id: targetRunId },
+                operation_id: resumeOpId
+              },
+              {},
+              id
+            );
+          } catch (requestErr) {
+            if (
+              requestErr.statusCode === 401 ||
+              requestErr.statusCode === 403 ||
+              requestErr.statusCode === 404
+            ) {
+              logStderr(`Resume request failed with status ${requestErr.statusCode}. Attempting to reconnect...`);
+              if (requestErr.statusCode === 401 || requestErr.statusCode === 403) {
+                this.controllerToken = null;
+              }
+              await this.connectServer(true, { forResume: true });
+              initialRes = await this.httpRequest(
+                "POST",
+                "/api/external-play/mcp",
+                {
+                  tool: "resume",
+                  arguments: { run_id: targetRunId },
+                  operation_id: resumeOpId
+                },
+                {},
+                id
+              );
+            } else {
+              throw requestErr;
+            }
+          }
+
+          const reqData = initialRes.result?.content?.[0]?.text
+            ? JSON.parse(initialRes.result.content[0].text)
+            : initialRes;
+
+          if (reqData.status === "pending_approval") {
+            this.stopHeartbeat();
+            this.startResumePolling(reqData.request_id);
+            logStderr(`Resume request submitted (${reqData.request_id}). Waiting for user approval on dashboard: ${reqData.review_url}`);
+            sendStdout({
+              jsonrpc: "2.0",
+              id,
+              result: {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify({
+                      status: "pending_approval",
+                      request_id: reqData.request_id,
+                      run_id: reqData.run_id,
+                      review_url: reqData.review_url,
+                      message: reqData.message || "Resume request submitted. Resumption must be approved by the user in the local web interface before play can continue."
+                    })
+                  }
+                ],
+                isError: false
+              }
+            });
+            return;
+          }
+
+          if (reqData.status === "approved") {
+            this.attachResumedLease(reqData);
+
+            const observation = reqData.observation || {};
+            sendStdout({
+              jsonrpc: "2.0",
+              id,
+              result: {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify({
+                      run_id: this.activeRunId,
+                      ...(reqData.group_id ? {
+                        group_id: reqData.group_id,
+                        entry_id: reqData.entry_id,
+                        group_mode: reqData.group_mode
+                      } : {}),
+                      model_name: reqData.model_name,
+                      harness: reqData.harness,
+                      instructions_version: reqData.instructions_version,
+                      run_instructions: reqData.run_instructions,
+                      status: reqData.run_status || "active",
+                      action_seq: reqData.action_seq ?? observation.action_count ?? 0,
+                      observation,
+                      game_won: Boolean(reqData.game_won),
+                      ended: Boolean(reqData.ended),
+                      ...(reqData.outcome ? { outcome: reqData.outcome } : {}),
+                      ...(reqData.max_actions ? {
+                        max_actions: reqData.max_actions,
+                        actions_remaining: reqData.actions_remaining
+                      } : {}),
+                      ...(reqData.duration_ms ? {
+                        duration_ms: reqData.duration_ms,
+                        deadline_at: reqData.deadline_at,
+                        time_remaining_ms: reqData.time_remaining_ms
+                      } : {}),
+                      message: "MazeBench run resumed and lease attached successfully"
+                    })
+                  }
+                ],
+                isError: false
+              }
+            });
+            return;
+          }
+
+          throw new Error(reqData.message || `Resume request returned status ${reqData.status}`);
+        }
+
+        const callOperationId = `mcp-call-${id}-${crypto.randomUUID()}`;
         try {
           if (!this.controllerToken) {
             await this.connectServer(true);
@@ -643,12 +897,12 @@ class StdioMcpAdapter {
             "POST",
             "/api/external-play/mcp",
             {
-              run_id: toolName === "start" ? targetRunId : this.activeRunId,
+              run_id: toolName === "start" ? undefined : this.activeRunId,
               tool: toolName,
               arguments: toolArgs,
               lease_id: this.leaseId,
               lease_epoch: this.leaseEpoch,
-              operation_id: `mcp-call-${id}-${Date.now()}`
+              operation_id: callOperationId
             },
             {},
             id
@@ -662,19 +916,23 @@ class StdioMcpAdapter {
             logStderr(`Request failed with status ${requestErr.statusCode}. Attempting to reconnect...`);
             if (requestErr.statusCode === 401 || requestErr.statusCode === 403) {
               this.controllerToken = null;
+              if (this.claimedState) {
+                this.requireResumption();
+                logStderr(`Controller authentication lost for claimed run ${this.claimedState}. Re-authorization via resume required.`);
+                throw new Error(`Controller authentication lost for claimed run ${this.claimedState}. Use resume tool to request resumption approval.`);
+              }
             }
             await this.connectServer(true);
-            targetRunId = toolArgs?.run_id || null;
             proxyRes = await this.httpRequest(
               "POST",
               "/api/external-play/mcp",
               {
-                run_id: toolName === "start" ? targetRunId : this.activeRunId,
+                run_id: toolName === "start" ? undefined : this.activeRunId,
                 tool: toolName,
                 arguments: toolArgs,
                 lease_id: this.leaseId,
                 lease_epoch: this.leaseEpoch,
-                operation_id: `mcp-call-${id}-${Date.now()}`
+                operation_id: callOperationId
               },
               {},
               id
@@ -700,6 +958,7 @@ class StdioMcpAdapter {
         if (toolName === "start") {
           if (proxyRes.run_id) {
             this.activeRunId = proxyRes.run_id;
+            this.claimedState = this.activeRunId;
           }
           if (proxyRes.lease_id && proxyRes.lease_epoch) {
             this.leaseId = proxyRes.lease_id;
@@ -768,6 +1027,10 @@ class StdioMcpAdapter {
           result
         });
       } catch (err) {
+        if ((err.statusCode === 401 || err.statusCode === 403) && this.claimedState) {
+          this.controllerToken = null;
+          this.requireResumption();
+        }
         if (err.code === "CANCELLED" || this.cancelledRequests.has(id)) {
           this.cancelledRequests.delete(id);
           sendStdout({

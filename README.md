@@ -150,7 +150,7 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 2. 在浏览器打开 External Play 页面。
 3. 创建单局、并发组或比赛组，并设置统一的游戏 actions 上限；运行组支持 2–8 个席位。
 4. 启动或重启已经配置 MCP 的 CLI/桌面端。
-5. 给每个模型指定名称，并发送统一初始提示词：`调用 MazeBench 的 start 工具，填写指定的 model_name，然后严格按照返回的 run_instructions 继续游戏。`
+5. 给每个模型指定名称，并发送统一初始提示词：`调用 MazeBench 的 start 工具，填写指定的 model_name，然后严格按照返回的 run_instructions 继续游戏。`（若需跨会话恢复先前未结束的对局，请让模型调用 `resume` 工具传入 `run_id` 并在网页控制台完成审批）。
 6. 在浏览器中实时观看 3D 画面、动作记录、房间和 gems 状态。
 7. 达到 actions 上限后，在同一页面查看总结和回放。
 
@@ -160,9 +160,10 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 
 ## MCP 工具
 
-当前提供 14 个工具：
+当前提供 15 个工具：
 
 - `start`
+- `resume`
 - `observe`
 - `up`、`down`、`left`、`right`
 - `rotate_camera_up`、`rotate_camera_down`
@@ -172,7 +173,11 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 - `go_to_level`
 - `action_sequence`
 
-首次认领 run 时调用：
+### 认领与恢复规则
+
+每个独立 MCP 客户端实例会自动与 External Play 服务协商独立的 controller 会话（`MAZEBENCH_LOCAL_MCP_TOKEN` 环境变量已废弃并被禁止使用）。
+
+首次认领 armed 席位时调用 `start`：
 
 ```json
 {
@@ -180,16 +185,23 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 }
 ```
 
-`start` 会返回 `run_id`、可选的 `group_id`/`entry_id`、模型与 harness 身份、`run_instructions`、初始观察和本局预算。连接中断后，可用首次返回的 `run_id` 和相同的 `model_name` 明确恢复；同一 controller 重复 attach 时可以省略参数。
+> **注意**：`start` 仅用于认领全新空闲席位，**严格拒绝**传入 `run_id` 参数。同一 controller 已绑定未结束的运行将拒绝认领新席位。
+`start` 会返回 `run_id`、可选的 `group_id`/`entry_id`、模型与 harness 身份、`run_instructions`、初始观察和本局预算。
 
-运行组管理 API：
+跨会话恢复已有运行：
+若因客户端重启或断开需要接管先前未结束的运行，调用 `resume`：
 
-- `POST /api/external-play/groups`
-- `GET /api/external-play/groups`
-- `GET /api/external-play/groups/:id`
-- `POST /api/external-play/groups/:id/cancel`
+```json
+{
+  "run_id": "run-2026-09-06-abc"
+}
+```
 
-`start` 用于 claim 当前场次并建立控制 lease。之后的游戏操作必须使用同一个 MCP 会话，不能直接调用或修改游戏引擎状态。
+`resume` 会创建授权恢复申请，立即返回 `pending_approval` 与 `review_url`，adapter 每 2 秒后台查询审批状态。用户可在 External Play 网页控制台（首页待审批申请面板或对局详情页）进行审核批准。若原 controller 仍在线，审批时会弹出二次确认对话框，确认后强制接管（`force: true`），原子撤销旧租约并绑定新 controller。获批后 adapter 自动附着租约并启动心跳，不执行游戏动作；调用 `observe` 获取当前观察，或再次调用 `resume` 获取最新提示词与环境元数据。拒绝、过期或断连会停止轮询；租约已过期或被接管时，重新调用 `resume` 必须再次审批。
+
+已认领运行的 adapter 若丢失认证，后续 `start` 重试不会创建新 controller 或领取下一席位；只能通过 `resume` 重新申请并获批后继续游戏。审批和新认领共用 controller 绑定锁，同一 controller 不会同时持有两个运行的租约。
+
+`start` 与 `resume` 获批后建立控制 lease。之后的游戏操作必须使用同一个 MCP 会话，不能直接调用或修改游戏引擎状态。
 
 `action_sequence` 接受 1 到 1,000 个有序 action 字符串。它逐步执行并保留实时观战与动作记录；默认返回紧凑步骤摘要和 `final_observation`。遇到 `ended: true`、玩家死亡或动作错误时会提前停止，以便模型恢复或重新规划。
 
@@ -210,6 +222,14 @@ The game implementation, session, checkpoints, and scoring are evaluator-only. D
 ```
 
 如果创建场次时把 actions 上限改成其他数值，请同步替换提示词中的 `256`。
+
+若因客户端重启或断开需要恢复未完成的对局，可让模型使用以下恢复提示词：
+
+```text
+Use the configured `mazebench` MCP server to resume the existing 3D grid game.
+Call the `mazebench` MCP tool `resume` with `{"run_id": "<your-run-id>"}` and wait until approval is granted in the local web interface. Do not call `start`.
+After approval is granted, inspect the observation and continue using the game action tools (`up`, `down`, `left`, `right`, `observe`, `action_sequence`, etc.) until ended=true.
+```
 
 ## 结束条件与运行产物
 
@@ -295,6 +315,7 @@ python -m unittest tests/test_mazebench_cli.py
 
 - [本地 MCP 实时观战与总结功能改造方案](docs/plan/2026-08-25-local-mcp-live-service.md)
 - [External Play 本地鉴权简化与 Prime CLI 解耦方案](docs/plan/2026-08-31-external-play-local-auth-and-prime-decoupling.md)
+- [External Play 认领与授权恢复执行计划](docs/plan/2026-09-06-external-play-claim-and-auth-resume.md)
 - [Maze level 格式](docs/maze-level-format.md)
 - [Python 打包说明](docs/packaging.md)
 

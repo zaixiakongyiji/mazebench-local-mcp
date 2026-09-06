@@ -203,16 +203,40 @@ function createRequestRouter({
           return;
         }
         const payload = await readJsonBody(request);
-        const run = payload.tool === "start"
+
+        if (payload.tool === "start") {
+          if (payload.run_id !== undefined || payload.arguments?.run_id !== undefined) {
+            sendJson(response, 400, {
+              error: "start does not accept run_id; use resume({run_id}) to request run resumption",
+              code: "INVALID_ARGUMENT"
+            });
+            return;
+          }
+        }
+
+        const run = (payload.tool === "start" || payload.tool === "resume")
           ? null
           : (payload.run_id ? externalPlay.getRun(payload.run_id) : null);
 
-        if (payload.tool !== "start" && !run) {
+        if (payload.tool !== "start" && payload.tool !== "resume" && !run) {
           sendJson(response, 404, {
             error: `Run not found: ${payload.run_id}`,
             code: "NOT_FOUND"
           });
           return;
+        }
+
+        if (payload.tool !== "start" && payload.tool !== "resume") {
+          const boundRunId = externalPlay.controllerRunBindings.get(controllerInfo.controllerId);
+          if (!boundRunId || boundRunId !== payload.run_id) {
+            sendJson(response, 409, {
+              error: boundRunId
+                ? `Controller is bound to run ${boundRunId}, cannot target run ${payload.run_id}`
+                : `Controller is not bound to run ${payload.run_id}`,
+              code: "CONFLICT"
+            });
+            return;
+          }
         }
 
         const requestAbort = new AbortController();
@@ -225,14 +249,27 @@ function createRequestRouter({
         try {
           let res;
           if (payload.tool === "start") {
-            res = await externalPlay.claimOrAttachRun(
+            res = await externalPlay.claimRun(
               controllerInfo,
-              { ...(payload.arguments || {}), ...(payload.run_id ? { run_id: payload.run_id } : {}) },
+              payload.arguments || {},
               payload.operation_id,
               requestAbort.signal
             );
+          } else if (payload.tool === "resume") {
+            const targetRunId = payload.arguments?.run_id || payload.run_id;
+            const resumeRes = await externalPlay.createResumeRequest(controllerInfo, targetRunId);
+            res = {
+              result: {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify(resumeRes)
+                }],
+                isError: false
+              },
+              ...resumeRes
+            };
           } else if (payload.tool === "observe") {
-            const obs = await run.observe();
+            const obs = await run.observe(controllerInfo);
             res = {
               result: {
                 content: [
@@ -281,6 +318,11 @@ function createRequestRouter({
           return;
         }
         const payload = await readJsonBody(request);
+        const boundRunId = externalPlay.controllerRunBindings.get(controllerInfo.controllerId);
+        if (boundRunId && boundRunId !== payload.run_id) {
+          sendJson(response, 409, { error: `Controller is bound to run ${boundRunId}`, code: "CONFLICT" });
+          return;
+        }
         const run = externalPlay.getRun(payload.run_id);
         if (!run) {
           sendJson(response, 404, { error: `Run not found: ${payload.run_id}`, code: "NOT_FOUND" });
@@ -308,6 +350,11 @@ function createRequestRouter({
           return;
         }
         const payload = await readJsonBody(request);
+        const boundRunId = externalPlay.controllerRunBindings.get(controllerInfo.controllerId);
+        if (boundRunId && boundRunId !== payload.run_id) {
+          sendJson(response, 409, { error: `Controller is bound to run ${boundRunId}`, code: "CONFLICT" });
+          return;
+        }
         const run = externalPlay.getRun(payload.run_id);
         if (!run) {
           sendJson(response, 404, { error: `Run not found: ${payload.run_id}`, code: "NOT_FOUND" });
@@ -319,6 +366,68 @@ function createRequestRouter({
         } catch (err) {
           sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
         }
+        return;
+      }
+
+      // Resume Requests: GET /api/external-play/resume-requests
+      if (segments.length === 3 && segments[2] === "resume-requests") {
+        if (request.method !== "GET") {
+          response.writeHead(405, { Allow: "GET" });
+          response.end();
+          return;
+        }
+        sendJson(response, 200, {
+          requests: externalPlay.getResumeRequests()
+        });
+        return;
+      }
+
+      // Resume Request Operations: approve / reject / status
+      // POST /api/external-play/resume-requests/:id/approve
+      // POST /api/external-play/resume-requests/:id/reject
+      // GET /api/external-play/resume-requests/:id/status
+      if (segments.length === 5 && segments[2] === "resume-requests") {
+        const reqId = segments[3];
+        const action = segments[4];
+
+        if (action === "status" && request.method === "GET") {
+          const controllerInfo = externalPlay.validateControllerToken(request.headers.authorization);
+          if (!controllerInfo) {
+            sendJson(response, 401, { error: "Unauthorized controller token", code: "UNAUTHORIZED" });
+            return;
+          }
+          try {
+            const statusRes = await externalPlay.getResumeRequestStatus(controllerInfo, reqId);
+            sendJson(response, 200, statusRes);
+          } catch (err) {
+            sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+          }
+          return;
+        }
+
+        if (action === "approve" && request.method === "POST") {
+          const payload = await readJsonBody(request);
+          try {
+            const res = await externalPlay.approveResumeRequest(reqId, { force: payload?.force === true });
+            sendJson(response, 200, res);
+          } catch (err) {
+            sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+          }
+          return;
+        }
+
+        if (action === "reject" && request.method === "POST") {
+          try {
+            const res = await externalPlay.rejectResumeRequest(reqId);
+            sendJson(response, 200, res);
+          } catch (err) {
+            sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+          }
+          return;
+        }
+
+        response.writeHead(405, { Allow: "GET, POST" });
+        response.end();
         return;
       }
 

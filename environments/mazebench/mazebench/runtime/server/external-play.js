@@ -163,6 +163,9 @@ class ExternalPlayService {
     this.activeGroupId = null;
     this.claimableRunIds = [];
     this.controllerRunBindings = new Map();
+    this.resumeRequests = new Map();
+    this.controllerResumeIndex = new Map();
+    this.claimHistory = new Map();
 
     this.controllerTokens = new Map(); // token -> { instanceId, controllerId, declaredCli, createdAt }
     this.viewerKey = null;
@@ -515,7 +518,7 @@ class ExternalPlayService {
       this.controllerTokens.delete(token);
       return null;
     }
-    return info;
+    return { ...info, token };
   }
 
   generateViewerToken(runId) {
@@ -708,36 +711,367 @@ class ExternalPlayService {
     return this.getGroup(groupId);
   }
 
-  async claimOrAttachRun(controllerInfo, args = {}, operationId = null, abortSignal = null) {
+  async claimRun(controllerInfo, args = {}, operationId = null, abortSignal = null) {
     return await this.admissionMutex.withLock(async () => {
-      const explicitRunId = args.run_id ? String(args.run_id) : null;
+      if (args.run_id !== undefined && args.run_id !== null) {
+        throw { status: 400, code: "INVALID_ARGUMENT", message: "start does not accept run_id; use resume({run_id}) to request run resumption" };
+      }
+
+      const modelName = normalizeModelName(args.model_name, { required: true });
+      const opId = operationId || `op-start-${crypto.randomUUID()}`;
+      const claimCacheKey = `${controllerInfo.controllerId}:${opId}`;
+      const fingerprint = crypto.createHash("sha256").update(JSON.stringify({
+        operation: "start",
+        modelName
+      })).digest("hex");
+
+      // 幂等查询必须在选择席位前进行
+      if (this.claimHistory.has(claimCacheKey)) {
+        const cached = this.claimHistory.get(claimCacheKey);
+        if (cached.fingerprint !== fingerprint) {
+          throw { status: 409, code: "IDEMPOTENCY_CONFLICT", message: "Operation ID already used with different arguments" };
+        }
+        const cachedRunId = cached.result?.run_id || cached.runId;
+        const cachedRun = cachedRunId ? this.getRun(cachedRunId) : null;
+        if (cachedRun) {
+          const currentLease = cachedRun.currentLease;
+          const isControllerCurrent = currentLease && currentLease.controllerId === controllerInfo.controllerId;
+          const isSameLease = isControllerCurrent && currentLease.leaseId === cached.result?.lease_id;
+          if (!isControllerCurrent || !isSameLease) {
+            throw { status: 409, code: "CONFLICT", message: "Lease has been superseded or revoked" };
+          }
+        }
+        return cached.result;
+      }
+
+      // 检查当前 controller 是否已绑定未结束 run
       let boundRunId = this.controllerRunBindings.get(controllerInfo.controllerId) || null;
-      if (boundRunId && TERMINAL_STATUSES.has(this.getRun(boundRunId)?.status)) {
+      if (boundRunId) {
+        const boundRun = this.getRun(boundRunId);
+        if (boundRun && !TERMINAL_STATUSES.has(boundRun.status)) {
+          if (boundRun.modelName && modelName && boundRun.modelName !== modelName) {
+            throw { status: 409, code: "IDENTITY_MISMATCH", message: `Run ${boundRun.runId} is already registered as ${boundRun.modelName}` };
+          }
+          throw { status: 409, code: "ALREADY_BOUND", message: `Controller is already bound to active run ${boundRunId}` };
+        }
+        // 原 run 已结束后，新的请求可以领取下一席
         this.controllerRunBindings.delete(controllerInfo.controllerId);
         boundRunId = null;
       }
-      const runId = explicitRunId || boundRunId || this.claimableRunIds[0] || null;
+
+      const runId = this.claimableRunIds[0] || null;
       const run = runId ? this.getRun(runId) : null;
-      if (!run) {
-        if (explicitRunId) {
-          throw { status: 404, code: "NOT_FOUND", message: `Run not found: ${explicitRunId}` };
-        }
+      if (!run || run.status !== "armed") {
         throw { status: 409, code: "NO_AVAILABLE_RUN", message: "No armed External Play run is available" };
       }
-      if (boundRunId && explicitRunId && boundRunId !== explicitRunId) {
-        throw { status: 409, code: "CONFLICT", message: `Controller is already bound to run ${boundRunId}` };
-      }
 
-      const modelName = normalizeModelName(args.model_name, { required: run.status === "armed" });
-      if (run.modelName && modelName && run.modelName !== modelName) {
-        throw { status: 409, code: "IDENTITY_MISMATCH", message: `Run ${run.runId} is already registered as ${run.modelName}` };
-      }
-
-      const result = await run.startOrAttach(controllerInfo, operationId, abortSignal, { modelName });
+      const result = await run.start(controllerInfo, opId, abortSignal, { modelName });
       this.controllerRunBindings.set(controllerInfo.controllerId, run.runId);
       this._refreshClaimState();
+      this.claimHistory.set(claimCacheKey, { fingerprint, result });
       return result;
     });
+  }
+
+  async claimOrAttachRun(controllerInfo, args = {}, operationId = null, abortSignal = null) {
+    return await this.claimRun(controllerInfo, args, operationId, abortSignal);
+  }
+
+  _cleanExpiredResumeRequests() {
+    const now = Date.now();
+    for (const [id, req] of this.resumeRequests.entries()) {
+      if (req.status === "pending" && req.expiresAt <= now) {
+        req.status = "expired";
+      }
+    }
+  }
+
+  _formatResumePendingResponse(req, run) {
+    const host = `${this.serverHost}:${this.serverPort}`;
+    const reviewUrl = `http://${host}/external-play/${run.runId}#resume`;
+    return {
+      status: "pending_approval",
+      request_id: req.id,
+      run_id: run.runId,
+      model_name: run.modelName,
+      review_url: reviewUrl,
+      message: "Resume request submitted. Resumption must be approved by the user in the local web interface before play can continue."
+    };
+  }
+
+  _approvedResumeResponse(req, run) {
+    const lease = run?.currentLease;
+    if (!run || run.disposed || TERMINAL_STATUSES.has(run.status) ||
+        !lease || lease.expiresAt <= Date.now() ||
+        lease.controllerId !== req.controllerId ||
+        lease.leaseId !== req.approvedLease?.lease_id ||
+        lease.leaseEpoch !== req.approvedLease?.lease_epoch) {
+      req.status = "expired";
+      req.approvedLease = null;
+      if (this.controllerResumeIndex.get(req.controllerId) === req.id) {
+        this.controllerResumeIndex.delete(req.controllerId);
+      }
+      return null;
+    }
+    const observation = run.gameSession
+      ? sanitizeObservationForMcp(getBridge().sessionSnapshot(run.gameSession)) : {};
+    return {
+      status: "approved",
+      request_id: req.id,
+      run_id: run.runId,
+      run_status: run.status,
+      lease_id: lease.leaseId,
+      lease_epoch: lease.leaseEpoch,
+      lease_expires_at: new Date(lease.expiresAt).toISOString(),
+      started_at: run.startedAt,
+      ...run._startResponseMetadata(),
+      ...run._startProgressMetadata({ observation }),
+      observation
+    };
+  }
+
+  async createResumeRequest(controllerInfo, runId) {
+    if (!runId || typeof runId !== "string") {
+      throw { status: 400, code: "INVALID_ARGUMENT", message: "run_id is required" };
+    }
+    const run = this.getRun(runId);
+    if (!run) {
+      throw { status: 404, code: "NOT_FOUND", message: `Run not found: ${runId}` };
+    }
+    if (TERMINAL_STATUSES.has(run.status)) {
+      throw { status: 409, code: "CONFLICT", message: `Run ${runId} has already ended with status ${run.status}` };
+    }
+    if (run.status === "armed") {
+      throw { status: 409, code: "CONFLICT", message: `Run ${runId} is still armed; use start to claim it` };
+    }
+
+    const currentBound = this.controllerRunBindings.get(controllerInfo.controllerId);
+    if (currentBound && currentBound !== runId) {
+      const boundRun = this.getRun(currentBound);
+      if (boundRun && !TERMINAL_STATUSES.has(boundRun.status)) {
+        throw { status: 409, code: "ALREADY_BOUND", message: `Controller is already bound to active run ${currentBound}` };
+      }
+    }
+
+    this._cleanExpiredResumeRequests();
+    const now = Date.now();
+
+    // 同一 controller 对同一 run 重复申请复用同一条待审批记录；每个 controller 最多一条待审批申请，10 分钟过期
+    const existingReqId = this.controllerResumeIndex.get(controllerInfo.controllerId);
+    if (existingReqId) {
+      const existingReq = this.resumeRequests.get(existingReqId);
+      if (existingReq && existingReq.runId === runId) {
+        if (existingReq.status === "approved" && existingReq.approvedLease) {
+          const approved = this._approvedResumeResponse(existingReq, run);
+          if (approved) return approved;
+        }
+        if (existingReq.status === "pending" && existingReq.expiresAt > now) {
+          return this._formatResumePendingResponse(existingReq, run);
+        }
+      }
+      if (existingReq && existingReq.status === "pending") {
+        existingReq.status = "superseded";
+        this.resumeRequests.delete(existingReqId);
+        this.controllerResumeIndex.delete(controllerInfo.controllerId);
+      }
+    }
+
+    const requestId = `resume-${crypto.randomUUID()}`;
+    const declaredCli = controllerInfo.declaredCli || controllerInfo.clientInfo?.name || "external-mcp";
+    const isPreviousLeaseActive = Boolean(run.currentLease && run.currentLease.expiresAt > now);
+
+    const requestRecord = {
+      id: requestId,
+      runId: run.runId,
+      controllerId: controllerInfo.controllerId,
+      token: controllerInfo.token || null,
+      declaredCli,
+      clientInfo: controllerInfo.clientInfo || {},
+      createdAt: new Date(now).toISOString(),
+      expiresAt: now + 10 * 60 * 1000,
+      status: "pending",
+      previousControllerId: run.currentLease?.controllerId || null,
+      previousLeaseActive: isPreviousLeaseActive,
+      approvedLease: null
+    };
+
+    this.resumeRequests.set(requestId, requestRecord);
+    this.controllerResumeIndex.set(controllerInfo.controllerId, requestId);
+
+    return this._formatResumePendingResponse(requestRecord, run);
+  }
+
+  getResumeRequests() {
+    this._cleanExpiredResumeRequests();
+    const result = [];
+    const now = Date.now();
+    for (const req of this.resumeRequests.values()) {
+      if (req.status !== "pending") continue;
+      const run = this.getRun(req.runId);
+      if (!run || TERMINAL_STATUSES.has(run.status)) continue;
+      const isLeaseActive = Boolean(run.currentLease && run.currentLease.expiresAt > now);
+      result.push({
+        request_id: req.id,
+        run_id: req.runId,
+        entry_id: run.manifest?.group_entry_id || null,
+        group_id: run.manifest?.group_id || null,
+        model_name: run.modelName,
+        declared_cli: req.declaredCli,
+        client_info: req.clientInfo,
+        created_at: req.createdAt,
+        expires_at: new Date(req.expiresAt).toISOString(),
+        previous_lease_active: isLeaseActive,
+        status: req.status
+      });
+    }
+    return result;
+  }
+
+  async getResumeRequestStatus(controllerInfo, requestId) {
+    this._cleanExpiredResumeRequests();
+    const req = this.resumeRequests.get(requestId);
+    if (!req) {
+      throw { status: 404, code: "NOT_FOUND", message: `Resume request not found: ${requestId}` };
+    }
+    if (req.controllerId !== controllerInfo.controllerId) {
+      throw { status: 403, code: "FORBIDDEN", message: "Cannot query resume request of another controller" };
+    }
+
+    if (req.status === "pending") {
+      return {
+        status: "pending_approval",
+        request_id: req.id,
+        run_id: req.runId
+      };
+    }
+
+    if (req.status === "approved") {
+      const run = this.getRun(req.runId);
+      const approved = this._approvedResumeResponse(req, run);
+      if (approved) return approved;
+    }
+
+    return {
+      status: req.status,
+      request_id: req.id,
+      run_id: req.runId
+    };
+  }
+
+  async approveResumeRequest(requestId, options = {}) {
+    this._cleanExpiredResumeRequests();
+    const req = this.resumeRequests.get(requestId);
+    if (!req) {
+      throw { status: 404, code: "NOT_FOUND", message: `Resume request not found: ${requestId}` };
+    }
+
+    const run = this.getRun(req.runId);
+    if (!run) {
+      throw { status: 404, code: "NOT_FOUND", message: `Run not found: ${req.runId}` };
+    }
+
+    // 与认领共用绑定锁，锁顺序始终为 admission -> session。
+    return await this.admissionMutex.withLock(() => run.sessionMutex.withLock(async () => {
+      if (req.status !== "pending") {
+        throw { status: 409, code: "CONFLICT", message: `Resume request is ${req.status}` };
+      }
+      if (req.expiresAt <= Date.now()) {
+        req.status = "expired";
+        throw { status: 410, code: "EXPIRED", message: "Resume request has expired" };
+      }
+
+      if (run.disposed || TERMINAL_STATUSES.has(run.status)) {
+        throw { status: 409, code: "CONFLICT", message: `Run ${run.runId} has ended with status ${run.status}` };
+      }
+
+      // 重新验证申请者身份有效性 (解决问题 6)
+      let isTokenValid = false;
+      if (req.token) {
+        isTokenValid = Boolean(this.validateControllerToken(`Bearer ${req.token}`));
+      } else {
+        isTokenValid = Array.from(this.controllerTokens.values()).some(
+          info => info.controllerId === req.controllerId &&
+          info.instanceId === this.instanceId &&
+          Date.now() - info.createdAt <= CONTROLLER_TOKEN_TTL_MS
+        );
+      }
+      if (!isTokenValid) {
+        req.status = "expired";
+        throw { status: 410, code: "EXPIRED", message: "Applicant controller authentication has expired or is invalid" };
+      }
+
+      const currentBound = this.controllerRunBindings.get(req.controllerId);
+      if (currentBound && currentBound !== run.runId) {
+        const boundRun = this.getRun(currentBound);
+        if (boundRun && !TERMINAL_STATUSES.has(boundRun.status)) {
+          throw { status: 409, code: "ALREADY_BOUND", message: `Applicant controller is already bound to active run ${currentBound}` };
+        }
+      }
+
+      // 锁内检查当前有效租约 (解决问题 1: 并发审批绕过 force)
+      const now = Date.now();
+      const isLeaseActive = Boolean(run.currentLease && run.currentLease.expiresAt > now);
+      const isSameController = run.currentLease && run.currentLease.controllerId === req.controllerId;
+
+      if (isLeaseActive && !isSameController && !options.force) {
+        throw { status: 409, code: "LEASE_ACTIVE", message: "Existing controller lease is still active. Confirm forced takeover." };
+      }
+
+      const controllerInfo = {
+        controllerId: req.controllerId,
+        declaredCli: req.declaredCli,
+        clientInfo: req.clientInfo
+      };
+
+      const leaseResult = await run._attachApprovedLeaseLocked(
+        controllerInfo,
+        req.id,
+        Boolean(options.force),
+        options.operationId || `op-resume-${crypto.randomUUID()}`
+      );
+
+      // 已断开或超时的旧租约为空，必须按 run 清理遗留绑定。
+      for (const [controllerId, boundRunId] of this.controllerRunBindings) {
+        if (boundRunId === run.runId && controllerId !== req.controllerId) {
+          this.controllerRunBindings.delete(controllerId);
+        }
+      }
+      this.controllerRunBindings.set(req.controllerId, run.runId);
+
+      req.status = "approved";
+      req.approvedLease = leaseResult;
+
+      for (const [otherId, otherReq] of this.resumeRequests.entries()) {
+        if (otherId !== requestId && otherReq.runId === run.runId && otherReq.status === "pending") {
+          otherReq.status = "superseded";
+        }
+      }
+
+      return {
+        status: "approved",
+        request_id: req.id,
+        run_id: run.runId,
+        message: "Resume request approved successfully"
+      };
+    }));
+  }
+
+  async rejectResumeRequest(requestId) {
+    this._cleanExpiredResumeRequests();
+    const req = this.resumeRequests.get(requestId);
+    if (!req) {
+      throw { status: 404, code: "NOT_FOUND", message: `Resume request not found: ${requestId}` };
+    }
+    if (req.status !== "pending") {
+      throw { status: 409, code: "CONFLICT", message: `Resume request is already ${req.status}` };
+    }
+    req.status = "rejected";
+    this.controllerResumeIndex.delete(req.controllerId);
+    return {
+      status: "rejected",
+      request_id: req.id,
+      run_id: req.runId
+    };
   }
 
   getRun(runId) {
@@ -766,6 +1100,9 @@ class ExternalPlayService {
     }
     this.groupStore.cleanup();
     this.controllerRunBindings.clear();
+    this.resumeRequests.clear();
+    this.controllerResumeIndex.clear();
+    this.claimHistory.clear();
     this._releaseServerLock();
     this._clearServerJson();
   }
@@ -1400,12 +1737,15 @@ class RunInstance {
 
   // MCP & Action Protocol Implementation
 
-  async startOrAttach(controllerInfo, operationId = null, abortSignal = null, startOptions = {}) {
+  async start(controllerInfo, operationId = null, abortSignal = null, startOptions = {}) {
     return await this.sessionMutex.withLock(async () => {
       if (abortSignal?.aborted) {
         throw { status: 499, code: "REQUEST_CANCELLED", message: "Request cancelled before WAL commit" };
       }
-      const requestedModelName = normalizeModelName(startOptions.modelName, { required: this.status === "armed" });
+      if (this.status !== "armed") {
+        throw { status: 409, code: "CONFLICT", message: `Run ${this.runId} is ${this.status}, cannot start` };
+      }
+      const requestedModelName = normalizeModelName(startOptions.modelName, { required: true });
       if (this.modelName && requestedModelName && this.modelName !== requestedModelName) {
         throw { status: 409, code: "IDENTITY_MISMATCH", message: `Run ${this.runId} is already registered as ${this.modelName}` };
       }
@@ -1414,6 +1754,9 @@ class RunInstance {
 
       if (this.operationIndex.has(opId)) {
         const cached = this.operationIndex.get(opId);
+        if (cached.start_response) {
+          return cached.start_response;
+        }
         const currentObs = this.gameSession ? sanitizeObservationForMcp(getBridge().sessionSnapshot(this.gameSession)) : {};
         return {
           run_id: this.runId,
@@ -1422,160 +1765,194 @@ class RunInstance {
           lease_epoch: cached.lease_epoch,
           lease_expires_at: cached.lease_expires_at,
           started_at: this.startedAt,
-          ...this._startProgressMetadata({ observation: currentObs }),
+          ...this._startProgressMetadata({ observation: currentObs, status: this.status }),
           ...this._startResponseMetadata(),
           observation: cached.observation || currentObs,
           sanitized_result: cached.initial_sanitized_result || cached.sanitized_result
         };
       }
 
-      if (this.status === "armed") {
-        const leaseId = `lease-${crypto.randomUUID()}`;
-        const startedAt = new Date().toISOString();
-        const deadlineAt = this.maxActions ? null : new Date(Date.now() + this.durationMs).toISOString();
-        const expiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
-        const declaredCli = controllerInfo?.declaredCli || controllerInfo?.name || "stdio-mcp";
+      const leaseId = `lease-${crypto.randomUUID()}`;
+      const startedAt = new Date().toISOString();
+      const deadlineAt = this.maxActions ? null : new Date(Date.now() + this.durationMs).toISOString();
+      const expiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
+      const declaredCli = controllerInfo?.declaredCli || controllerInfo?.clientInfo?.name || "stdio-mcp";
 
-        const initialObs = this.gameSession ? sanitizeObservationForMcp(getBridge().sessionSnapshot(this.gameSession)) : {};
-        const sanitizedResult = {
-          resultType: "complete",
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                run_id: this.runId,
-                status: "active",
-                ...this._startResponseMetadata({ modelName: requestedModelName, harnessName: declaredCli }),
-                ...this._startProgressMetadata({ deadlineAt, observation: initialObs, status: "active" }),
-                observation: initialObs,
-              })
-            }
-          ],
-          isError: false
-        };
-
-        const startedRecord = {
-          journal_seq: this.lastJournalSeq + 1,
-          timestamp: startedAt,
-          run_id: this.runId,
-          type: "run_started",
-          operation_id: opId,
-          request_fingerprint: fingerprint,
-          controller_id: controllerInfo.controllerId,
-          declared_cli: declaredCli,
-          model_name: requestedModelName,
-          lease_id: leaseId,
-          lease_epoch: 1,
-          started_at: startedAt,
-          ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: deadlineAt }),
-          lease_expires_at: expiresAt,
-          initial_sanitized_result: sanitizedResult
-        };
-
-        await this.appendJournalRecord(startedRecord);
-
-        return {
-          run_id: this.runId,
-          status: "active",
-          lease_id: leaseId,
-          lease_epoch: 1,
-          lease_expires_at: expiresAt,
-          started_at: startedAt,
-          ...this._startProgressMetadata({ deadlineAt, observation: initialObs, status: "active" }),
-          ...this._startResponseMetadata(),
-          observation: initialObs,
-          sanitized_result: sanitizedResult
-        };
-      }
-
-      if (this.status === "active") {
-        // If current lease is active and held by another controller, 409
-        if (this.currentLease && this.currentLease.expiresAt > Date.now()) {
-          if (this.currentLease.controllerId !== controllerInfo.controllerId) {
-            throw { status: 409, code: "CONFLICT", message: "Run is actively leased by another controller" };
+      const initialObs = this.gameSession ? sanitizeObservationForMcp(getBridge().sessionSnapshot(this.gameSession)) : {};
+      const sanitizedResult = {
+        resultType: "complete",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              run_id: this.runId,
+              status: "active",
+              ...this._startResponseMetadata({ modelName: requestedModelName, harnessName: declaredCli }),
+              ...this._startProgressMetadata({ deadlineAt, observation: initialObs, status: "active" }),
+              observation: initialObs,
+            })
           }
-          // Same controller re-attaches
-          const currentObs = this.gameSession ? sanitizeObservationForMcp(getBridge().sessionSnapshot(this.gameSession)) : {};
-          return {
-            run_id: this.runId,
-            status: "active",
-            lease_id: this.currentLease.leaseId,
-            lease_epoch: this.currentLease.leaseEpoch,
-            lease_expires_at: new Date(this.currentLease.expiresAt).toISOString(),
-            started_at: this.startedAt,
-            ...this._startProgressMetadata({ observation: currentObs, status: "active" }),
-            ...this._startResponseMetadata(),
-            observation: currentObs
-          };
-        }
+        ],
+        isError: false
+      };
 
-        // The timer may be queued behind this same mutation lock.  Close an
-        // expired lease in the WAL before attaching its successor so recovery
-        // never observes two lease lifecycles joined without a revocation.
-        if (this.currentLease) {
-          const expiredLease = this.currentLease;
-          const revokeRecord = {
-            journal_seq: this.lastJournalSeq + 1,
-            timestamp: new Date().toISOString(),
-            run_id: this.runId,
-            type: "lease_revoked",
-            operation_id: `attach-expired-revoke-${crypto.randomUUID()}`,
-            request_fingerprint: "0".repeat(64),
-            controller_id: expiredLease.controllerId,
-            lease_id: expiredLease.leaseId,
-            lease_epoch: expiredLease.leaseEpoch,
-            reason: "heartbeat_timeout",
-            sanitized_result: {
-              resultType: "complete",
-              content: [{ type: "text", text: "Expired lease revoked before controller attach" }],
-              isError: true
-            }
-          };
-          await this.appendJournalRecord(revokeRecord);
-        }
+      const startedRecord = {
+        journal_seq: this.lastJournalSeq + 1,
+        timestamp: startedAt,
+        run_id: this.runId,
+        type: "run_started",
+        operation_id: opId,
+        request_fingerprint: fingerprint,
+        controller_id: controllerInfo.controllerId,
+        declared_cli: declaredCli,
+        model_name: requestedModelName,
+        lease_id: leaseId,
+        lease_epoch: 1,
+        started_at: startedAt,
+        ...(this.maxActions ? { max_actions: this.maxActions } : { deadline_at: deadlineAt }),
+        lease_expires_at: expiresAt,
+        initial_sanitized_result: sanitizedResult
+      };
 
-        // Attach with new epoch
-        const nextEpoch = this.maxLeaseEpoch + 1;
-        const leaseId = `lease-${crypto.randomUUID()}`;
-        const expiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
-        const declaredCli = controllerInfo?.declaredCli || controllerInfo?.name || this.declaredCli || "stdio-mcp";
-        this.declaredCli = declaredCli;
+      await this.appendJournalRecord(startedRecord);
 
-        const attachedRecord = {
+      const startResult = {
+        run_id: this.runId,
+        status: "active",
+        lease_id: leaseId,
+        lease_epoch: 1,
+        lease_expires_at: expiresAt,
+        started_at: startedAt,
+        ...this._startProgressMetadata({ deadlineAt, observation: initialObs, status: "active" }),
+        ...this._startResponseMetadata(),
+        observation: initialObs,
+        sanitized_result: sanitizedResult
+      };
+      startedRecord.start_response = startResult;
+
+      return startResult;
+    });
+  }
+
+  async attachApprovedLease(controllerInfo, requestId, forced = false, operationId = null) {
+    return await this.sessionMutex.withLock(async () => {
+      return await this._attachApprovedLeaseLocked(controllerInfo, requestId, forced, operationId);
+    });
+  }
+
+  async _attachApprovedLeaseLocked(controllerInfo, requestId, forced = false, operationId = null) {
+    if (this.disposed || TERMINAL_STATUSES.has(this.status)) {
+      throw { status: 409, code: "CONFLICT", message: `Run ${this.runId} is ${this.status}, cannot resume` };
+    }
+
+      const opId = operationId || `op-resume-${crypto.randomUUID()}`;
+      const fingerprint = crypto.createHash("sha256").update(JSON.stringify({ opId, requestId, forced })).digest("hex");
+      const previousControllerId = this.currentLease ? this.currentLease.controllerId : null;
+
+      if (this.currentLease) {
+        const expiredOrRevokedLease = this.currentLease;
+        const revokeRecord = {
           journal_seq: this.lastJournalSeq + 1,
           timestamp: new Date().toISOString(),
           run_id: this.runId,
-          type: "lease_attached",
-          operation_id: opId,
-          request_fingerprint: fingerprint,
-          controller_id: controllerInfo.controllerId,
-          declared_cli: declaredCli,
-          lease_id: leaseId,
-          lease_epoch: nextEpoch,
-          lease_expires_at: expiresAt,
+          type: "lease_revoked",
+          operation_id: `revoke-${opId}`,
+          request_fingerprint: "0".repeat(64),
+          controller_id: expiredOrRevokedLease.controllerId,
+          lease_id: expiredOrRevokedLease.leaseId,
+          lease_epoch: expiredOrRevokedLease.leaseEpoch,
+          reason: forced ? "forced_takeover" : "authorized_resumption",
           sanitized_result: {
             resultType: "complete",
-            content: [{ type: "text", text: `Lease attached at epoch ${nextEpoch}` }],
-            isError: false
+            content: [{ type: "text", text: "Lease superseded by authorized resumption" }],
+            isError: true
           }
         };
+        await this.appendJournalRecord(revokeRecord);
+      }
 
-        await this.appendJournalRecord(attachedRecord);
+      const nextEpoch = Math.max(2, (this.maxLeaseEpoch || 1) + 1);
+      const nextLeaseId = `lease-${crypto.randomUUID()}`;
+      const expiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
+      const declaredCli = controllerInfo?.declaredCli || controllerInfo?.clientInfo?.name || this.declaredCli || "stdio-mcp";
 
+      const currentObs = this.gameSession ? sanitizeObservationForMcp(getBridge().sessionSnapshot(this.gameSession)) : {};
+      const sanitizedResult = {
+        resultType: "complete",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              run_id: this.runId,
+              status: this.status,
+              ...this._startResponseMetadata(),
+              ...this._startProgressMetadata({ observation: currentObs, status: this.status }),
+              observation: currentObs
+            })
+          }
+        ],
+        isError: false
+      };
+
+      const attachedRecord = {
+        journal_seq: this.lastJournalSeq + 1,
+        timestamp: new Date().toISOString(),
+        run_id: this.runId,
+        type: "lease_attached",
+        operation_id: opId,
+        request_fingerprint: fingerprint,
+        controller_id: controllerInfo.controllerId,
+        declared_cli: declaredCli,
+        lease_id: nextLeaseId,
+        lease_epoch: nextEpoch,
+        lease_expires_at: expiresAt,
+        request_id: requestId,
+        previous_controller_id: previousControllerId,
+        forced: Boolean(forced),
+        sanitized_result: sanitizedResult
+      };
+
+      await this.appendJournalRecord(attachedRecord);
+
+      return {
+        run_id: this.runId,
+        status: this.status,
+        lease_id: nextLeaseId,
+        lease_epoch: nextEpoch,
+        lease_expires_at: expiresAt,
+        started_at: this.startedAt,
+        ...this._startProgressMetadata({ observation: currentObs, status: this.status }),
+        ...this._startResponseMetadata(),
+        observation: currentObs,
+        sanitized_result: sanitizedResult
+      };
+    }
+
+  async startOrAttach(controllerInfo, operationId = null, abortSignal = null, startOptions = {}) {
+    if (operationId && this.operationIndex.has(operationId)) {
+      const cached = this.operationIndex.get(operationId);
+      if (cached.start_response) {
+        return cached.start_response;
+      }
+    }
+    if (this.status === "armed") {
+      return await this.start(controllerInfo, operationId, abortSignal, startOptions);
+    }
+    return await this.sessionMutex.withLock(async () => {
+      if (this.status === "active" && this.currentLease?.controllerId === controllerInfo.controllerId) {
         const currentObs = this.gameSession ? sanitizeObservationForMcp(getBridge().sessionSnapshot(this.gameSession)) : {};
         return {
           run_id: this.runId,
           status: "active",
-          lease_id: leaseId,
-          lease_epoch: nextEpoch,
-          lease_expires_at: expiresAt,
+          lease_id: this.currentLease.leaseId,
+          lease_epoch: this.currentLease.leaseEpoch,
+          lease_expires_at: new Date(this.currentLease.expiresAt).toISOString(),
           started_at: this.startedAt,
           ...this._startProgressMetadata({ observation: currentObs, status: "active" }),
           ...this._startResponseMetadata(),
           observation: currentObs
         };
       }
-
       throw { status: 409, code: "CONFLICT", message: `Cannot start or attach to run in status ${this.status}` };
     });
   }
@@ -1636,12 +2013,17 @@ class RunInstance {
     });
   }
 
-  async observe() {
+  async observe(controllerInfo = null) {
     // Two-phase lock-free observe protocol
     let currentJ = 0;
     await this.sessionMutex.withLock(async () => {
       if (this.status !== "active" && this.status !== "finalizing") {
         throw { status: 409, code: "CONFLICT", message: `Run is ${this.status}, cannot observe` };
+      }
+      if (controllerInfo) {
+        if (!this.currentLease || this.currentLease.controllerId !== controllerInfo.controllerId) {
+          throw { status: 409, code: "CONFLICT", message: "Run is not leased by this controller" };
+        }
       }
       currentJ = this.lastJournalSeq;
     });
@@ -1672,15 +2054,7 @@ class RunInstance {
       if (abortSignal?.aborted) {
         throw { status: 499, code: "REQUEST_CANCELLED", message: "Request cancelled before WAL commit" };
       }
-      const opId = operationId || `op-${crypto.randomUUID()}`;
-      const fingerprint = crypto.createHash("sha256").update(opId).digest("hex");
-
-      if (this.operationIndex.has(opId)) {
-        const cached = this.operationIndex.get(opId);
-        return cached.sanitized_result || cached.final_response;
-      }
-
-      // Check Active & Lease
+      // 租约失效或被接管后，不返回旧租约缓存，也不重新执行已提交动作
       if (this.status !== "active") {
         throw { status: 409, code: "CONFLICT", message: `Run is ${this.status}, cannot execute actions` };
       }
@@ -1691,6 +2065,20 @@ class RunInstance {
         this.currentLease.leaseEpoch !== leaseEpoch
       ) {
         throw { status: 409, code: "CONFLICT", message: "Invalid lease credentials or epoch" };
+      }
+
+      const opId = operationId || `op-${crypto.randomUUID()}`;
+      const fingerprint = crypto.createHash("sha256").update(JSON.stringify({
+        tool,
+        args: args || {}
+      })).digest("hex");
+
+      if (this.operationIndex.has(opId)) {
+        const cached = this.operationIndex.get(opId);
+        if (cached.controller_id !== controllerInfo.controllerId || (cached.request_fingerprint && cached.request_fingerprint !== fingerprint)) {
+          throw { status: 409, code: "IDEMPOTENCY_CONFLICT", message: "Operation ID already used with different arguments or controller" };
+        }
+        return cached.sanitized_result || cached.final_response;
       }
 
       if (this.maxActions && this.lastActionSeq >= this.maxActions) {

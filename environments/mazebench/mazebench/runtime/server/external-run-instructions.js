@@ -1,4 +1,4 @@
-const INSTRUCTIONS_VERSION = "external-mcp-v1";
+const INSTRUCTIONS_VERSION = "external-mcp-v2";
 
 function normalizeModelName(value, { required = false } = {}) {
   if (value === undefined || value === null) {
@@ -29,7 +29,7 @@ function buildRunInstructions(run) {
     : `This run ends at its server-enforced deadline after ${Math.round(Number(run.durationMs || 0) / 1000)} seconds.`;
 
   return `You are controlling an authoritative MazeBench 3D grid game through the configured MCP server.
-Use only the MazeBench game tools to change game state. The start call has already claimed this run; do not call start again unless reconnecting.
+Use only the MazeBench game tools to change game state. The start call has already claimed this run; do not call start again. To resume an existing session across connections, call resume({ run_id }) and wait for user approval.
 
 Goal: explore as many unique rooms and collect as many unique gems as possible. ${budget}
 Continue taking actions until the server reports ended=true, the maze is won, or no legal recovery remains. Do not stop merely to ask the user for an ordinary movement decision.

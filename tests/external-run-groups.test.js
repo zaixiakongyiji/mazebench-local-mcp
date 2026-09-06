@@ -53,62 +53,66 @@ async function runTests() {
     const standalone = await service.createRun({ maxActions: 1 });
     const standaloneController = await createController(service, "codex-test-harness");
     await assert.rejects(
-      service.claimOrAttachRun(standaloneController, {}, "missing-model"),
+      service.claimRun(standaloneController, {}, "missing-model"),
       (error) => error?.status === 400 && error?.code === "INVALID_ARGUMENT"
     );
     await assert.rejects(
-      service.claimOrAttachRun(standaloneController, { model_name: "bad\nname" }, "bad-model"),
+      service.claimRun(standaloneController, { model_name: "bad\nname" }, "bad-model"),
       (error) => error?.status === 400 && error?.code === "INVALID_ARGUMENT"
     );
     await assert.rejects(
-      service.claimOrAttachRun(standaloneController, { model_name: "x".repeat(129) }, "long-model"),
+      service.claimRun(standaloneController, { model_name: "x".repeat(129) }, "long-model"),
       (error) => error?.status === 400 && error?.code === "INVALID_ARGUMENT"
     );
     await assert.rejects(
-      service.claimOrAttachRun(standaloneController, {
+      service.claimRun(standaloneController, {
         run_id: "ext-00000000-0000-4000-8000-000000000000",
         model_name: "missing-run"
       }, "missing-run"),
-      (error) => error?.status === 404 && error?.code === "NOT_FOUND"
+      (error) => error?.status === 400 && error?.code === "INVALID_ARGUMENT"
     );
 
-    const standaloneStart = await service.claimOrAttachRun(
+    const standaloneStart = await service.claimRun(
       standaloneController,
       { model_name: "  gpt-5.6  " },
       "standalone-start"
     );
     assert.equal(standaloneStart.model_name, "gpt-5.6");
     assert.equal(standaloneStart.harness, "codex-test-harness");
-    assert.equal(standaloneStart.instructions_version, "external-mcp-v1");
+    assert.equal(standaloneStart.instructions_version, "external-mcp-v2");
     assert.match(standaloneStart.run_instructions, /at most 1 game actions/);
     assert.ok(standaloneStart.observation?.current_room);
 
-    const repeatAttach = await service.claimOrAttachRun(standaloneController, {}, "standalone-attach");
+    // Idempotent retry with same operation_id returns cached start response
+    const repeatAttach = await service.claimRun(standaloneController, { model_name: "gpt-5.6" }, "standalone-start");
     assert.equal(repeatAttach.run_id, standalone.runId);
     assert.equal(repeatAttach.model_name, "gpt-5.6");
 
-    const identityController = await createController(service, "another-harness");
+    // Already bound controller calling start again returns 409 ALREADY_BOUND
     await assert.rejects(
-      service.claimOrAttachRun(identityController, {
-        run_id: standalone.runId,
-        model_name: "different-model"
-      }, "identity-mismatch"),
-      (error) => error?.status === 409 && error?.code === "IDENTITY_MISMATCH"
+      service.claimRun(standaloneController, { model_name: "gpt-5.6" }, "another-start-op"),
+      (error) => error?.status === 409 && error?.code === "ALREADY_BOUND"
     );
 
-    standalone.currentLease.expiresAt = Date.now() - 1;
+    // Cross-session recovery via resume request and approval
     const recoveryController = await createController(service, "recovery-harness");
-    const recoveredAttach = await service.claimOrAttachRun(recoveryController, {
-      run_id: standalone.runId,
-      model_name: "gpt-5.6"
-    }, "standalone-recovery");
-    assert.equal(recoveredAttach.lease_epoch, 2);
-    assert.equal(recoveredAttach.harness, "codex-test-harness", "The registered harness must remain immutable");
+    const resumeReq = await service.createResumeRequest(recoveryController, standalone.runId);
+    assert.equal(resumeReq.status, "pending_approval");
+    assert.ok(resumeReq.request_id);
+
+    // Approve with force: true
+    const approveRes = await service.approveResumeRequest(resumeReq.request_id, { force: true });
+    assert.equal(approveRes.status, "approved");
+
+    const statusRes = await service.getResumeRequestStatus(recoveryController, resumeReq.request_id);
+    assert.equal(statusRes.status, "approved");
+    assert.equal(statusRes.lease_epoch, 2);
+    assert.equal(statusRes.harness, "codex-test-harness", "The registered harness must remain immutable");
 
     await standalone.executeAction(
       recoveryController,
-      recoveredAttach.lease_id,
-      recoveredAttach.lease_epoch,
+      statusRes.lease_id,
+      statusRes.lease_epoch,
       "rotate_camera_left",
       {},
       "standalone-action"
@@ -134,7 +138,7 @@ async function runTests() {
     for (let index = 0; index < 8; index += 1) {
       controllers.push(await createController(service, `harness-${index + 1}`));
     }
-    const starts = await Promise.all(controllers.map((controller, index) => service.claimOrAttachRun(
+    const starts = await Promise.all(controllers.map((controller, index) => service.claimRun(
       controller,
       { model_name: index < 2 ? "duplicate-model" : `model-${index + 1}` },
       `group-start-${index + 1}`
@@ -146,7 +150,7 @@ async function runTests() {
 
     const overflowController = await createController(service, "overflow-harness");
     await assert.rejects(
-      service.claimOrAttachRun(overflowController, { model_name: "overflow-model" }, "overflow-start"),
+      service.claimRun(overflowController, { model_name: "overflow-model" }, "overflow-start"),
       (error) => error?.status === 409 && error?.code === "NO_AVAILABLE_RUN"
     );
 

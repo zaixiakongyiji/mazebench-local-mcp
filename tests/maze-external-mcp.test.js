@@ -7,6 +7,57 @@ const http = require("node:http");
 const readline = require("node:readline");
 
 const { createRequestHandler, externalPlay } = require("../server/app");
+const { StdioMcpAdapter } = require("../scripts/maze-external-mcp");
+
+async function testResumePollingLifecycle() {
+  console.log("  [Unit] Resume polling approval, rejection, expiry, disconnect and late responses");
+  const schedulePoll = (adapter) => {
+    let callback;
+    const original = global.setTimeout;
+    global.setTimeout = (fn, delay) => {
+      assert.equal(delay, 2000);
+      callback = fn;
+      return null;
+    };
+    try {
+      adapter.startResumePolling("resume-unit");
+    } finally {
+      global.setTimeout = original;
+    }
+    return callback;
+  };
+  for (const status of ["approved", "rejected", "expired", "superseded", "unauthorized", "disconnected", "late"]) {
+    const adapter = new StdioMcpAdapter();
+    adapter.controllerToken = "test-token";
+    adapter.claimedState = "test-run";
+    adapter.authorizationRequired = true;
+    let heartbeats = 0;
+    adapter.startHeartbeat = () => { heartbeats += 1; };
+    let resolveLate;
+    const approval = { status: "approved", run_id: "test-run", lease_id: "new-lease", lease_epoch: 2 };
+    adapter.httpRequest = async () => {
+      if (status === "unauthorized") throw Object.assign(new Error("Unauthorized"), { statusCode: 401 });
+      if (status === "disconnected") throw new Error("Connection closed");
+      if (status === "late") return new Promise((resolve) => { resolveLate = resolve; });
+      return { ...approval, status };
+    };
+    try {
+      const poll = schedulePoll(adapter);
+      const result = poll();
+      if (status === "late") {
+        await adapter.detach();
+        resolveLate(approval);
+      }
+      await result;
+      assert.equal(adapter.pendingResume, null);
+      assert.equal(heartbeats, status === "approved" ? 1 : 0);
+      assert.equal(adapter.authorizationRequired, status !== "approved");
+      assert.equal(adapter.leaseId, status === "approved" ? "new-lease" : null);
+    } finally {
+      adapter.stopResumePolling();
+    }
+  }
+}
 
 class TestJsonRpcClient {
   constructor(childProc) {
@@ -68,6 +119,7 @@ class TestJsonRpcClient {
 
 async function runMcpTests() {
   console.log("Starting maze-external-mcp stdio adapter tests...");
+  await testResumePollingLifecycle();
 
   const testDataHome = fs.mkdtempSync(path.join(os.tmpdir(), "mazebench-mcp-test-"));
   process.env.MAZEBENCH_DATA_HOME = testDataHome;
@@ -164,15 +216,16 @@ async function runMcpTests() {
     assert.ok(pingRes.result);
 
     // 5. Tools List verification
-    console.log("  [Test 5] Tools list contains all 14 tools");
+    console.log("  [Test 5] Tools list contains all 15 tools");
     const toolsRes = await client.sendRequest(5, "tools/list", {});
     assert.ok(toolsRes.result);
     assert.ok(Array.isArray(toolsRes.result.tools));
-    assert.equal(toolsRes.result.tools.length, 14);
+    assert.equal(toolsRes.result.tools.length, 15);
 
     const toolNames = toolsRes.result.tools.map((t) => t.name);
     const expected = [
       "start",
+      "resume",
       "observe",
       "up",
       "down",
@@ -214,7 +267,7 @@ async function runMcpTests() {
     assert.equal(startPayload.model_name, "Test Model");
     assert.equal(startPayload.harness, "测试客户端-claude-desktop");
     assert.match(startPayload.run_instructions, /action_sequence/);
-    assert.equal(startPayload.instructions_version, "external-mcp-v1");
+    assert.equal(startPayload.instructions_version, "external-mcp-v2");
     assert.ok(startPayload.observation, "start must return observation");
     assert.ok(startPayload.observation.player, "start observation must include player");
     assert.ok(startPayload.observation.current_room, "start observation must include current_room");
@@ -290,16 +343,24 @@ async function runMcpTests() {
     assert.equal(sequencePayload.ended, false);
     assert.ok(sequencePayload.final_observation?.level);
 
-    const resumedStartRes = await client.sendRequest(123, "tools/call", {
+    // Calling start again on the same controller while bound to an active run must return 409 ALREADY_BOUND
+    const reboundStartRes = await client.sendRequest(123, "tools/call", {
       name: "start",
+      arguments: { model_name: "Test Model" }
+    });
+    assert.equal(reboundStartRes.result?.isError, true);
+    assert.match(reboundStartRes.result.content[0].text, /already bound/i);
+
+    const observeAfterSeq = await client.sendRequest(124, "tools/call", {
+      name: "observe",
       arguments: {}
     });
-    assert.equal(resumedStartRes.result?.isError, false);
-    const resumedStartPayload = JSON.parse(resumedStartRes.result.content[0].text);
-    assert.equal(resumedStartPayload.action_seq, externalPlay.getRun(startPayload.run_id).lastActionSeq);
-    assert.equal(resumedStartPayload.actions_remaining, 256 - resumedStartPayload.action_seq);
-    assert.equal(resumedStartPayload.game_won, false);
-    assert.equal(resumedStartPayload.ended, false);
+    assert.equal(observeAfterSeq.result?.isError, false);
+    const obsAfterSeqPayload = JSON.parse(observeAfterSeq.result.content[0].text);
+    assert.equal(obsAfterSeqPayload.action_seq, externalPlay.getRun(startPayload.run_id).lastActionSeq);
+    assert.equal(obsAfterSeqPayload.status, "active");
+    assert.equal(obsAfterSeqPayload.ended, false);
+    assert.equal(obsAfterSeqPayload.observation?.game_won, false);
 
     // 10. Cancel notification handling
     console.log("  [Test 10] notifications/cancelled handling");
@@ -358,8 +419,8 @@ async function runMcpTests() {
     assert.ok(reconfigPayload.time_remaining_ms > 0);
     assert.equal(reconfigPayload.max_actions, undefined);
 
-    // 12. Explicit run_id argument support
-    console.log("  [Test 12] Explicit run_id argument support for start");
+    // 12. Rejection of run_id in start and cross-session resumption via resume
+    console.log("  [Test 12] start rejects run_id and resume attaches across sessions");
     // Finalize replacement run
     await replacementRun._startFinalize("won", "test completed");
     while (replacementRun.status === "finalizing") {
@@ -367,15 +428,79 @@ async function runMcpTests() {
     }
     // Create new armed run
     const explicitRun = await externalPlay.createRun({ durationMs: 1800000 });
-    const explicitStartRes = await client.sendRequest(16, "tools/call", {
+
+    // 12a. Calling start with run_id must be rejected
+    const rejectedStartWithRunId = await client.sendRequest(16, "tools/call", {
       name: "start",
       arguments: { run_id: explicitRun.runId, model_name: "Explicit Model" }
+    });
+    assert.ok(rejectedStartWithRunId.error || rejectedStartWithRunId.result?.isError);
+
+    // 12b. Calling start without run_id succeeds
+    const explicitStartRes = await client.sendRequest(161, "tools/call", {
+      name: "start",
+      arguments: { model_name: "Explicit Model" }
     });
     assert.ok(explicitStartRes.result);
     assert.equal(explicitStartRes.result.isError, false);
     const explicitPayload = JSON.parse(explicitStartRes.result.content[0].text);
     assert.equal(explicitPayload.run_id, explicitRun.runId);
     assert.equal(explicitPayload.status, "active");
+
+    // 12c. Another client resumes the run via resume({ run_id }) and approval
+    const resumeChild = spawn(process.execPath, [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")], {
+      env: { ...process.env, MAZEBENCH_DATA_HOME: testDataHome },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    try {
+      const resumeClient = new TestJsonRpcClient(resumeChild);
+      await resumeClient.sendRequest(162, "initialize", {
+        protocolVersion: "2025-11-25",
+        clientInfo: { name: "resume-harness", version: "1.0.0" }
+      });
+
+      // 首次调用 resume({ run_id }) 立即返回 pending_approval 与 review_url
+      const initialResumeRes = await resumeClient.sendRequest(163, "tools/call", {
+        name: "resume",
+        arguments: { run_id: explicitRun.runId }
+      });
+      assert.ok(initialResumeRes.result);
+      assert.equal(initialResumeRes.result.isError, false);
+      const pendingPayload = JSON.parse(initialResumeRes.result.content[0].text);
+      assert.equal(pendingPayload.status, "pending_approval");
+      assert.equal(pendingPayload.run_id, explicitRun.runId);
+      assert.ok(pendingPayload.review_url);
+      assert.match(pendingPayload.review_url, /#resume$/);
+
+      const requests = externalPlay.getResumeRequests();
+      const pendingReq = requests.find((r) => r.run_id === explicitRun.runId && r.status === "pending");
+      assert.ok(pendingReq, "pending resume request must exist");
+
+      // 本地网页端批准（带 force: true 强制接管）
+      await externalPlay.approveResumeRequest(pendingReq.request_id, { force: true });
+
+      // 不再次调用 resume，后台轮询也必须完成接管。
+      const pollDeadline = Date.now() + 5000;
+      let observed;
+      do {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        observed = await resumeClient.sendRequest(1640, "tools/call", { name: "observe", arguments: {} });
+      } while (observed.result?.isError && Date.now() < pollDeadline);
+      assert.equal(observed.result?.isError, false, "Background polling must attach without a second resume call");
+
+      // 重复 resume 返回最新提示词与观察，不另建租约。
+      const approvedResumeRes = await resumeClient.sendRequest(164, "tools/call", {
+        name: "resume",
+        arguments: { run_id: explicitRun.runId }
+      });
+      assert.ok(approvedResumeRes.result);
+      assert.equal(approvedResumeRes.result.isError, false);
+      const resumePayload = JSON.parse(approvedResumeRes.result.content[0].text);
+      assert.equal(resumePayload.run_id, explicitRun.runId);
+      assert.equal(resumePayload.status, "active");
+    } finally {
+      resumeChild.kill();
+    }
 
     // 13. Starting without a manually created run must not add a record
     console.log("  [Test 13] Start stays idle when all runs are terminal");
@@ -388,7 +513,7 @@ async function runMcpTests() {
     externalPlay.defaultMaxActions = 2;
     const rejectedStartRes = await client.sendRequest(17, "tools/call", {
       name: "start",
-      arguments: {}
+      arguments: { model_name: "Idle Test Model" }
     });
     assert.equal(rejectedStartRes.result?.isError, true);
     assert.match(rejectedStartRes.result.content[0].text, /No armed External Play run is available/);
@@ -400,7 +525,7 @@ async function runMcpTests() {
     const terminalSequenceRun = await externalPlay.createRun({ maxActions: 2 });
     const terminalSequenceStartRes = await client.sendRequest(18, "tools/call", {
       name: "start",
-      arguments: { run_id: terminalSequenceRun.runId, model_name: "Sequence Model" }
+      arguments: { model_name: "Sequence Model" }
     });
     assert.equal(terminalSequenceStartRes.result?.isError, false);
     const terminalSequenceRes = await client.sendRequest(19, "tools/call", {
@@ -455,6 +580,64 @@ async function runMcpTests() {
       );
     } finally {
       concurrentChildren.forEach((proc) => proc.kill("SIGTERM"));
+    }
+
+    // 16. MAZEBENCH_LOCAL_MCP_TOKEN deprecated check
+    console.log("  [Test 16] MAZEBENCH_LOCAL_MCP_TOKEN environment variable is deprecated and aborts startup");
+    const deprecatedTokenChild = spawn(process.execPath, [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")], {
+      env: { ...process.env, MAZEBENCH_DATA_HOME: testDataHome, MAZEBENCH_LOCAL_MCP_TOKEN: "legacy-token" },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    const exitCode = await new Promise((resolve) => {
+      deprecatedTokenChild.on("exit", (code) => resolve(code));
+    });
+    assert.equal(exitCode, 1);
+
+    console.log("  [Test 17] Repeated start after auth loss cannot claim another seat; approved resume restores play");
+    const recoveryGroup = await externalPlay.createGroup({ mode: "concurrent", count: 2, maxActions: 100 });
+    const recoveryChild = spawn(process.execPath, [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")], {
+      env: { ...process.env, MAZEBENCH_DATA_HOME: testDataHome },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    try {
+      const recoveryClient = new TestJsonRpcClient(recoveryChild);
+      await recoveryClient.sendRequest(500, "initialize", {
+        protocolVersion: "2025-06-18", clientInfo: { name: "auth-loss-client" }
+      });
+      const claimed = await recoveryClient.sendRequest(501, "tools/call", { name: "start", arguments: { model_name: "Auth model" } });
+      const runId = JSON.parse(claimed.result.content[0].text).run_id;
+      const run = externalPlay.getRun(runId);
+      const oldControllerId = run.currentLease.controllerId;
+      for (const [token, info] of externalPlay.controllerTokens) {
+        if (info.controllerId === oldControllerId) externalPlay.controllerTokens.delete(token);
+      }
+      const tokenCount = externalPlay.controllerTokens.size;
+      for (const id of [502, 503, 504]) {
+        const denied = await recoveryClient.sendRequest(id, "tools/call", { name: "start", arguments: { model_name: "Another model" } });
+        assert.equal(denied.result?.isError, true);
+        assert.match(denied.result.content[0].text, /resume/i);
+      }
+      assert.equal(externalPlay.controllerTokens.size, tokenCount, "Retries must not create a controller");
+      const spare = recoveryGroup.entries.find((entry) => entry.run_id !== runId);
+      assert.equal(externalPlay.getRun(spare.run_id).status, "armed");
+      const pending = await recoveryClient.sendRequest(505, "tools/call", { name: "resume", arguments: { run_id: runId } });
+      const pendingPayload = JSON.parse(pending.result.content[0].text);
+      assert.equal(pendingPayload.status, "pending_approval");
+      const denied = await recoveryClient.sendRequest(506, "tools/call", { name: "start", arguments: { model_name: "Another model" } });
+      assert.equal(denied.result?.isError, true, "A newly negotiated token must not bypass pending approval");
+      await externalPlay.approveResumeRequest(pendingPayload.request_id, { force: true });
+      const initialExpiry = run.currentLease.expiresAt;
+      const heartbeatDeadline = Date.now() + 16000;
+      while (run.currentLease.expiresAt <= initialExpiry && Date.now() < heartbeatDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.ok(run.currentLease.expiresAt > initialExpiry, "Approval must automatically start heartbeat without another tool call");
+      const moved = await recoveryClient.sendRequest(507, "tools/call", { name: "rotate_camera_left", arguments: {} });
+      assert.equal(moved.result?.isError, false);
+      assert.equal(run.lastActionSeq, 1);
+      assert.equal(externalPlay.getRun(spare.run_id).status, "armed");
+    } finally {
+      recoveryChild.kill("SIGTERM");
     }
 
     console.log("All maze-external-mcp stdio adapter tests PASSED!");

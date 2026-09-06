@@ -373,6 +373,41 @@ async function runBrowserTest() {
     assert.equal(blobNegativeResults.invalidViewerStateRejected, true, "Malformed viewer_state must be rejected by validator");
     assert.equal(blobNegativeResults.invalidSummaryRejected, true, "Malformed summary must be rejected by validator");
 
+    // 9. Test Resume Request approval & forced takeover confirmation dialog
+    console.log("  [Step 9] Testing resume request approval UI and confirm dialog...");
+    const run9 = await externalPlay.createRun();
+    const ctrl9Session = await externalPlay.handleControllerSession(externalPlay.mcpBootstrapNonce, { name: "orig-ctrl" });
+    const ctrl9 = externalPlay.validateControllerToken(`Bearer ${ctrl9Session.controller_token}`);
+    await externalPlay.claimRun(ctrl9, { model_name: "orig-model" }, "op-start-9");
+
+    const newCtrlSession = await externalPlay.handleControllerSession(externalPlay.mcpBootstrapNonce, { name: "new-ctrl" });
+    const newCtrl = externalPlay.validateControllerToken(`Bearer ${newCtrlSession.controller_token}`);
+    const resumeReq9 = await externalPlay.createResumeRequest(newCtrl, run9.runId);
+
+    const landingPage = await context.newPage();
+    await landingPage.goto(`http://127.0.0.1:${port}/external-play`, { waitUntil: "domcontentloaded" });
+
+    await landingPage.waitForSelector("#resume-requests-section", { state: "visible", timeout: 5000 });
+    await landingPage.waitForSelector(`.btn-approve-resume[data-id="${resumeReq9.request_id}"]`, { timeout: 5000 });
+
+    // Click approve button - since orig-ctrl is active, confirm dialog must show up
+    await landingPage.click(`.btn-approve-resume[data-id="${resumeReq9.request_id}"]`);
+    await landingPage.waitForSelector("#ext-confirm-modal:not([hidden])", { timeout: 3000 });
+
+    const dialogTitle = await landingPage.$eval("#ext-confirm-title", (el) => el.textContent);
+    assert.ok(dialogTitle.includes("强制切换确认") || dialogTitle.includes("确认"), `Expected confirm dialog, got: ${dialogTitle}`);
+
+    // Click Confirm button in the modal
+    await landingPage.click("#ext-confirm-ok");
+
+    // Wait for modal to hide
+    await landingPage.waitForSelector("#ext-confirm-modal", { state: "hidden", timeout: 3000 });
+
+    // Request should now be approved in externalPlay
+    const reqStatus = await externalPlay.getResumeRequestStatus(newCtrl, resumeReq9.request_id);
+    assert.equal(reqStatus.status, "approved");
+    assert.equal(reqStatus.lease_epoch, 2);
+
     console.log("Playwright E2E browser test PASSED!");
   } finally {
     if (mcpProc) {

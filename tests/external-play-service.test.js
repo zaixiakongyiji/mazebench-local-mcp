@@ -378,7 +378,7 @@ async function runTests() {
         { name: "deadline-race-takeover" }
       );
       const takeoverController = raceService.validateControllerToken(`Bearer ${takeoverSession.controller_token}`);
-      const takeover = await raceRun.startOrAttach(takeoverController, "race-takeover");
+      const takeover = await raceRun.attachApprovedLease(takeoverController, "req-test-12", false, "race-takeover");
       assert.equal(takeover.lease_epoch, raceStart.lease_epoch + 1);
       assert.equal(takeover.deadline_at, preservedDeadline, "lease takeover must not reset the run deadline");
       const takeoverJournal = fs.readFileSync(raceRun.journalPath, "utf8")
@@ -387,7 +387,7 @@ async function runTests() {
         .map((line) => JSON.parse(line));
       assert.deepEqual(
         takeoverJournal.slice(-2).map((record) => [record.type, record.reason || null]),
-        [["lease_revoked", "heartbeat_timeout"], ["lease_attached", null]]
+        [["lease_revoked", "authorized_resumption"], ["lease_attached", null]]
       );
 
       if (raceRun.deadlineTimer) clearTimeout(raceRun.deadlineTimer);
@@ -754,6 +754,295 @@ async function runTests() {
     await handleRequest(mockReq, mockRes);
     assert.equal(apiStatus, 200);
     assert.equal(apiJson.levelLabel, "FROZEN_LEVEL_MARKER_TEST");
+
+    console.log("  [Test 23] External Play Claim & Auth Resume Spec Invariants");
+    const test23DataHome = path.join(testDataHome, "claim-auth-invariants");
+    const test23Service = new ExternalPlayService({ dataHome: test23DataHome, port: 3018, defaultMaxActions: 2 });
+    await test23Service.initialize();
+    try {
+      const runA = await test23Service.createRun();
+      const ctrlASession = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "ctrl-A" });
+      const ctrlA = test23Service.validateControllerToken(`Bearer ${ctrlASession.controller_token}`);
+
+      // 1. start strictly rejects run_id
+      await assert.rejects(
+        test23Service.claimRun(ctrlA, { model_name: "Model A", run_id: runA.runId }, "op-start-invalid"),
+        (err) => err?.status === 400 && err?.code === "INVALID_ARGUMENT",
+        "start with run_id must be rejected with 400 INVALID_ARGUMENT"
+      );
+
+      // 2. Normal claim
+      const claimARes = await test23Service.claimRun(ctrlA, { model_name: "Model A" }, "op-start-A");
+      assert.equal(claimARes.run_id, runA.runId);
+      assert.equal(claimARes.status, "active");
+      assert.equal(claimARes.lease_epoch, 1);
+
+      // 3. Bound controller cannot claim another run while active
+      await assert.rejects(
+        test23Service.claimRun(ctrlA, { model_name: "Model A" }, "op-start-A2"),
+        (err) => err?.status === 409 && err?.code === "ALREADY_BOUND"
+      );
+
+      // 4. Same operation_id retry returns exact cached result
+      const retryARes = await test23Service.claimRun(ctrlA, { model_name: "Model A" }, "op-start-A");
+      assert.deepEqual(retryARes, claimARes);
+
+      // 5. Another controller attempts resume
+      const ctrlBSession = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "ctrl-B" });
+      const ctrlB = test23Service.validateControllerToken(`Bearer ${ctrlBSession.controller_token}`);
+
+      const resumeReq = await test23Service.createResumeRequest(ctrlB, runA.runId);
+      assert.equal(resumeReq.status, "pending_approval");
+      assert.ok(resumeReq.request_id);
+
+      // Since ctrlA's lease is currently active, ordinary approval without force must return 409 LEASE_ACTIVE
+      await assert.rejects(
+        test23Service.approveResumeRequest(resumeReq.request_id, { force: false }),
+        (err) => err?.status === 409 && err?.code === "LEASE_ACTIVE",
+        "approving active lease without force: true must return 409 LEASE_ACTIVE"
+      );
+
+      // Approving with force: true succeeds
+      const approveRes = await test23Service.approveResumeRequest(resumeReq.request_id, { force: true });
+      assert.equal(approveRes.status, "approved");
+
+      const statusRes = await test23Service.getResumeRequestStatus(ctrlB, resumeReq.request_id);
+      assert.equal(statusRes.status, "approved");
+      assert.equal(statusRes.lease_epoch, 2);
+      assert.notEqual(statusRes.lease_id, claimARes.lease_id);
+
+      // WAL audit verification
+      const runAJournal = fs.readFileSync(runA.journalPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const revokeRec = runAJournal.find((r) => r.type === "lease_revoked" && r.controller_id === ctrlA.controllerId);
+      assert.ok(revokeRec, "revoke record must exist for superseded controller");
+      assert.equal(revokeRec.reason, "forced_takeover");
+
+      const attachRec = runAJournal.find((r) => r.type === "lease_attached" && r.controller_id === ctrlB.controllerId);
+      assert.ok(attachRec, "attach record must exist for new controller");
+      assert.equal(attachRec.request_id, resumeReq.request_id);
+      assert.equal(attachRec.previous_controller_id, ctrlA.controllerId);
+      assert.equal(attachRec.forced, true);
+      assert.equal(attachRec.lease_epoch, 2);
+
+      // 6. Finalize runA and verify that ctrlA's old start retry on superseded lease is rejected and does NOT claim newly created runB
+      await runA.cancelRun();
+      while (runA.status === "finalizing") {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+
+      const runB = await test23Service.createRun();
+      assert.notEqual(runB.runId, runA.runId);
+
+      // Re-send op-start-A (retry of old operation on superseded lease):
+      // Must reject with 409 CONFLICT (superseded/revoked) and NOT claim runB
+      await assert.rejects(
+        test23Service.claimRun(ctrlA, { model_name: "Model A" }, "op-start-A"),
+        (err) => err?.status === 409 && err?.code === "CONFLICT",
+        "Late retry on superseded lease must be rejected with 409 CONFLICT"
+      );
+      assert.equal(runB.status, "armed", "runB must remain armed and unclaimed");
+
+      // 7. Test 24: Concurrent approval mutual exclusion & force takeover protection
+      console.log("  [Test 24] Concurrent approval mutual exclusion & force protection");
+      const run24 = await test23Service.createRun();
+      const ctrl24SessionA = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "ctrl24-A" });
+      const ctrl24A = test23Service.validateControllerToken(`Bearer ${ctrl24SessionA.controller_token}`);
+      await test23Service.claimRun(ctrl24A, { model_name: "Model 24A" });
+
+      // Two applicant controllers submit resume requests
+      const ctrl24SessionB = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "ctrl24-B" });
+      const ctrl24B = test23Service.validateControllerToken(`Bearer ${ctrl24SessionB.controller_token}`);
+      const reqB = await test23Service.createResumeRequest(ctrl24B, run24.runId);
+
+      const ctrl24SessionC = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "ctrl24-C" });
+      const ctrl24C = test23Service.validateControllerToken(`Bearer ${ctrl24SessionC.controller_token}`);
+      const reqC = await test23Service.createResumeRequest(ctrl24C, run24.runId);
+
+      // Force ctrl24A lease to expire so an ordinary approval without force can succeed
+      run24.currentLease.expiresAt = Date.now() - 1000;
+
+      // Concurrently approve reqB and reqC with force: false
+      const [resB, resC] = await Promise.allSettled([
+        test23Service.approveResumeRequest(reqB.request_id, { force: false }),
+        test23Service.approveResumeRequest(reqC.request_id, { force: false })
+      ]);
+
+      const fulfilled = [resB, resC].filter((r) => r.status === "fulfilled");
+      const rejected = [resB, resC].filter((r) => r.status === "rejected");
+      assert.equal(fulfilled.length, 1, "Exactly one ordinary approval must succeed");
+      assert.equal(rejected.length, 1, "The competing ordinary approval must be rejected");
+      assert.equal(rejected[0].reason.status, 409, "Rejected competitor must receive 409");
+      assert.ok(
+        rejected[0].reason.code === "LEASE_ACTIVE" || rejected[0].reason.code === "CONFLICT",
+        `Rejected competitor must fail with LEASE_ACTIVE or CONFLICT, got: ${rejected[0].reason.code}`
+      );
+      assert.equal(run24.currentLease.leaseEpoch, 2, "Lease epoch must be exactly 2, not overwritten to 3");
+
+      // 8. Test 25: Old controller binding cleared after takeover, freeing controller to claim next seat
+      console.log("  [Test 25] Old controller binding is cleared upon takeover, freeing controller");
+      const nextRun25 = await test23Service.createRun();
+      const claim25Res = await test23Service.claimRun(ctrl24A, { model_name: "Model 24A-New" });
+      assert.equal(claim25Res.run_id, nextRun25.runId, "Old controller must be able to claim a new run");
+      assert.equal(claim25Res.status, "active");
+
+      // 9. Test 26: Stale / invalidated applicant controller cannot be approved
+      console.log("  [Test 26] Invalidated applicant controller is rejected during approval without revoking incumbent");
+      const run26 = await test23Service.createRun();
+      const ctrl26SessionIncumbent = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "ctrl26-incumbent" });
+      const ctrl26Incumbent = test23Service.validateControllerToken(`Bearer ${ctrl26SessionIncumbent.controller_token}`);
+      const incumbentClaim = await test23Service.claimRun(ctrl26Incumbent, { model_name: "Incumbent Model" });
+
+      const ctrl26SessionApplicant = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "ctrl26-applicant" });
+      const ctrl26Applicant = test23Service.validateControllerToken(`Bearer ${ctrl26SessionApplicant.controller_token}`);
+      const req26 = await test23Service.createResumeRequest(ctrl26Applicant, run26.runId);
+
+      // Invalidate applicant token
+      test23Service.controllerTokens.delete(ctrl26SessionApplicant.controller_token);
+
+      await assert.rejects(
+        test23Service.approveResumeRequest(req26.request_id, { force: true }),
+        (err) => err?.status === 410 && err?.code === "EXPIRED",
+        "Approval must fail with 410 EXPIRED when applicant token is invalidated"
+      );
+
+      // Verify incumbent lease is untouched
+      assert.equal(run26.currentLease.controllerId, ctrl26Incumbent.controllerId, "Incumbent lease must remain intact");
+      assert.equal(run26.currentLease.leaseId, incumbentClaim.lease_id);
+      assert.equal(run26.currentLease.leaseEpoch, 1);
+
+      // 10. Test 27: Unbound and detached controller cannot observe a run
+      console.log("  [Test 27] Unbound and detached controller cannot observe an un-leased or disconnected run");
+      const run27 = await test23Service.createRun();
+      const ctrl27Session = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "ctrl27" });
+      const ctrl27 = test23Service.validateControllerToken(`Bearer ${ctrl27Session.controller_token}`);
+
+      // Unbound controller trying to observe armed run
+      await assert.rejects(
+        run27.observe(ctrl27),
+        (err) => err?.status === 409 && err?.code === "CONFLICT",
+        "Observing armed run must be rejected"
+      );
+
+      // Start run, then detach lease (making currentLease null)
+      await test23Service.claimRun(ctrl27, { model_name: "Model 27" });
+      await run27.detach(ctrl27, run27.currentLease.leaseId, run27.currentLease.leaseEpoch);
+      assert.equal(run27.currentLease, null, "Lease must be detached/null");
+
+      // Another stranger controller tries to observe the disconnected run
+      const strangerSession = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name: "stranger" });
+      const stranger = test23Service.validateControllerToken(`Bearer ${strangerSession.controller_token}`);
+
+      await assert.rejects(
+        run27.observe(stranger),
+        (err) => err?.status === 409 && err?.code === "CONFLICT",
+        "Stranger controller cannot observe a disconnected run with null currentLease"
+      );
+
+      const newController = async (name) => {
+        const session = await test23Service.handleControllerSession(test23Service.mcpBootstrapNonce, { name });
+        return test23Service.validateControllerToken(`Bearer ${session.controller_token}`);
+      };
+
+      console.log("  [Test 28] Approval and claim serialize controller bindings in both orders");
+      for (const first of ["approve", "claim"]) {
+        const owner = await newController(`race-owner-${first}`);
+        const applicant = await newController(`race-applicant-${first}`);
+        const target = await test23Service.createRun({ maxActions: 100 });
+        await test23Service.claimRun(owner, { model_name: "Race owner" });
+        const req = await test23Service.createResumeRequest(applicant, target.runId);
+        const spare = await test23Service.createRun({ maxActions: 100 });
+        const approve = () => test23Service.approveResumeRequest(req.request_id, { force: true });
+        const claim = () => test23Service.claimRun(applicant, { model_name: "Race applicant" });
+        const blockedRun = first === "approve" ? target : spare;
+        const method = first === "approve" ? "_attachApprovedLeaseLocked" : "start";
+        const original = blockedRun[method];
+        let entered;
+        let release;
+        const enteredPromise = new Promise((resolve) => { entered = resolve; });
+        const gate = new Promise((resolve) => { release = resolve; });
+        blockedRun[method] = async function (...args) {
+          entered();
+          await gate;
+          return original.apply(this, args);
+        };
+        try {
+          const firstResult = (first === "approve" ? approve() : claim());
+          await enteredPromise;
+          const secondResult = (first === "approve" ? claim() : approve());
+          const settled = Promise.allSettled([firstResult, secondResult]);
+          await new Promise((resolve) => setImmediate(resolve));
+          release();
+          const results = await settled;
+          assert.equal(results[0].status, "fulfilled");
+          assert.equal(results[1].status, "rejected");
+          assert.ok(["ALREADY_BOUND", "IDENTITY_MISMATCH"].includes(results[1].reason.code));
+          const owned = [target, spare].filter((run) => run.currentLease?.controllerId === applicant.controllerId);
+          assert.equal(owned.length, 1, "One controller must never hold two leases");
+          assert.equal(test23Service.controllerRunBindings.get(applicant.controllerId), owned[0].runId);
+        } finally {
+          release();
+          blockedRun[method] = original;
+        }
+      }
+
+      console.log("  [Test 29] Resume cache validates lease and returns live progress");
+      for (const revoke of ["expired", "timeout", "detach", "takeover"]) {
+        const owner = await newController(`cache-owner-${revoke}`);
+        const applicant = await newController(`cache-applicant-${revoke}`);
+        const run = await test23Service.createRun({ maxActions: 100 });
+        await test23Service.claimRun(owner, { model_name: "Cache owner" });
+        const req = await test23Service.createResumeRequest(applicant, run.runId);
+        await test23Service.approveResumeRequest(req.request_id, { force: true });
+        const attached = await test23Service.getResumeRequestStatus(applicant, req.request_id);
+        await run.executeAction(applicant, attached.lease_id, attached.lease_epoch, "rotate_camera_left", {}, `cache-action-${revoke}`);
+        const live = await test23Service.createResumeRequest(applicant, run.runId);
+        assert.equal(live.action_seq, 1);
+        assert.equal(live.actions_remaining, 99);
+        if (revoke === "expired" || revoke === "timeout") {
+          run.currentLease.expiresAt = Date.now() - 1;
+          if (revoke === "timeout") await run._handleLeaseTimeout();
+        } else if (revoke === "detach") {
+          await run.detach(applicant, attached.lease_id, attached.lease_epoch);
+        } else {
+          const next = await newController("cache-next");
+          const nextReq = await test23Service.createResumeRequest(next, run.runId);
+          await test23Service.approveResumeRequest(nextReq.request_id, { force: true });
+        }
+        const status = await test23Service.getResumeRequestStatus(applicant, req.request_id);
+        assert.equal(status.status, "expired");
+        assert.equal(status.lease_id, undefined);
+        const pending = await test23Service.createResumeRequest(applicant, run.runId);
+        assert.equal(pending.status, "pending_approval");
+        assert.notEqual(pending.request_id, req.request_id);
+        assert.equal(pending.lease_id, undefined);
+        await test23Service.getResumeRequestStatus(applicant, req.request_id);
+        assert.equal(test23Service.controllerResumeIndex.get(applicant.controllerId), pending.request_id);
+      }
+
+      console.log("  [Test 30] Takeover clears bindings even after detach or lease timeout");
+      for (const revoke of ["detach", "timeout"]) {
+        const owner = await newController(`binding-owner-${revoke}`);
+        const applicant = await newController(`binding-applicant-${revoke}`);
+        const run = await test23Service.createRun({ maxActions: 100 });
+        const lease = await test23Service.claimRun(owner, { model_name: "Binding owner" });
+        if (revoke === "detach") {
+          await run.detach(owner, lease.lease_id, lease.lease_epoch);
+        } else {
+          run.currentLease.expiresAt = Date.now() - 1;
+          await run._handleLeaseTimeout();
+        }
+        assert.equal(run.currentLease, null);
+        const req = await test23Service.createResumeRequest(applicant, run.runId);
+        await test23Service.approveResumeRequest(req.request_id);
+        assert.equal(test23Service.controllerRunBindings.has(owner.controllerId), false);
+        const next = await test23Service.createRun();
+        const claim = await test23Service.claimRun(owner, { model_name: "Next model" });
+        assert.equal(claim.run_id, next.runId);
+      }
+    } finally {
+      await new Promise((r) => setTimeout(r, 60));
+      test23Service.shutdown();
+    }
 
     console.log("All ExternalPlayService unit & integration tests PASSED!");
   } finally {

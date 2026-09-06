@@ -1502,6 +1502,16 @@ function createPageRenderer({
 
         ${activeGroupHtml || activeRunHtml}
 
+        <section class="panel resume-requests-panel" id="resume-requests-section" style="margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <h2 style="margin: 0;" data-i18n="ext_resume_requests_title">恢复申请 / Resume Requests</h2>
+            <span class="badge" id="resume-requests-count">0 pending</span>
+          </div>
+          <div id="resume-requests-container" class="resume-requests-container">
+            <p class="muted" style="margin: 0;" data-i18n="ext_no_resume_requests">暂无待审批恢复申请</p>
+          </div>
+        </section>
+
         <section class="panel" style="margin-bottom: 24px;">
           <h2 data-i18n="ext_mcp_config_title">MCP Configuration</h2>
           <p style="color: #94a3b8; font-size: 0.9rem;" data-i18n="ext_mcp_config_desc">Add the following to your Codex or Claude Desktop configuration:</p>
@@ -1716,6 +1726,7 @@ args = ["mcp"]</code></pre>
           <span id="spectator-actions" class="spectator-badge">👟 <strong id="spectator-actions-val">0</strong></span>
           <span id="spectator-room" class="spectator-badge">🚪 <strong id="spectator-room-val">level_HxI</strong></span>
           <span id="controller-status" class="spectator-badge controller-badge">Controller: Disconnected</span>
+          <button id="spectator-resume-btn" class="spectator-badge resume-badge" type="button" style="cursor: pointer; background: rgba(234, 179, 8, 0.2); color: #facc15; border: 1px solid #ca8a04;" hidden>🔄 <span id="spectator-resume-btn-text">恢复申请 (0)</span></button>
           <button id="cancel-run-btn" class="button--danger button--small" type="button" data-i18n="cancel_run">Cancel Run</button>
         </nav>
 
@@ -1769,6 +1780,19 @@ args = ["mcp"]</code></pre>
               <button id="summary-dismiss-btn" class="button" type="button" data-i18n="summary_dismiss">View Board</button>
               <a id="summary-home-btn" class="button" href="/" data-i18n="summary_home">Back to Home</a>
               <a id="summary-json-link" class="button" href="/api/external-play/runs/${encodeURIComponent(run.runId)}/summary" download="summary.json" data-i18n="summary_download">Download summary.json</a>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="spectator-resume-overlay" class="summary-overlay resume-requests-overlay" hidden>
+        <div class="summary-card-dialog">
+          <div class="summary-header">
+            <h2 data-i18n="resume_requests_title">恢复申请审批 / Resume Requests</h2>
+            <button id="resume-modal-close-btn" class="modal-close-btn" type="button" aria-label="Close" title="Close">✕</button>
+          </div>
+          <div class="summary-body" style="padding: 16px;">
+            <div id="spectator-resume-list" class="resume-requests-container">
+              <p class="muted">暂无针对本场次的恢复申请</p>
             </div>
           </div>
         </div>

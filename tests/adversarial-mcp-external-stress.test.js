@@ -103,6 +103,7 @@ async function runMcpComprehensiveStressTest() {
     server.listen(port, "127.0.0.1", async () => {
       externalPlay.serverPort = port;
       await externalPlay.initialize();
+      await externalPlay.createRun({ durationMs: 1800000 });
       resolve();
     });
   });
@@ -132,13 +133,16 @@ async function runMcpComprehensiveStressTest() {
 
     const toolsRes = await client1.sendRequest(2, "tools/list", {});
     assert.ok(toolsRes.result?.tools);
-    assert.equal(toolsRes.result.tools.length, 13);
+    assert.equal(toolsRes.result.tools.length, 15);
     pass();
 
     console.log(">>> [Phase 2] Game Session Claim & Rapid Action Storm (40 steps)");
-    const startRes = await client1.callTool(3, "start", {});
+    const startRes = await client1.callTool(3, "start", { model_name: "AdversarialStressAgent" });
     assert.ok(startRes.result);
     assert.equal(startRes.result.isError, false);
+    const startPayload = JSON.parse(startRes.result.content[0].text);
+    const activeRunId = startPayload.run_id;
+    assert.ok(activeRunId);
     pass();
 
     // Rapid action storm
@@ -152,7 +156,6 @@ async function runMcpComprehensiveStressTest() {
     }
 
     console.log(">>> [Phase 3] Concurrent Viewer Inspection & Telemetry During Active Play");
-    const activeRunId = externalPlay.activeRunId;
     const tokenRes = await fetchHttp(`http://127.0.0.1:${port}/api/external-play/runs/${activeRunId}/viewer-token`, {
       method: "POST",
       headers: {
@@ -227,6 +230,20 @@ async function runMcpComprehensiveStressTest() {
     assert.equal(badLvlRes.error.code, -32602);
     pass();
 
+    // 4. Rejection of start with run_id
+    const badStartWithRunId = await client1.callTool(204, "start", { model_name: "AdversarialStressAgent", run_id: "fake-run-id" });
+    assert.ok(badStartWithRunId.error || badStartWithRunId.result?.isError);
+    pass();
+
+    // 5. Resume tool returns pending_approval immediately with review_url
+    const resumeRes = await client1.callTool(205, "resume", { run_id: activeRunId });
+    assert.ok(resumeRes.result);
+    assert.equal(resumeRes.result.isError, false);
+    const resumePayload = JSON.parse(resumeRes.result.content[0].text);
+    assert.equal(resumePayload.status, "pending_approval");
+    assert.ok(resumePayload.review_url);
+    pass();
+
     console.log(">>> [Phase 5] Competing MCP Client Exclusion (Single-Controller Invariant)");
     const child2 = spawn(process.execPath, [adapterScript], {
       env: { ...process.env, MAZEBENCH_DATA_HOME: testDataHome },
@@ -240,7 +257,7 @@ async function runMcpComprehensiveStressTest() {
       clientInfo: { name: "CompetingClient", version: "1.0.0" }
     });
 
-    const conflictRes = await client2.callTool(2, "start", {});
+    const conflictRes = await client2.callTool(2, "start", { model_name: "CompetingClient" });
     assert.ok(conflictRes.error || (conflictRes.result && conflictRes.result.isError));
     pass();
 

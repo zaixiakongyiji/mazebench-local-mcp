@@ -38,6 +38,213 @@
     return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
+  function showConfirmDialog({ title, message, confirmText, cancelText, onConfirm }) {
+    let modal = document.getElementById("ext-confirm-modal");
+    if (!modal) {
+      modal = document.createElement("div");
+      modal.id = "ext-confirm-modal";
+      modal.className = "summary-overlay confirm-overlay";
+      modal.innerHTML = `
+        <div class="summary-card-dialog confirm-dialog" style="max-width: 460px;">
+          <div class="summary-header">
+            <h3 id="ext-confirm-title" style="margin: 0; font-size: 1.15rem;">确认 / Confirm</h3>
+            <button id="ext-confirm-close" class="modal-close-btn" type="button">✕</button>
+          </div>
+          <div class="summary-body" style="padding: 18px 20px;">
+            <p id="ext-confirm-message" style="margin: 0 0 20px 0; line-height: 1.5; color: #e2e8f0;"></p>
+            <div style="display: flex; justify-content: flex-end; gap: 10px;">
+              <button id="ext-confirm-cancel" class="button" type="button">取消</button>
+              <button id="ext-confirm-ok" class="button button--danger" type="button">确认强制切换</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+    }
+
+    const titleElem = document.getElementById("ext-confirm-title");
+    const msgElem = document.getElementById("ext-confirm-message");
+    const cancelBtn = document.getElementById("ext-confirm-cancel");
+    const okBtn = document.getElementById("ext-confirm-ok");
+    const closeBtn = document.getElementById("ext-confirm-close");
+
+    titleElem.textContent = title || "确认";
+    msgElem.textContent = message || "确认执行该操作？";
+    okBtn.textContent = confirmText || "确认";
+    cancelBtn.textContent = cancelText || "取消";
+
+    modal.hidden = false;
+    modal.style.display = "flex";
+
+    const hide = () => {
+      modal.hidden = true;
+      modal.style.display = "none";
+    };
+
+    closeBtn.onclick = hide;
+    cancelBtn.onclick = hide;
+    okBtn.onclick = () => {
+      hide();
+      if (typeof onConfirm === "function") onConfirm();
+    };
+  }
+
+  function initResumeRequestsManager({ containerId, countId, targetRunId = null, onCountChange = null }) {
+    const container = document.getElementById(containerId);
+    if (!container) return null;
+    const countElem = countId ? document.getElementById(countId) : null;
+
+    let pollTimer = null;
+
+    async function fetchAndRender() {
+      try {
+        const res = await fetch("/api/external-play/resume-requests", {
+          headers: { "Content-Type": "application/json" }
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        let requests = data.requests || [];
+        if (targetRunId) {
+          requests = requests.filter((r) => r.run_id === targetRunId);
+        }
+
+        if (countElem) {
+          countElem.textContent = `${requests.length} pending`;
+        }
+        if (typeof onCountChange === "function") {
+          onCountChange(requests.length);
+        }
+
+        if (requests.length === 0) {
+          container.innerHTML = `<p class="muted" style="margin: 0;">暂无待审批恢复申请</p>`;
+          return;
+        }
+
+        container.innerHTML = `
+          <div class="resume-requests-table-wrapper" style="overflow-x: auto;">
+            <table class="resume-requests-table" style="width: 100%; border-collapse: collapse; font-size: 0.875rem;">
+              <thead>
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.1); text-align: left; color: #94a3b8;">
+                  <th style="padding: 8px;">目标 Run</th>
+                  <th style="padding: 8px;">原模型</th>
+                  <th style="padding: 8px;">申请客户端</th>
+                  <th style="padding: 8px;">原租约状态</th>
+                  <th style="padding: 8px;">申请时间</th>
+                  <th style="padding: 8px; text-align: right;">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${requests.map((req) => {
+                  const isOnline = req.previous_lease_active;
+                  const leaseBadge = isOnline
+                    ? `<span class="badge" style="background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid #dc2626;">在线中 (Active)</span>`
+                    : `<span class="badge" style="background: rgba(148,163,184,0.2); color: #cbd5e1;">已断开 (Expired)</span>`;
+                  const clientText = escapeHtml(req.declared_cli || req.client_info?.name || "MCP Client");
+                  return `
+                    <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);" data-req-id="${escapeHtml(req.request_id)}">
+                      <td style="padding: 8px;"><code>${escapeHtml(req.run_id)}</code></td>
+                      <td style="padding: 8px;"><strong>${escapeHtml(req.model_name || "-")}</strong></td>
+                      <td style="padding: 8px;">${clientText}</td>
+                      <td style="padding: 8px;">${leaseBadge}</td>
+                      <td style="padding: 8px; color: #94a3b8;">${new Date(req.created_at).toLocaleTimeString()}</td>
+                      <td style="padding: 8px; text-align: right; white-space: nowrap;">
+                        <button class="button button--small button--primary btn-approve-resume" data-id="${escapeHtml(req.request_id)}" data-online="${isOnline}" style="margin-right: 6px;">批准</button>
+                        <button class="button button--small button--danger btn-reject-resume" data-id="${escapeHtml(req.request_id)}">拒绝</button>
+                      </td>
+                    </tr>
+                  `;
+                }).join("")}
+              </tbody>
+            </table>
+          </div>
+        `;
+
+        container.querySelectorAll(".btn-approve-resume").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const reqId = btn.getAttribute("data-id");
+            const isOnline = btn.getAttribute("data-online") === "true";
+
+            const doApprove = async (force) => {
+              try {
+                btn.disabled = true;
+                const approveRes = await fetch(`/api/external-play/resume-requests/${encodeURIComponent(reqId)}/approve`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ force })
+                });
+                const body = await approveRes.json().catch(() => ({}));
+                if (!approveRes.ok) {
+                  if (approveRes.status === 409 && body.code === "LEASE_ACTIVE") {
+                    showConfirmDialog({
+                      title: "强制切换确认 / Forced Takeover",
+                      message: "原客户端连接当前仍在线！若批准接管，原连接将被立即撤销。确定强制切换吗？",
+                      confirmText: "强制接管",
+                      cancelText: "取消",
+                      onConfirm: () => doApprove(true)
+                    });
+                    return;
+                  }
+                  alert("审批失败: " + (body.error || body.message || `HTTP ${approveRes.status}`));
+                } else {
+                  fetchAndRender();
+                }
+              } catch (err) {
+                alert("网络错误: " + err.message);
+              } finally {
+                btn.disabled = false;
+              }
+            };
+
+            if (isOnline) {
+              showConfirmDialog({
+                title: "强制切换确认 / Forced Takeover",
+                message: "原客户端连接当前仍在线！若批准接管，原连接将被立即撤销。确定强制切换吗？",
+                confirmText: "强制接管",
+                cancelText: "取消",
+                onConfirm: () => doApprove(true)
+              });
+            } else {
+              doApprove(false);
+            }
+          });
+        });
+
+        container.querySelectorAll(".btn-reject-resume").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const reqId = btn.getAttribute("data-id");
+            if (!confirm("确定拒绝该恢复申请吗？")) return;
+            try {
+              btn.disabled = true;
+              const rejectRes = await fetch(`/api/external-play/resume-requests/${encodeURIComponent(reqId)}/reject`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" }
+              });
+              if (!rejectRes.ok) {
+                const body = await rejectRes.json().catch(() => ({}));
+                alert("拒绝失败: " + (body.error || body.message || `HTTP ${rejectRes.status}`));
+              }
+              fetchAndRender();
+            } catch (err) {
+              alert("网络错误: " + err.message);
+            } finally {
+              btn.disabled = false;
+            }
+          });
+        });
+
+      } catch (_e) {}
+    }
+
+    fetchAndRender();
+    pollTimer = setInterval(fetchAndRender, 3000);
+    return {
+      stop: () => {
+        if (pollTimer) clearInterval(pollTimer);
+      },
+      refresh: fetchAndRender
+    };
+  }
+
   // 1. Landing Page Logic
   function initLandingPage() {
     const form = document.getElementById("create-external-run-form");
@@ -209,6 +416,11 @@
         statusText.textContent = (isZh() ? "创建失败: " : "Error: ") + err.message;
         submitBtn.disabled = false;
       }
+    });
+
+    initResumeRequestsManager({
+      containerId: "resume-requests-container",
+      countId: "resume-requests-count"
     });
   }
 
@@ -1330,6 +1542,45 @@
           startAutoPlay();
         });
       });
+    }
+
+    // Resume Requests Management
+    const resumeOverlay = document.getElementById("spectator-resume-overlay");
+    const resumeBtn = document.getElementById("spectator-resume-btn");
+    const resumeBtnText = document.getElementById("spectator-resume-btn-text");
+    const resumeCloseBtn = document.getElementById("resume-modal-close-btn");
+
+    if (resumeOverlay && resumeBtn) {
+      initResumeRequestsManager({
+        containerId: "spectator-resume-list",
+        countId: null,
+        targetRunId: runId,
+        onCountChange: (count) => {
+          if (count > 0) {
+            resumeBtn.hidden = false;
+            if (resumeBtnText) resumeBtnText.textContent = `恢复申请 (${count})`;
+          } else {
+            resumeBtn.hidden = true;
+          }
+        }
+      });
+
+      resumeBtn.addEventListener("click", () => {
+        resumeOverlay.hidden = false;
+        resumeOverlay.style.display = "flex";
+      });
+
+      if (resumeCloseBtn) {
+        resumeCloseBtn.addEventListener("click", () => {
+          resumeOverlay.hidden = true;
+          resumeOverlay.style.display = "none";
+        });
+      }
+
+      if (window.location.hash === "#resume") {
+        resumeOverlay.hidden = false;
+        resumeOverlay.style.display = "flex";
+      }
     }
 
     // Kickoff initial catch-up and SSE connection

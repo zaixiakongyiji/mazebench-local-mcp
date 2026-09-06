@@ -15,6 +15,22 @@ Benchmark agents must never be able to inspect MazeBenchEngine or any other repo
 - Launchers must fail closed before starting a run if the requested configuration, sandbox, tool set, working directory, mount set, or environment would expose repository or host files. Never silently launch with broader access.
 - When changing agent launch code, preserve this boundary with automated tests that assert the evaluated agent cannot read repository or host files, launch subprocesses, use the network, or invoke host shell/file tools. A run that crosses this boundary is invalid even if it never changes game state.
 
+## External Play and MCP agent isolation and authorization
+
+External Play allows evaluated models and autonomous agents (e.g. Claude Desktop, Cursor, and custom CLI agents) to interact with MazeBench through the local MCP adapter or HTTP API. These runs must respect strict isolation, fairness, and safety boundaries:
+
+- External Play MCP agents are strictly confined to the 15 approved tools: `start`, `resume`, `observe`, `up`, `down`, `left`, `right`, `rotate_camera_up`, `rotate_camera_down`, `rotate_camera_left`, `rotate_camera_right`, `undo`, `reset`, `go_to_level`, and `action_sequence`.
+- Protocol separation for claim and resume:
+  - `start({ model_name })` is strictly for claiming a fresh vacant or armed run seat. Passing `run_id` to `start` must fail-closed with `400 INVALID_ARGUMENT`, preventing agents from accidentally or maliciously usurping or mutating another run.
+  - Resuming an existing run across connections or restarts must exclusively use `resume({ run_id })`.
+  - `resume` requests enter a `pending_approval` state and must never expose lease credentials, observation, or game controls until explicitly authorized by the human operator in the local web interface (`/external-play`). If an existing controller lease is still active, secondary confirmation (`force: true`) is required to take over the session.
+- Controller session isolation:
+  - Shared tokens (`MAZEBENCH_LOCAL_MCP_TOKEN`) are deprecated and prohibited; each MCP adapter connection automatically negotiates an isolated controller session.
+  - A controller session is strictly bound 1:1 to a single run. Once bound, it cannot claim or resume another run until the current run reaches a terminal state.
+  - Idempotent operations must be scoped to `controller_id + operation_id` to guarantee safe retries without unintended seat allocations.
+- Durable audit logging:
+  - All lease attachments, revocations, and forced takeovers must be durably recorded in the WAL journal (`journal.jsonl`) with `request_id`, `previous_controller_id`, and `forced` fields.
+
 ## Branch-first development
 
 - Do not commit or push ordinary work directly to `main` unless the user explicitly overrides this rule.
