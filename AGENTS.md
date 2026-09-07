@@ -21,15 +21,26 @@ External Play allows evaluated models and autonomous agents (e.g. Claude Desktop
 
 - External Play MCP agents are strictly confined to the 15 approved tools: `start`, `resume`, `observe`, `up`, `down`, `left`, `right`, `rotate_camera_up`, `rotate_camera_down`, `rotate_camera_left`, `rotate_camera_right`, `undo`, `reset`, `go_to_level`, and `action_sequence`.
 - Protocol separation for claim and resume:
-  - `start({ model_name })` is strictly for claiming a fresh vacant or armed run seat. Passing `run_id` to `start` must fail-closed with `400 INVALID_ARGUMENT`, preventing agents from accidentally or maliciously usurping or mutating another run.
+  - `start({ model_name })` 仅用于认领全新 armed 席位，必须拒绝 `run_id` 且不分配席位、不改变其他运行。HTTP 接口返回 `400 INVALID_ARGUMENT`；stdio MCP adapter 的参数校验返回 JSON-RPC `-32602`，不要混用两层错误码。
   - Resuming an existing run across connections or restarts must exclusively use `resume({ run_id })`.
-  - `resume` requests enter a `pending_approval` state and must never expose lease credentials, observation, or game controls until explicitly authorized by the human operator in the local web interface (`/external-play`). If an existing controller lease is still active, secondary confirmation (`force: true`) is required to take over the session.
+  - 新的 `resume` 授权申请立即返回 `pending_approval` 和 `review_url`，获批前不得暴露租约凭据、观察或控制权。用户在本地网页 `/external-play` 审批；接管其他 controller 的有效租约必须经过二次确认（`force: true`）。
+  - adapter 每 2 秒非阻塞轮询审批状态；获批后自动附着租约并启动心跳，不自动执行游戏动作。拒绝、过期、断连或取消轮询后，迟到响应不得重新附着。已获批申请仅能在 controller、lease ID、epoch 和有效期均匹配当前租约时复用，并返回最新观察与预算；失效后必须重新审批。
 - Controller session isolation:
-  - Shared tokens (`MAZEBENCH_LOCAL_MCP_TOKEN`) are deprecated and prohibited; each MCP adapter connection automatically negotiates an isolated controller session.
-  - A controller session is strictly bound 1:1 to a single run. Once bound, it cannot claim or resume another run until the current run reaches a terminal state.
+  - 禁止共享 `MAZEBENCH_LOCAL_MCP_TOKEN`；每个独立 stdio MCP adapter 进程协商独立 controller。多模型并发必须使用独立 adapter 连接，不得假设同一客户端的不同对话或窗口天然隔离，也不要求使用不同品牌客户端。
+  - 同一 controller 最多绑定一个未结束 run。运行结束或授权接管成功后，服务端解除原绑定；接管必须按 run ID 清理旧绑定，包括租约已经断开或超时的情况。仅断开或超时不自动释放绑定。
+  - 审批和新认领必须共用 controller 绑定锁，锁顺序保持 `admissionMutex -> sessionMutex`，在同一事务范围内检查和更新绑定，防止同一 controller 同时取得两个 run 的租约。
+  - adapter 已认领 run 后丢失认证，必须持续保留重新授权状态；后续 `start` 重试不得创建新 controller 或领取下一席位。只有通过 `resume` 获批才能恢复控制，服务端解绑不能用来绕过 adapter 的授权限制。
   - Idempotent operations must be scoped to `controller_id + operation_id` to guarantee safe retries without unintended seat allocations.
 - Durable audit logging:
-  - All lease attachments, revocations, and forced takeovers must be durably recorded in the WAL journal (`journal.jsonl`) with `request_id`, `previous_controller_id`, and `forced` fields.
+  - 认领、租约附着、撤销及强制接管必须持久化到 WAL（`journal.jsonl`）。首次认领记录为 `run_started`；恢复附着的 `lease_attached` 写入 `request_id`、`previous_controller_id`（可为 `null`）和 `forced`。
+  - `lease_revoked` 记录被撤销的 controller、lease ID、epoch 和 `reason`，不要求上述恢复附着专用字段。schema 中的新增审计字段保持可选以兼容旧历史，不重写旧 journal。
+
+## 生成文件与回归验证
+
+- schema 生成源为 `scripts/build-standalone-validators.js`。修改后运行 `npm run build:validators`，不要手工编辑 `shared/validators.standalone.js` 或 `public/validators.standalone.js`。
+- 修改源文件后通过 `npm run sync-runtime` 同步 `environments/mazebench/mazebench/runtime/`，不要直接修改镜像副本；新增运行时模块必须确认已被 `scripts/sync-runtime.js` 的目录或文件清单覆盖。
+- External Play / MCP 改动至少运行 `node tests/external-play-service.test.js`、`node tests/external-run-groups.test.js`、`node tests/maze-external-mcp.test.js`、`node tests/adversarial-mcp-external-stress.test.js`、`npm run test:browser` 和 `node tests/runtime-drift.test.js`，最后执行 `npm test`。
+- 测试必须覆盖审批与认领竞争、连续认证失败重试、后台审批接管和心跳、过期租约缓存、旧绑定清理，以及历史与回放兼容。验证结果分别报告通过、失败和跳过；仅修改 README 或 AGENTS.md 无需生成或同步 runtime，也无需全量业务回归。
 
 ## Branch-first development
 

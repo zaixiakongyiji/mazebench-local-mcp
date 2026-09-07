@@ -324,6 +324,34 @@ async function runTests() {
       test6Service.shutdown();
       fs.rmSync(test6DataHome, { recursive: true, force: true });
     }
+
+    console.log("  [Test 7] deleteGroup removes memory state and disk directories");
+    await assert.rejects(
+      service.deleteGroup("non-existent-group"),
+      (error) => error?.status === 404 && error?.code === "NOT_FOUND"
+    );
+
+    const test7Group = await service.createGroup({ mode: "concurrent", count: 2, maxActions: 10 });
+    const test7GroupId = test7Group.group_id;
+    const test7GroupDir = path.join(dataHome, "external-groups", test7GroupId);
+    const test7RunIds = test7Group.entries.map((e) => e.run_id);
+    const test7RunDirs = test7RunIds.map((id) => path.join(dataHome, "external-runs", id));
+
+    assert.ok(fs.existsSync(test7GroupDir), "Group directory must exist before delete");
+    for (const rDir of test7RunDirs) {
+      assert.ok(fs.existsSync(rDir), "Run directory must exist before delete");
+    }
+
+    const deleteRes = await service.deleteGroup(test7GroupId);
+    assert.deepEqual(deleteRes, { deleted: true, group_id: test7GroupId });
+    assert.equal(service.getGroup(test7GroupId), null, "Group must be removed from memory");
+    for (const rId of test7RunIds) {
+      assert.equal(service.getRun(rId), null, "Child run must be removed from memory");
+    }
+    assert.ok(!fs.existsSync(test7GroupDir), "Group directory must be deleted from disk");
+    for (const rDir of test7RunDirs) {
+      assert.ok(!fs.existsSync(rDir), "Child run directory must be deleted from disk");
+    }
   } finally {
     if (service.serviceState !== "SHUTDOWN") service.shutdown();
     fs.rmSync(dataHome, { recursive: true, force: true });

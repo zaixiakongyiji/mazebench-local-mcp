@@ -711,6 +711,51 @@ class ExternalPlayService {
     return this.getGroup(groupId);
   }
 
+  async deleteGroup(groupId) {
+    const group = this.getGroup(groupId);
+    if (!group) throw { status: 404, code: "NOT_FOUND", message: `Run group not found: ${groupId}` };
+    await Promise.all(group.entries.map(async (entry) => {
+      const run = this.getRun(entry.run_id);
+      if (run && !TERMINAL_STATUSES.has(run.status)) {
+        try {
+          await run.cancelRun();
+        } catch (_err) {
+          // ignore error if cancel fails
+        }
+      }
+
+      for (const [ctrlId, boundRunId] of this.controllerRunBindings.entries()) {
+        if (boundRunId === entry.run_id) {
+          this.controllerRunBindings.delete(ctrlId);
+        }
+      }
+
+      for (const [reqId, req] of this.resumeRequests.entries()) {
+        if (req.runId === entry.run_id) {
+          this.resumeRequests.delete(reqId);
+          this.controllerResumeIndex.delete(req.controllerId);
+        }
+      }
+
+      if (run) {
+        run._deleted = true;
+        this.runs.delete(run.runId);
+        if (fs.existsSync(run.runDir)) {
+          fs.rmSync(run.runDir, { recursive: true, force: true });
+        }
+      } else {
+        const runDir = path.join(this.runsDir, entry.run_id);
+        if (fs.existsSync(runDir)) {
+          fs.rmSync(runDir, { recursive: true, force: true });
+        }
+      }
+    }));
+
+    this.groupStore.remove(groupId);
+    this._refreshClaimState();
+    return { deleted: true, group_id: groupId };
+  }
+
   async claimRun(controllerInfo, args = {}, operationId = null, abortSignal = null) {
     return await this.admissionMutex.withLock(async () => {
       if (args.run_id !== undefined && args.run_id !== null) {
@@ -2314,6 +2359,7 @@ class RunInstance {
   async _runFinalizeWorker(outcome) {
     // Run asynchronously
     setImmediate(async () => {
+      if (this._deleted) return;
       try {
         // Build summary
         const summary = SummaryBuilder.buildSummary(this, outcome);
@@ -2364,7 +2410,7 @@ class RunInstance {
   }
 
   async _recordFinalizeFailure(error) {
-    if (["won", "action_limit", "timed_out", "cancelled", "failed"].includes(this.status)) {
+    if (this._deleted || ["won", "action_limit", "timed_out", "cancelled", "failed"].includes(this.status)) {
       return;
     }
     try {

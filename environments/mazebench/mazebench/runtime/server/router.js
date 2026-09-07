@@ -473,6 +473,14 @@ function createRequestRouter({
           }
           return;
         }
+        if (segments.length === 4 && request.method === "DELETE") {
+          try {
+            sendJson(response, 200, await externalPlay.deleteGroup(groupId));
+          } catch (err) {
+            sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
+          }
+          return;
+        }
         if (segments.length === 5 && segments[4] === "cancel" && request.method === "POST") {
           try {
             sendJson(response, 200, await externalPlay.cancelGroup(groupId));
@@ -481,7 +489,7 @@ function createRequestRouter({
           }
           return;
         }
-        response.writeHead(405, { Allow: "GET, POST" });
+        response.writeHead(405, { Allow: "GET, POST, DELETE" });
         response.end();
         return;
       }

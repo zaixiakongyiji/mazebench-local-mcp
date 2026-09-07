@@ -175,7 +175,9 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 
 ### 认领与恢复规则
 
-每个独立 MCP 客户端实例会自动与 External Play 服务协商独立的 controller 会话（`MAZEBENCH_LOCAL_MCP_TOKEN` 环境变量已废弃并被禁止使用）。
+每个独立的 stdio MCP adapter 进程会自动与 External Play 服务协商独立的 controller 会话（`MAZEBENCH_LOCAL_MCP_TOKEN` 环境变量已废弃并被禁止使用）。并发或比赛模式下，每个模型都需要独立的 adapter 连接，不能共享同一 controller。
+
+同一客户端中的不同对话、窗口或模型不一定拥有独立 MCP 连接，取决于客户端如何管理 MCP 进程。判断依据是是否分别启动了 adapter 并协商了不同的 controller，而不是客户端品牌或对话数量；无需强制使用不同品牌的客户端。
 
 首次认领 armed 席位时调用 `start`：
 
@@ -186,6 +188,7 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 ```
 
 > **注意**：`start` 仅用于认领全新空闲席位，**严格拒绝**传入 `run_id` 参数。同一 controller 已绑定未结束的运行将拒绝认领新席位。
+
 `start` 会返回 `run_id`、可选的 `group_id`/`entry_id`、模型与 harness 身份、`run_instructions`、初始观察和本局预算。
 
 跨会话恢复已有运行：
@@ -193,7 +196,7 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 
 ```json
 {
-  "run_id": "run-2026-09-06-abc"
+  "run_id": "<此前返回的 run_id>"
 }
 ```
 
@@ -201,34 +204,28 @@ Windows 上同样可以把 `command` 替换为 `mazebench.exe` 的绝对路径�
 
 已认领运行的 adapter 若丢失认证，后续 `start` 重试不会创建新 controller 或领取下一席位；只能通过 `resume` 重新申请并获批后继续游戏。审批和新认领共用 controller 绑定锁，同一 controller 不会同时持有两个运行的租约。
 
-`start` 与 `resume` 获批后建立控制 lease。之后的游戏操作必须使用同一个 MCP 会话，不能直接调用或修改游戏引擎状态。
+在服务端，运行结束或授权接管成功会解除原 controller 的绑定；接管时也会清理已经断开或超时的旧绑定。仅断开或租约超时不代表自动解除绑定。服务端解绑不等于 adapter 自动获得新局权限：进入重新授权状态的 adapter 仍受上述恢复审批限制。
+
+`start` 成功认领或 `resume` 获批后建立控制 lease。之后的游戏操作必须使用持有当前有效租约的 MCP 会话，不能直接调用或修改游戏引擎状态。
 
 `action_sequence` 接受 1 到 1,000 个有序 action 字符串。它逐步执行并保留实时观战与动作记录；默认返回紧凑步骤摘要和 `final_observation`。遇到 `ended: true`、玩家死亡或动作错误时会提前停止，以便模型恢复或重新规划。
 
 ### 推荐的自主游玩提示词
 
+将 `<指定模型名称>` 替换为本次模型的名称，单局、并发组和比赛组统一使用：
+
 ```text
-Use the configured `mazebench` MCP server to play the hidden 3D grid game. All game interaction must go through the tools supplied by that MCP server.
-
-Call the `mazebench` MCP tool `start` exactly once first and inspect its sanitized ASCII observation. Then use its named action tools `up`, `down`, `left`, `right`, `rotate_camera_up`, `rotate_camera_down`, `rotate_camera_left`, `rotate_camera_right`, `undo`, `reset`, and `go_to_level`. A saved solver may instead call its `action_sequence` tool with an ordered `actions` array of at most 1,000 items. By default the sequence result contains compact step summaries plus `final_observation`. Use the `observe` tool only when you need to inspect the current state without consuming an action. `go_to_level` accepts the two world-coordinate letters for a previously visited room.
-
-The controls do not report whether a movement was blocked; infer its effect only from the returned observation.
-
-Explore as many rooms as possible and collect as many gems as possible. You may use at most 256 game actions. Quit is disabled; recover with undo or reset after a death and keep playing.
-
-Finish with a short route summary only after a game result says `ended: true`. A belief that no useful move remains is not a stop condition: while `ended: false`, never provide a final response and continue using the game controls.
-
-The game implementation, session, checkpoints, and scoring are evaluator-only. Do not try to locate or access them. Do not claim moves or scores that were not returned by the game controls.
+调用 MazeBench 的 start 工具，填写 model_name 为“<指定模型名称>”，然后严格按照返回的 run_instructions 继续游戏。
 ```
 
-如果创建场次时把 actions 上限改成其他数值，请同步替换提示词中的 `256`。
+目标、允许工具、动作或时间预算、死亡恢复方式和结束规则以服务端返回的 `run_instructions` 及运行状态为准，不需要根据模式或预算手工修改初始提示词。不要为新局填写 `run_id`。
 
 若因客户端重启或断开需要恢复未完成的对局，可让模型使用以下恢复提示词：
 
 ```text
-Use the configured `mazebench` MCP server to resume the existing 3D grid game.
-Call the `mazebench` MCP tool `resume` with `{"run_id": "<your-run-id>"}` and wait until approval is granted in the local web interface. Do not call `start`.
-After approval is granted, inspect the observation and continue using the game action tools (`up`, `down`, `left`, `right`, `observe`, `action_sequence`, etc.) until ended=true.
+调用 MazeBench 的 resume 工具，填写 run_id 为“<此前返回的 run_id>”，不要调用 start。
+收到 pending_approval 后等待用户在 review_url 对应的本地网页批准，不要尝试绕过审批。
+获批后再次调用 resume 获取最新 run_instructions 和 observation，严格按返回的规则继续游戏，直到服务端报告 ended: true。
 ```
 
 ## 结束条件与运行产物
@@ -236,6 +233,7 @@ After approval is granted, inspect the observation and continue using the game a
 场次在以下条件之一满足时结束：
 
 - 达到创建场次时设定的 game actions 上限（默认 256）；
+- 使用旧版时间预算配置的运行达到服务端截止时间；
 - 用户在本地网页明确取消；
 - 服务或运行发生不可恢复错误。
 
@@ -254,6 +252,18 @@ After approval is granted, inspect the observation and continue using the game a
 - `world-bundle.json`
 - `summary.json`
 - replay 使用的不可变 blobs
+
+运行组数据默认保存在 `~/.mazebench/external-groups/<group-id>/`：
+
+- `manifest.json`：共同规则和席位关联；
+- `result.json`：全部子 run 终止后保存的结算快照；比赛组含本场排名，并发组的 `ranking` 为 `null`；
+- `seat-failures.json`：存在席位恢复失败等情况时保存的失败记录。
+
+子 run 的历史和回放仍保存在各自的 `external-runs/<run-id>/` 目录。组结算写入失败时保持 `finalizing`，服务会重试补写，而不是提前将组标记为结算完成。
+
+### 取消与删除运行组
+
+网页中的“取消未结束的运行”会停止尚未结束的子 run，并保留已有历史、结果和回放。“删除”则会移除整个运行组及其子 run 的持久化记录和回放资源，不是隐藏列表，也没有撤销功能；需要保留结果时应使用取消。
 
 ## 其他本地命令
 
@@ -310,6 +320,27 @@ npm run test:pr
 npm run test:browser
 python -m unittest tests/test_mazebench_cli.py
 ```
+
+涉及 schema 时，修改生成源 `scripts/build-standalone-validators.js` 后重新构建；不要手工编辑 `shared/validators.standalone.js` 或 `public/validators.standalone.js`。涉及 runtime 源文件时，通过同步脚本更新 `environments/mazebench/mazebench/runtime/`，不要直接修改镜像副本；新增运行时文件需确认已被同步清单覆盖。
+
+```bash
+npm run build:validators
+npm run sync-runtime
+node tests/runtime-drift.test.js
+```
+
+External Play / MCP 改动的专项回归和完整 Node 验证：
+
+```bash
+node tests/external-play-service.test.js
+node tests/external-run-groups.test.js
+node tests/maze-external-mcp.test.js
+node tests/adversarial-mcp-external-stress.test.js
+npm run test:browser
+npm test
+```
+
+报告测试结果时应分别注明通过、失败和因环境限制跳过的项目，不能把跳过当作通过。仅修改 README 或 AGENTS.md 无需重新生成 validators 或同步 runtime。
 
 相关文档：
 

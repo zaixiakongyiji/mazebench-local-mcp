@@ -1477,13 +1477,16 @@ function createPageRenderer({
         </section>`
       : "";
     const groupHistoryHtml = groups.length
-      ? `<section class="panel" style="margin-top: 24px;">
+      ? `<section class="panel" id="external-group-history-section" style="margin-top: 24px;">
           <h2 data-i18n="ext_history_title">Run Group History</h2>
           <div class="external-group-list">
-            ${groups.map((group) => `<a class="external-group-list__item" href="/external-play/groups/${encodeURIComponent(group.group_id)}">
-              <span><strong>${escapeHtml(group.mode === "competition" ? "Competition" : "Concurrent")}</strong><small>${escapeHtml(group.group_id)}</small></span>
-              <span>${group.entries.length} runs · ${escapeHtml(group.status)}</span>
-            </a>`).join("")}
+            ${groups.map((group) => `<div class="external-group-list__item" data-group-id="${escapeHtml(group.group_id)}">
+              <a class="external-group-list__link" href="/external-play/groups/${encodeURIComponent(group.group_id)}">
+                <span><strong>${escapeHtml(group.mode === "competition" ? "Competition" : "Concurrent")}</strong><small>${escapeHtml(group.group_id)}</small></span>
+                <span>${group.entries.length} runs · ${escapeHtml(group.status)}</span>
+              </a>
+              <button type="button" class="button button--danger button--small external-group-delete-btn" data-group-id="${escapeHtml(group.group_id)}" title="Delete" data-i18n="ext_delete_group_btn">删除</button>
+            </div>`).join("")}
           </div>
         </section>`
       : "";
@@ -1613,7 +1616,10 @@ args = ["mcp"]</code></pre>
             <h1 data-i18n="ext_group_page_title">External Run Group</h1>
             <p class="muted"><code>${escapeHtml(group.group_id)}</code> · <span id="external-group-status">${escapeHtml(group.status)}</span></p>
           </div>
-          <button id="cancel-external-group" class="button--danger" type="button" data-i18n="ext_cancel_group_btn">Cancel unfinished runs</button>
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <button id="cancel-external-group" class="button--danger" type="button" data-i18n="ext_cancel_group_btn">Cancel unfinished runs</button>
+            <button id="delete-external-group" class="button--danger" type="button" data-group-id="${escapeHtml(group.group_id)}" data-i18n="ext_delete_group_btn">Delete</button>
+          </div>
         </div>
         <section class="panel external-group-bootstrap">
           <h2 data-i18n="ext_bootstrap_title">Model bootstrap prompt</h2>

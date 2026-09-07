@@ -422,6 +422,58 @@
       containerId: "resume-requests-container",
       countId: "resume-requests-count"
     });
+
+    function initGroupHistoryDeletions() {
+      const historySection = document.getElementById("external-group-history-section");
+      if (!historySection) return;
+
+      historySection.addEventListener("click", async (e) => {
+        const deleteBtn = e.target.closest(".external-group-delete-btn");
+        if (!deleteBtn) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const groupId = deleteBtn.getAttribute("data-group-id");
+        if (!groupId) return;
+
+        showConfirmDialog({
+          title: isZh() ? "删除运行组历史" : "Delete Run Group",
+          message: isZh()
+            ? `确定要删除运行组 ${groupId} 及其所有历史记录吗？此操作不可撤销。`
+            : `Are you sure you want to delete run group ${groupId} and its records? This cannot be undone.`,
+          confirmText: isZh() ? "确认删除" : "Delete",
+          cancelText: isZh() ? "取消" : "Cancel",
+          onConfirm: async () => {
+            deleteBtn.disabled = true;
+            deleteBtn.textContent = isZh() ? "正在删除..." : "Deleting...";
+            try {
+              const res = await fetch(`/api/external-play/groups/${encodeURIComponent(groupId)}`, {
+                method: "DELETE",
+                headers: { "Content-Type": "application/json" },
+                body: "{}"
+              });
+              if (!res.ok) {
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.error || `HTTP ${res.status}`);
+              }
+              const item = deleteBtn.closest(".external-group-list__item");
+              if (item) {
+                item.remove();
+              }
+              const remaining = historySection.querySelectorAll(".external-group-list__item");
+              if (remaining.length === 0) {
+                historySection.remove();
+              }
+            } catch (err) {
+              alert((isZh() ? "删除失败: " : "Failed to delete: ") + err.message);
+              deleteBtn.disabled = false;
+              deleteBtn.textContent = isZh() ? "删除" : "Delete";
+            }
+          }
+        });
+      });
+    }
+    initGroupHistoryDeletions();
   }
 
   function initGroupPage() {
@@ -519,6 +571,41 @@
         } finally {
           cancelButton.disabled = false;
         }
+      });
+    }
+
+    const deleteButton = document.getElementById("delete-external-group");
+    if (deleteButton) {
+      deleteButton.addEventListener("click", async () => {
+        const groupId = group.group_id;
+        showConfirmDialog({
+          title: isZh() ? "删除运行组" : "Delete Run Group",
+          message: isZh()
+            ? `确定要删除当前运行组 ${groupId} 吗？所有运行记录将被彻底移除，页面将返回控制台。`
+            : `Are you sure you want to delete run group ${groupId}? All records will be removed and you will return to console.`,
+          confirmText: isZh() ? "确认删除" : "Delete",
+          cancelText: isZh() ? "取消" : "Cancel",
+          onConfirm: async () => {
+            deleteButton.disabled = true;
+            deleteButton.textContent = isZh() ? "正在删除..." : "Deleting...";
+            try {
+              const res = await fetch(`/api/external-play/groups/${encodeURIComponent(groupId)}`, {
+                method: "DELETE",
+                headers: { "Content-Type": "application/json" },
+                body: "{}"
+              });
+              if (!res.ok) {
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.error || `HTTP ${res.status}`);
+              }
+              window.location.assign("/external-play");
+            } catch (err) {
+              alert((isZh() ? "删除失败: " : "Failed to delete: ") + err.message);
+              deleteButton.disabled = false;
+              deleteButton.textContent = isZh() ? "删除" : "Delete";
+            }
+          }
+        });
       });
     }
 
