@@ -229,5 +229,181 @@ assert.throws(
   /outside/
 );
 
+// --- AC-R2: atomic validation and transaction rollback for local world update ---
+const multiRoomState = {
+  version: "mazebench-build-world-v1",
+  title: "Multi Room World",
+  world: { width: 2, height: 1 },
+  levels: [
+    {
+      id: "level_AxA",
+      column: "A",
+      row: "A",
+      width: 4,
+      height: 3,
+      cells: [
+        ["#", "#", "#", "#"],
+        ["#", ".+p", ".+G", "#"],
+        ["#", "#", "#", "#"]
+      ]
+    },
+    {
+      id: "level_BxA",
+      column: "B",
+      row: "A",
+      width: 4,
+      height: 3,
+      cells: [
+        ["#", "#", "#", "#"],
+        ["#", ".", ".", "#"],
+        ["#", "#", "#", "#"]
+      ]
+    }
+  ]
+};
+
+const atomicWorld = buildWorlds.createLocalWorld({ editorState: multiRoomState, title: "Atomic World" });
+const atomicWorldDir = path.join(gamesDir, atomicWorld.id);
+const origAxA = fs.readFileSync(path.join(atomicWorldDir, "levels", "level_AxA.txt"), "utf8");
+const origBxA = fs.readFileSync(path.join(atomicWorldDir, "levels", "level_BxA.txt"), "utf8");
+const origParsing = fs.readFileSync(path.join(atomicWorldDir, "world_parsing.json"), "utf8");
+const origMap = fs.readFileSync(path.join(atomicWorldDir, "world_map.json"), "utf8");
+const origDraft = fs.readFileSync(path.join(atomicWorldDir, "draft.json"), "utf8");
+
+// 1. 全量前置校验：第 2 个房间包含非法 token，校验报错且严禁修改任何磁盘文件
+const invalidTokenState = {
+  version: "mazebench-build-world-v1",
+  title: "Dirty World Attempt",
+  world: { width: 2, height: 1 },
+  levels: [
+    {
+      id: "level_AxA",
+      column: "A",
+      row: "A",
+      width: 4,
+      height: 3,
+      cells: [
+        ["#", "#", "#", "#"],
+        ["#", ".+G", ".+p", "#"], // 修改第 1 个房间
+        ["#", "#", "#", "#"]
+      ]
+    },
+    {
+      id: "level_BxA",
+      column: "B",
+      row: "A",
+      width: 4,
+      height: 3,
+      cells: [
+        ["#", "#", "#", "#"],
+        ["#", "INVALID_TOKEN_TEST", ".", "#"], // 第 2 个房间非法 token
+        ["#", "#", "#", "#"]
+      ]
+    }
+  ]
+};
+
+assert.throws(
+  () => buildWorlds.replaceLocalWorldFromEditorState(atomicWorld.id, invalidTokenState),
+  /Unknown token/
+);
+
+// 校验前置拦截后所有磁盘文件 100% 保持原样，无任何残存修改
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "levels", "level_AxA.txt"), "utf8"), origAxA, "level_AxA 必须保持原样");
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "levels", "level_BxA.txt"), "utf8"), origBxA, "level_BxA 必须保持原样");
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "world_parsing.json"), "utf8"), origParsing, "world_parsing.json 必须保持原样");
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "world_map.json"), "utf8"), origMap, "world_map.json 必须保持原样");
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "draft.json"), "utf8"), origDraft, "draft.json 必须保持原样");
+
+// 2. 写入阶段抛错时原子事务回滚
+const validUpdateState = {
+  version: "mazebench-build-world-v1",
+  title: "Valid Updated World",
+  world: { width: 2, height: 1 },
+  levels: [
+    {
+      id: "level_AxA",
+      column: "A",
+      row: "A",
+      width: 4,
+      height: 3,
+      cells: [
+        ["#", "#", "#", "#"],
+        ["#", ".+G", ".+p", "#"],
+        ["#", "#", "#", "#"]
+      ]
+    },
+    {
+      id: "level_BxA",
+      column: "B",
+      row: "A",
+      width: 4,
+      height: 3,
+      cells: [
+        ["#", "#", "#", "#"],
+        ["#", ".+p", ".+G", "#"],
+        ["#", "#", "#", "#"]
+      ]
+    }
+  ]
+};
+
+const originalWriteFileSync = fs.writeFileSync;
+try {
+  fs.writeFileSync = function (filePath, data, options) {
+    if (typeof filePath === "string" && filePath.includes(atomicWorld.id) && filePath.endsWith("world_map.json")) {
+      throw new Error("Synthetic I/O failure writing world_map.json");
+    }
+    return originalWriteFileSync.apply(this, arguments);
+  };
+
+  assert.throws(
+    () => buildWorlds.replaceLocalWorldFromEditorState(atomicWorld.id, validUpdateState),
+    /Synthetic I\/O failure/
+  );
+} finally {
+  fs.writeFileSync = originalWriteFileSync;
+}
+
+// 校验回滚后所有文件无损恢复原版内容
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "levels", "level_AxA.txt"), "utf8"), origAxA, "写入失败后 level_AxA 必须原子回滚");
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "levels", "level_BxA.txt"), "utf8"), origBxA, "写入失败后 level_BxA 必须原子回滚");
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "world_parsing.json"), "utf8"), origParsing, "写入失败后 world_parsing.json 必须原子回滚");
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "world_map.json"), "utf8"), origMap, "写入失败后 world_map.json 必须原子回滚");
+assert.equal(fs.readFileSync(path.join(atomicWorldDir, "draft.json"), "utf8"), origDraft, "写入失败后 draft.json 必须原子回滚");
+
+// --- AC-R4: Windows 环境下新建草稿正确建立主世界资源链接 (images / assets_3d) ---
+console.log("Testing AC-R4: Windows draft shared asset links creation...");
+const testAssetContent = "PNG_SAMPLE_DATA";
+fs.writeFileSync(path.join(mazeDir, "images", "player.png"), testAssetContent, "utf8");
+fs.writeFileSync(path.join(mazeDir, "assets_3d", "wall.obj"), "OBJ_SAMPLE_DATA", "utf8");
+
+const draftWithAssets = buildWorlds.createLocalWorld({ title: "Draft Asset Test", worldWidth: 1, worldHeight: 1 });
+const draftDir = path.join(gamesDir, draftWithAssets.id);
+const imagesLink = path.join(draftDir, "images");
+const assets3dLink = path.join(draftDir, "assets_3d");
+
+assert.ok(fs.existsSync(imagesLink), "草稿目录下 images 软链接/Junction 必须存在");
+assert.ok(fs.existsSync(assets3dLink), "草稿目录下 assets_3d 软链接/Junction 必须存在");
+
+if (process.platform === "win32") {
+  const imagesStat = fs.lstatSync(imagesLink);
+  assert.ok(imagesStat.isSymbolicLink(), "Windows 下 images 必须作为软链接/Junction 创建");
+  const assetsStat = fs.lstatSync(assets3dLink);
+  assert.ok(assetsStat.isSymbolicLink(), "Windows 下 assets_3d 必须作为软链接/Junction 创建");
+}
+
+// 验证能透过软链接真实读取主世界资源
+assert.equal(
+  fs.readFileSync(path.join(imagesLink, "player.png"), "utf8"),
+  testAssetContent,
+  "透过草稿 images 链接必须能读取主世界资源内容"
+);
+assert.equal(
+  fs.readFileSync(path.join(assets3dLink, "wall.obj"), "utf8"),
+  "OBJ_SAMPLE_DATA",
+  "透过草稿 assets_3d 链接必须能读取主世界 3D 资源内容"
+);
+
 fs.rmSync(tempRoot, { recursive: true, force: true });
 console.log("local build world tests passed");

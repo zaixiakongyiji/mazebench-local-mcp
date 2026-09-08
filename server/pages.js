@@ -1507,7 +1507,7 @@ function createPageRenderer({
 
         <section class="panel resume-requests-panel" id="resume-requests-section" style="margin-bottom: 24px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <h2 style="margin: 0;" data-i18n="ext_resume_requests_title">恢复申请 / Resume Requests</h2>
+            <h2 style="margin: 0;" data-i18n="ext_resume_requests_title">Resume Requests</h2>
             <span class="badge" id="resume-requests-count">0 pending</span>
           </div>
           <div id="resume-requests-container" class="resume-requests-container">

@@ -459,6 +459,7 @@ def run_launch(
         port = int(pairs.get("port", "3000") or "3000")
     except ValueError:
         port = 3000
+    port = _find_free_port(host, port)
 
     state_file = _state_file()
     state_file.parent.mkdir(parents=True, exist_ok=True)

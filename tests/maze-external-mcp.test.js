@@ -120,6 +120,7 @@ class TestJsonRpcClient {
 async function runMcpTests() {
   console.log("Starting maze-external-mcp stdio adapter tests...");
   await testResumePollingLifecycle();
+  await require("./terminal-reclaim-review.test").runTests();
 
   const testDataHome = fs.mkdtempSync(path.join(os.tmpdir(), "mazebench-mcp-test-"));
   process.env.MAZEBENCH_DATA_HOME = testDataHome;
@@ -638,6 +639,168 @@ async function runMcpTests() {
       assert.equal(externalPlay.getRun(spare.run_id).status, "armed");
     } finally {
       recoveryChild.kill("SIGTERM");
+      await externalPlay.cancelGroup(recoveryGroup.group_id);
+      for (const entry of recoveryGroup.entries) {
+        const r = externalPlay.getRun(entry.run_id);
+        if (r) {
+          while (r.status === "finalizing") await new Promise((res) => setTimeout(res, 10));
+        }
+      }
+    }
+
+    // 18. 单局正常结束后同一 adapter 进程直接执行显式 start({ model_name }) 成功认领 2 席位组的新席位，并成功执行动作
+    console.log("  [Test 18] Single run ends normally -> same adapter process explicitly starts new group run and acts");
+    const test18SingleRun = await externalPlay.createRun({ maxActions: 2 });
+    const test18Child = spawn(process.execPath, [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")], {
+      env: { ...process.env, MAZEBENCH_DATA_HOME: testDataHome },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    try {
+      const test18Client = new TestJsonRpcClient(test18Child);
+      const initRes18 = await test18Client.sendRequest(600, "initialize", {
+        protocolVersion: "2025-06-18",
+        clientInfo: { name: "test18-client" }
+      });
+      assert.equal(initRes18.result?.serverInfo?.name, "mazebench");
+
+      // 认领第一局单局
+      const start18Res = await test18Client.sendRequest(601, "tools/call", {
+        name: "start",
+        arguments: { model_name: "T18-Model-Single" }
+      });
+      assert.equal(start18Res.result?.isError, false);
+      const start18Payload = JSON.parse(start18Res.result.content[0].text);
+      assert.equal(start18Payload.run_id, test18SingleRun.runId);
+
+      // 执行两步动作使其达到 action_limit 终态
+      const act18_1 = await test18Client.sendRequest(602, "tools/call", { name: "rotate_camera_left", arguments: {} });
+      assert.equal(act18_1.result?.isError, false);
+      const act18_2 = await test18Client.sendRequest(603, "tools/call", { name: "rotate_camera_right", arguments: {} });
+      assert.equal(act18_2.result?.isError, false);
+      const act18_2Payload = JSON.parse(act18_2.result.content[0].text);
+      assert.equal(act18_2Payload.ended, true);
+      assert.equal(act18_2Payload.actions_remaining, 0);
+
+      while (test18SingleRun.status === "finalizing") {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(test18SingleRun.status, "action_limit");
+
+      // 创建一个 2 席位并发组
+      const group18 = await externalPlay.createGroup({ mode: "concurrent", count: 2, maxActions: 5 });
+      assert.equal(group18.status, "awaiting_claim");
+      assert.equal(group18.entries.filter((e) => e.status === "armed").length, 2);
+
+      // 关键验证：同一 adapter 进程直接执行显式 start({ model_name }) 认领新席位
+      const start18GroupRes = await test18Client.sendRequest(604, "tools/call", {
+        name: "start",
+        arguments: { model_name: "T18-Model-Group" }
+      });
+      assert.equal(start18GroupRes.result?.isError, false);
+      const start18GroupPayload = JSON.parse(start18GroupRes.result.content[0].text);
+      assert.notEqual(start18GroupPayload.run_id, test18SingleRun.runId);
+      assert.equal(start18GroupPayload.group_id, group18.group_id);
+      assert.equal(start18GroupPayload.status, "active");
+
+      // 验证在组中成功认领 1 席，剩余 1 席仍为 armed
+      const group18State = externalPlay.getGroup(group18.group_id);
+      assert.equal(group18State.entries.filter((e) => e.status === "active").length, 1);
+      assert.equal(group18State.entries.filter((e) => e.status === "armed").length, 1);
+
+      // 验证新局能正常执行游戏动作与观察
+      const act18_3 = await test18Client.sendRequest(605, "tools/call", { name: "rotate_camera_left", arguments: {} });
+      assert.equal(act18_3.result?.isError, false);
+      const act18_3Payload = JSON.parse(act18_3.result.content[0].text);
+      assert.equal(act18_3Payload.action_seq, 1);
+
+      const obs18 = await test18Client.sendRequest(606, "tools/call", { name: "observe", arguments: {} });
+      assert.equal(obs18.result?.isError, false);
+      const obs18Payload = JSON.parse(obs18.result.content[0].text);
+      assert.ok(obs18Payload.observation?.current_room);
+
+      await externalPlay.cancelGroup(group18.group_id);
+      for (const entry of group18.entries) {
+        const r = externalPlay.getRun(entry.run_id);
+        if (r) {
+          while (r.status === "finalizing") await new Promise((res) => setTimeout(res, 10));
+        }
+      }
+    } finally {
+      test18Child.kill("SIGTERM");
+    }
+
+    // 19. 单局正常结束后人为抹除 controller token（模拟认证失效），再次执行显式 start({ model_name }) 成功通过服务端权威终态核验自愈换发新凭据并直接认领新组席位，无需网页审批
+    console.log("  [Test 19] Single run ends -> auth invalidated -> start reauths via previous_run terminal check without web approval");
+    const test19SingleRun = await externalPlay.createRun({ maxActions: 1 });
+    const test19Child = spawn(process.execPath, [path.resolve(__dirname, "..", "scripts", "maze-external-mcp.js")], {
+      env: { ...process.env, MAZEBENCH_DATA_HOME: testDataHome },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    try {
+      const test19Client = new TestJsonRpcClient(test19Child);
+      await test19Client.sendRequest(700, "initialize", {
+        protocolVersion: "2025-06-18",
+        clientInfo: { name: "test19-client" }
+      });
+
+      const start19Res = await test19Client.sendRequest(701, "tools/call", {
+        name: "start",
+        arguments: { model_name: "T19-Model-Initial" }
+      });
+      assert.equal(start19Res.result?.isError, false);
+      const start19Payload = JSON.parse(start19Res.result.content[0].text);
+      assert.equal(start19Payload.run_id, test19SingleRun.runId);
+
+      // 执行动作使其达到终态
+      const act19_1 = await test19Client.sendRequest(702, "tools/call", { name: "rotate_camera_left", arguments: {} });
+      assert.equal(act19_1.result?.isError, false);
+      const act19_1Payload = JSON.parse(act19_1.result.content[0].text);
+      assert.equal(act19_1Payload.ended, true);
+
+      while (test19SingleRun.status === "finalizing") {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(test19SingleRun.status, "action_limit");
+
+      // 人为抹除服务端保存的 controller token，模拟认证失效 / 服务重启 / token 到期
+      for (const [token, info] of externalPlay.controllerTokens) {
+        if (info.declaredCli === "test19-client") {
+          externalPlay.controllerTokens.delete(token);
+        }
+      }
+
+      // 创建 2 席位组
+      const group19 = await externalPlay.createGroup({ mode: "concurrent", count: 2, maxActions: 5 });
+      assert.equal(group19.status, "awaiting_claim");
+
+      // 旧 adapter 进程在本地认证失效情况下再次调用显式 start
+      const start19ReauthRes = await test19Client.sendRequest(703, "tools/call", {
+        name: "start",
+        arguments: { model_name: "T19-Model-Reclaim" }
+      });
+      assert.equal(start19ReauthRes.result?.isError, false, "Start must self-heal and succeed after terminal previous_run verification");
+      const start19ReauthPayload = JSON.parse(start19ReauthRes.result.content[0].text);
+      assert.equal(start19ReauthPayload.group_id, group19.group_id);
+      assert.equal(start19ReauthPayload.status, "active");
+      assert.notEqual(start19ReauthPayload.run_id, test19SingleRun.runId);
+
+      // 验证未产生 pending_approval，直接获得控制权
+      assert.equal(start19ReauthPayload.review_url, undefined);
+
+      // 验证能成功执行动作
+      const act19_2 = await test19Client.sendRequest(704, "tools/call", { name: "rotate_camera_right", arguments: {} });
+      assert.equal(act19_2.result?.isError, false);
+      assert.equal(JSON.parse(act19_2.result.content[0].text).action_seq, 1);
+
+      await externalPlay.cancelGroup(group19.group_id);
+      for (const entry of group19.entries) {
+        const r = externalPlay.getRun(entry.run_id);
+        if (r) {
+          while (r.status === "finalizing") await new Promise((res) => setTimeout(res, 10));
+        }
+      }
+    } finally {
+      test19Child.kill("SIGTERM");
     }
 
     console.log("All maze-external-mcp stdio adapter tests PASSED!");

@@ -221,3 +221,38 @@ class CliCommandTests(TestCase):
         result = mazebench_cli.run_launch(root, [], {"open": "true"}, [])
         self.assertEqual(result, 0)
         mock_open.assert_called_once_with("http://127.0.0.1:3000/external-play")
+
+    @mock.patch("webbrowser.open")
+    @mock.patch("subprocess.Popen")
+    @mock.patch.object(mazebench_cli, "_find_free_port", return_value=3001)
+    @mock.patch.object(mazebench_cli, "_read_state", return_value=None)
+    @mock.patch.object(
+        mazebench_cli,
+        "_wait_for_state",
+        return_value={"url": "http://127.0.0.1:3001", "pid": 5555},
+    )
+    @mock.patch.object(mazebench_cli, "_require")
+    @mock.patch.object(mazebench_cli, "_node_bin", return_value="node")
+    def test_run_launch_uses_find_free_port(
+        self,
+        _node_bin,
+        _require,
+        _wait_for_state,
+        _read_state,
+        mock_find_port,
+        mock_popen,
+        mock_open,
+    ):
+        mock_proc = mock.MagicMock()
+        mock_proc.pid = 5555
+        mock_popen.return_value = mock_proc
+
+        root = Path("/maze")
+        result = mazebench_cli.run_launch(
+            root, ["bg"], {"port": "3000", "open": "false"}, []
+        )
+        self.assertEqual(result, 0)
+        mock_find_port.assert_called_once_with("127.0.0.1", 3000)
+
+        _, kwargs = mock_popen.call_args
+        self.assertEqual(kwargs["env"]["PORT"], "3001")

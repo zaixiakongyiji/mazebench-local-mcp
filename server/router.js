@@ -182,10 +182,19 @@ function createRequestRouter({
         const payload = await readJsonBody(request);
         try {
           const nonce = payload.mcp_bootstrap_nonce || payload.nonce;
-          const res = await externalPlay.handleControllerSession(nonce, payload.clientInfo);
+          const options = {};
+          if (payload.previous_run_id !== undefined) {
+            options.previousRunId = payload.previous_run_id;
+          }
+          const res = await externalPlay.handleControllerSession(nonce, payload.clientInfo, options);
           sendJson(response, 200, res);
         } catch (err) {
-          sendJson(response, err.status || 403, { error: err.message, code: err.code || "FORBIDDEN" });
+          sendJson(response, err.status || 500, {
+            error: err.message,
+            code: err.code || "INTERNAL_ERROR",
+            ...(err.run_id ? { run_id: err.run_id } : {}),
+            ...(err.status_name ? { status: err.status_name } : {})
+          });
         }
         return;
       }

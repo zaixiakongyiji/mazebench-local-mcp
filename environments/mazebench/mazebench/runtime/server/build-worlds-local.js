@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { defaultEditorState } = require("../shared/default-world-template");
 
@@ -113,12 +114,12 @@ function createLocalBuildWorldService({
 
   function ensureSharedAssetLinks(gameId) {
     SHARED_ASSET_DIRS.forEach((dirName) => {
-      const linkPath = path.join(localWorldDir(gameId), dirName);
+      const linkPath = path.resolve(localWorldDir(gameId), dirName);
 
       if (!fs.existsSync(linkPath)) {
         try {
           if (process.platform === "win32") {
-            const targetPath = path.join(localWorldDir("maze"), dirName);
+            const targetPath = path.resolve(gamesDir, "maze", dirName);
             fs.symlinkSync(targetPath, linkPath, "junction");
           } else {
             fs.symlinkSync(path.join("..", "maze", dirName), linkPath, "dir");
@@ -247,18 +248,24 @@ function createLocalBuildWorldService({
       throw new Error(`Local world "${gameId}" did not load as a game.`);
     }
 
-    const entries = {};
-
-    levels.forEach((level) => {
+    // 全量内存前置校验：先对所有房间进行合法性预校验与数据准备，若任一房间不合法立即抛错，杜绝部分写入
+    const preparedLevels = levels.map((level) => {
       const sanitized = sanitizeEditorPayload(game, {
         cells: level.cells,
         width: level.width ?? (level.cells[0] || []).length,
         height: level.height ?? level.cells.length
       });
-      const fileName = `${level.id}.txt`;
+      return {
+        fileName: `${level.id}.txt`,
+        rawText: sanitized.rawText,
+        coordinates: [level.column, level.row]
+      };
+    });
 
-      fs.writeFileSync(path.join(levelsDir, fileName), `${sanitized.rawText}\n`, "utf8");
-      entries[fileName] = [level.column, level.row];
+    const entries = {};
+    preparedLevels.forEach((item) => {
+      fs.writeFileSync(path.join(levelsDir, item.fileName), `${item.rawText}\n`, "utf8");
+      entries[item.fileName] = item.coordinates;
     });
 
     // Drop level files that are no longer part of the world.
@@ -311,19 +318,146 @@ function createLocalBuildWorldService({
 
   function replaceLocalWorldFromEditorState(gameId, editorState, { title = null, remote = null } = {}) {
     const normalized = normalizeEditorState(editorState);
+    const worldDir = localWorldDir(gameId);
+    const levelsDir = path.join(worldDir, "levels");
+    const game = getGame(gameId);
 
-    writeWorldParsing(gameId, normalized.worldWidth, normalized.worldHeight);
-    applyEditorStateLevels(gameId, normalized.levels);
-    updateDraftMeta(gameId, {
-      title: title || normalized.title,
-      ...(remote
-        ? {
-            remote_id: remote.id ?? undefined,
-            remote_updated_at: remote.updated_at ?? undefined,
-            remote_status: remote.status ?? undefined
-          }
-        : {})
+    if (!game) {
+      throw new Error(`Local world "${gameId}" did not load as a game.`);
+    }
+
+    // 1. 全量前置内存校验：在触碰任何磁盘文件前，在内存中对所有房间预先调用 sanitizeEditorPayload
+    // 若发现非法 token 或尺寸不符，直接抛错，此时严禁触碰任何磁盘文件（world_parsing.json、world_map.json、levels/*.txt 100% 保持原样）
+    normalized.levels.forEach((level) => {
+      sanitizeEditorPayload(game, {
+        cells: level.cells,
+        width: level.width ?? (level.cells[0] || []).length,
+        height: level.height ?? level.cells.length
+      });
     });
+
+    // 2. 事务快照备份：在系统临时目录备份现有关卡及核心元数据
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), `mazebench-world-backup-${gameId}-`));
+    let isMutating = false;
+    let rollbackFailed = false;
+    const originalMetadataFiles = new Set();
+    try {
+      if (fs.existsSync(levelsDir)) {
+        const backupLevelsDir = path.join(backupDir, "levels");
+        fs.mkdirSync(backupLevelsDir, { recursive: true });
+        listTopLevelFiles(levelsDir).forEach((file) => {
+          fs.copyFileSync(path.join(levelsDir, file), path.join(backupLevelsDir, file));
+        });
+      }
+      ["world_map.json", "world_parsing.json", "draft.json"].forEach((file) => {
+        const src = path.join(worldDir, file);
+        if (fs.existsSync(src)) {
+          originalMetadataFiles.add(file);
+          fs.copyFileSync(src, path.join(backupDir, file));
+        }
+      });
+
+      // 3. 标记进入变更事务阶段：此后任何写入故障均触发回滚保护
+      isMutating = true;
+
+      writeWorldParsing(gameId, normalized.worldWidth, normalized.worldHeight);
+      applyEditorStateLevels(gameId, normalized.levels);
+      updateDraftMeta(gameId, {
+        title: title || normalized.title,
+        ...(remote
+          ? {
+              remote_id: remote.id ?? undefined,
+              remote_updated_at: remote.updated_at ?? undefined,
+              remote_status: remote.status ?? undefined
+            }
+          : {})
+      });
+    } catch (err) {
+      // 4. 回滚保护：仅在已进入变更阶段时才执行回滚，杜绝备份未完成时误删原世界文件
+      if (isMutating) {
+        // A. 关卡房间文件还原（细粒度隔离：单个房间异常绝不阻断其他房间及元数据还原）
+        try {
+          const backupLevelsDir = path.join(backupDir, "levels");
+          if (fs.existsSync(backupLevelsDir)) {
+            if (!fs.existsSync(levelsDir)) {
+              try {
+                fs.mkdirSync(levelsDir, { recursive: true });
+              } catch (mkdirErr) {
+                rollbackFailed = true;
+                console.error(`Failed to recreate levels directory during rollback for ${gameId}:`, mkdirErr);
+              }
+            }
+
+            const backupFileNames = new Set(listTopLevelFiles(backupLevelsDir));
+
+            // A1. 仅清理写入阶段新增的孤儿关卡文件（不在备份集中的文件）
+            if (fs.existsSync(levelsDir)) {
+              listTopLevelFiles(levelsDir).forEach((file) => {
+                if (!backupFileNames.has(file)) {
+                  try {
+                    fs.unlinkSync(path.join(levelsDir, file));
+                  } catch (unlinkErr) {
+                    rollbackFailed = true;
+                    console.error(`Failed to unlink stray level file ${file} during rollback for ${gameId}:`, unlinkErr);
+                  }
+                }
+              });
+            }
+
+            // A2. 逐一覆盖还原每个原有关卡文件（每文件独立 try-catch）
+            backupFileNames.forEach((file) => {
+              try {
+                fs.copyFileSync(path.join(backupLevelsDir, file), path.join(levelsDir, file));
+              } catch (copyErr) {
+                rollbackFailed = true;
+                console.error(`Failed to restore level file ${file} during rollback for ${gameId}:`, copyErr);
+              }
+            });
+          }
+        } catch (levelsRollbackErr) {
+          rollbackFailed = true;
+          console.error(`Unexpected failure during levels rollback for ${gameId}:`, levelsRollbackErr);
+        }
+
+        // B. 核心元数据文件还原（细粒度隔离：每个元数据文件独立还原保护）
+        ["world_map.json", "world_parsing.json", "draft.json"].forEach((file) => {
+          try {
+            const backupFile = path.join(backupDir, file);
+            const targetFile = path.join(worldDir, file);
+            if (fs.existsSync(backupFile)) {
+              fs.copyFileSync(backupFile, targetFile);
+            } else if (fs.existsSync(targetFile)) {
+              // 仅当该元数据文件在备份中原本不存在时（即本次写入新增的文件），才执行删除
+              try {
+                fs.unlinkSync(targetFile);
+              } catch (unlinkMetaErr) {
+                rollbackFailed = true;
+                console.error(`Failed to unlink stray metadata file ${file} during rollback for ${gameId}:`, unlinkMetaErr);
+              }
+            }
+          } catch (metaErr) {
+            rollbackFailed = true;
+            console.error(`Failed to restore metadata file ${file} during rollback for ${gameId}:`, metaErr);
+          }
+        });
+
+        if (rollbackFailed) {
+          err.rollback_incomplete = true;
+          err.backup_dir = backupDir;
+          err.message = `${err.message} (Rollback incomplete for world "${gameId}"; backup preserved at "${backupDir}")`;
+        }
+      }
+      throw err;
+    } finally {
+      // 5. 仅在更新成功或确认完整回滚后清理临时快照目录；回滚不完整时保留备份以供恢复
+      if (!isMutating || !rollbackFailed) {
+        try {
+          fs.rmSync(backupDir, { recursive: true, force: true });
+        } catch (_e) {}
+      } else {
+        console.warn(`[build-worlds-local] Preserving world backup for "${gameId}" at: ${backupDir}`);
+      }
+    }
 
     return getGame(gameId);
   }
