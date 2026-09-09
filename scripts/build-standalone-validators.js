@@ -132,7 +132,8 @@ const bundleSchema = {
             "event_id": { "type": "integer", "minimum": 1 },
             "tool": { "type": "string", "maxLength": 64 },
             "arguments": { "$ref": "#/$defs/action_rejected_arguments" },
-            "error_payload": { "$ref": "#/$defs/error_payload_safe" }
+            "error_payload": { "$ref": "#/$defs/error_payload_safe" },
+            "sanitized_result": { "$ref": "#/$defs/mcp_call_result" }
           },
           "required": ["journal_seq", "timestamp", "run_id", "type", "operation_id", "request_fingerprint", "controller_id", "lease_id", "lease_epoch", "event_id", "tool", "arguments", "error_payload"],
           "additionalProperties": false

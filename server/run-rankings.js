@@ -11,7 +11,8 @@ function getRunFinalNovelty(runDir, summary = null) {
 
   const actionsPath = path.join(runDir, "actions.jsonl");
   const journalPath = path.join(runDir, "journal.jsonl");
-  const targetPath = fs.existsSync(actionsPath) ? actionsPath : (fs.existsSync(journalPath) ? journalPath : null);
+  // 权威数据源为 journal.jsonl！若 journal.jsonl 存在优先从权威 WAL 计算排名与 novelty
+  const targetPath = fs.existsSync(journalPath) ? journalPath : (fs.existsSync(actionsPath) ? actionsPath : null);
   if (!targetPath) return 0;
 
   try {

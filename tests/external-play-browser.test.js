@@ -408,6 +408,59 @@ async function runBrowserTest() {
     assert.equal(reqStatus.status, "approved");
     assert.equal(reqStatus.lease_epoch, 2);
 
+    // 5 万步回放只请求一个窗口，并按历史增量标记宝石。
+    const longPage = await context.newPage();
+    const pageErrors = [];
+    longPage.on("pageerror", error => pageErrors.push(error.message));
+    let actionPages = 0;
+    let snapshotRequests = 0;
+    let eventRequests = 0;
+    const longPrefix = `/api/external-play/runs/${run9.runId}`;
+    await longPage.route("**/api/external-play/runs/**", async route => {
+      const u = new URL(route.request().url());
+      if (u.pathname === `${longPrefix}/snapshot`) {
+        snapshotRequests++;
+        return route.fulfill({ json: {
+          base_viewer_state: run9.baseViewerState, current_viewer_state: run9.currentViewerState,
+          action_seq: 50000, as_of_event_id: 50000, status: "active", started_at: run9.startedAt,
+          max_actions: 60000, visited_levels: ["level_HxI"]
+        } });
+      }
+      if (u.pathname === `${longPrefix}/actions`) {
+        actionPages++;
+        const from = Number(u.searchParams.get("from_seq"));
+        const to = Math.min(50000, Number(u.searchParams.get("to_seq")), from + Number(u.searchParams.get("limit")) - 1);
+        return route.fulfill({ json: { actions: Array.from({ length: Math.max(0, to - from + 1) }, (_, i) => ({
+          seq: from + i, tool: "left", post_viewer_state: run9.currentViewerState,
+          sanitized_status: { current_room: "level_HxI", collected_gems_count: from + i >= 321 ? 1 : 0 }
+        })) } });
+      }
+      if (u.pathname === `${longPrefix}/events`) {
+        eventRequests++;
+        if (eventRequests === 1) return route.fulfill({ status: 410, json: { code: "CURSOR_EXPIRED" } });
+        return route.fulfill({ contentType: "text/event-stream", body: ": heartbeat\n\n" });
+      }
+      return route.continue();
+    });
+    await longPage.goto(`http://127.0.0.1:${port}/external-play/${run9.runId}`, { waitUntil: "domcontentloaded" });
+    await longPage.waitForFunction(() => document.querySelector("#playback-scrubber")?.value === "50000");
+    await longPage.waitForTimeout(500);
+    assert.equal(snapshotRequests, 2, "事件缺口仅重载一次快照");
+    assert.equal(actionPages, 2, "每次快照只加载一个动作窗口");
+    assert.ok(await longPage.locator(".feed-item").count() <= 200, "指令 DOM 数量有界");
+    assert.equal(await longPage.locator(".feed-item-status--gem").count(), 0, "后续步骤不能误报宝石");
+    const steps = await longPage.locator(".feed-item").evaluateAll(items => items.map(item => item.dataset.step));
+    assert.equal(new Set(steps).size, steps.length, "重连不重复追加历史");
+    await longPage.locator("#playback-scrubber").evaluate(input => {
+      input.value = "321";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await longPage.waitForSelector('.feed-item[data-step="321"].is-current');
+    assert.equal(await longPage.locator(".feed-item-status--gem").count(), 1, "只有实际获得宝石的步骤标记一次");
+    assert.equal(await longPage.locator('.feed-item[data-step="321"] .feed-item-status--gem').count(), 1);
+    assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
+    await longPage.close();
+
     console.log("Playwright E2E browser test PASSED!");
   } finally {
     if (mcpProc) {

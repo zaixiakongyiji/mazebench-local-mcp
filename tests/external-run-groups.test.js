@@ -352,6 +352,94 @@ async function runTests() {
     for (const rDir of test7RunDirs) {
       assert.ok(!fs.existsSync(rDir), "Child run directory must be deleted from disk");
     }
+
+    console.log("  [Test 8] old controller with terminal run and fresh controller concurrently claim 2-seat group");
+    const test8DataHome = fs.mkdtempSync(path.join(os.tmpdir(), "mazebench-test8-"));
+    const test8Service = new ExternalPlayService({ dataHome: test8DataHome, port: 3023, defaultMaxActions: 1 });
+    await test8Service.initialize();
+    try {
+      // 1. 旧 controller 认领单局并运行到终态
+      const oldSingleRun = await test8Service.createRun({ maxActions: 1 });
+      const oldController = await createController(test8Service, "test8-old-harness");
+      const oldClaim = await test8Service.claimRun(oldController, { model_name: "test8-old-model" }, "t8-old-claim");
+      assert.equal(oldClaim.run_id, oldSingleRun.runId);
+
+      // 执行动作使其达到 action_limit 终态
+      await oldSingleRun.executeAction(
+        oldController,
+        oldClaim.lease_id,
+        oldClaim.lease_epoch,
+        "rotate_camera_left",
+        {},
+        "t8-old-act"
+      );
+      await waitForTerminal(oldSingleRun);
+      assert.equal(oldSingleRun.status, "action_limit");
+
+      // 2. 创建 2 席位并发组
+      const group8 = await test8Service.createGroup({ mode: "concurrent", count: 2, maxActions: 5 });
+      assert.equal(group8.status, "awaiting_claim");
+      assert.equal(group8.entries.filter((e) => e.status === "armed").length, 2);
+      assert.equal(test8Service.activeGroupId, group8.group_id);
+
+      // 3. 创建一个全新 controller
+      const freshController = await createController(test8Service, "test8-fresh-harness");
+
+      // 4. 并发认领：旧连接（已完成单局终态）与全新 adapter 并发发起 claimRun
+      const [claimOld, claimFresh] = await Promise.all([
+        test8Service.claimRun(oldController, { model_name: "test8-old-reclaim" }, "t8-concurrent-old"),
+        test8Service.claimRun(freshController, { model_name: "test8-fresh-claim" }, "t8-concurrent-fresh")
+      ]);
+
+      // 5. 严格断言
+      // 两个 controller 分别认领到两个不同的 run
+      assert.notEqual(claimOld.run_id, claimFresh.run_id);
+      assert.notEqual(claimOld.run_id, oldSingleRun.runId);
+      assert.equal(claimOld.group_id, group8.group_id);
+      assert.equal(claimFresh.group_id, group8.group_id);
+
+      // 组状态达到 2/2 全满状态 (running)，且 activeGroupId 被置为 null（已无剩余空席）
+      const updatedGroup8 = test8Service.getGroup(group8.group_id);
+      assert.equal(updatedGroup8.status, "running");
+      const activeEntries = updatedGroup8.entries.filter((e) => e.status === "active");
+      const armedEntries = updatedGroup8.entries.filter((e) => e.status === "armed");
+      assert.equal(activeEntries.length, 2, "Group must be 2/2 fully claimed");
+      assert.equal(armedEntries.length, 0, "No armed seats should remain");
+      assert.equal(test8Service.activeGroupId, null, "Active group ID must be cleared when all seats claimed");
+      assert.equal(test8Service.claimableRunIds.length, 0, "No claimable runs remaining");
+
+      // 6. 验证两个 controller 均能凭借各自的新租约正常执行游戏动作
+      const rOld = test8Service.getRun(claimOld.run_id);
+      const rFresh = test8Service.getRun(claimFresh.run_id);
+      const actResOld = await rOld.executeAction(
+        oldController,
+        claimOld.lease_id,
+        claimOld.lease_epoch,
+        "rotate_camera_right",
+        {},
+        "t8-act-old-newrun"
+      );
+      assert.equal(actResOld.isError, false);
+      assert.equal(rOld.lastActionSeq, 1);
+
+      const actResFresh = await rFresh.executeAction(
+        freshController,
+        claimFresh.lease_id,
+        claimFresh.lease_epoch,
+        "rotate_camera_left",
+        {},
+        "t8-act-fresh-newrun"
+      );
+      assert.equal(actResFresh.isError, false);
+      assert.equal(rFresh.lastActionSeq, 1);
+
+      // 7. 清理并等待所有 run 终态
+      await test8Service.cancelGroup(group8.group_id);
+      await Promise.all(group8.entries.map((entry) => waitForTerminal(test8Service.getRun(entry.run_id))));
+    } finally {
+      test8Service.shutdown();
+      fs.rmSync(test8DataHome, { recursive: true, force: true });
+    }
   } finally {
     if (service.serviceState !== "SHUTDOWN") service.shutdown();
     fs.rmSync(dataHome, { recursive: true, force: true });

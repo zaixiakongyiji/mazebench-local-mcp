@@ -298,6 +298,16 @@ class ExternalPlayService {
     const tempPath = `${this.serverJsonPath}.${process.pid}.tmp`;
     fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2) + "\n", "utf8");
     fs.renameSync(tempPath, this.serverJsonPath);
+
+    if (process.env.MAZEBENCH_STATE_FILE && process.env.MAZEBENCH_STATE_FILE !== this.serverJsonPath) {
+      try {
+        const stateFile = process.env.MAZEBENCH_STATE_FILE;
+        const stateTmp = `${stateFile}.${process.pid}.tmp`;
+        fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+        fs.writeFileSync(stateTmp, JSON.stringify(payload, null, 2) + "\n", "utf8");
+        fs.renameSync(stateTmp, stateFile);
+      } catch (_err) {}
+    }
   }
 
   _clearServerJson() {
@@ -309,6 +319,16 @@ class ExternalPlayService {
         }
       }
     } catch (_e) {}
+    if (process.env.MAZEBENCH_STATE_FILE && process.env.MAZEBENCH_STATE_FILE !== this.serverJsonPath) {
+      try {
+        if (fs.existsSync(process.env.MAZEBENCH_STATE_FILE)) {
+          const content = JSON.parse(fs.readFileSync(process.env.MAZEBENCH_STATE_FILE, "utf8"));
+          if (content.pid === process.pid) {
+            fs.rmSync(process.env.MAZEBENCH_STATE_FILE, { force: true });
+          }
+        }
+      } catch (_e) {}
+    }
   }
 
   async _recoverRuns() {
@@ -476,21 +496,71 @@ class ExternalPlayService {
 
   // HTTP & Admission Handlers
 
-  async handleControllerSession(nonce, clientInfo = {}) {
+  async handleControllerSession(nonce, clientInfo = {}, options = {}) {
+    // 阶段 0：只读预检 bootstrap nonce，阻断非法请求作为状态预言机或未授权清理绑定
+    if (!nonce || nonce !== this.mcpBootstrapNonce) {
+      throw { status: 403, code: "FORBIDDEN", message: "Invalid mcp bootstrap nonce" };
+    }
+
+    let previousRunSnapshot = null;
+
+    if (options.previousRunId !== undefined && options.previousRunId !== null) {
+      if (typeof options.previousRunId !== "string" || !options.previousRunId.trim()) {
+        throw { status: 400, code: "INVALID_ARGUMENT", message: "previous_run_id must be a non-empty string" };
+      }
+      const previousRunId = options.previousRunId.trim();
+
+      await this.admissionMutex.withLock(async () => {
+        const run = this.getRun(previousRunId);
+        if (!run) {
+          throw {
+            status: 409,
+            code: "PREVIOUS_RUN_UNVERIFIED",
+            message: "Previous run not found or unverified: " + previousRunId,
+            run_id: previousRunId
+          };
+        }
+        await run.sessionMutex.withLock(async () => {
+          if (!TERMINAL_STATUSES.has(run.status)) {
+            throw {
+              status: 409,
+              code: "RUN_RESUME_REQUIRED",
+              message: "Previous run is " + run.status + ", resume required: " + previousRunId,
+              run_id: previousRunId,
+              status_name: run.status
+            };
+          }
+          previousRunSnapshot = {
+            run_id: previousRunId,
+            ended: true,
+            status: run.status
+          };
+          for (const [ctrlId, boundRunId] of this.controllerRunBindings.entries()) {
+            if (boundRunId === previousRunId) {
+              this.controllerRunBindings.delete(ctrlId);
+            }
+          }
+        });
+      });
+    }
+
     return await this.credentialMutex.withLock(async () => {
+      // 阶段 B：锁内再次核实 nonce，防止并发竞争被其他请求消费
       if (!nonce || nonce !== this.mcpBootstrapNonce) {
         throw { status: 403, code: "FORBIDDEN", message: "Invalid mcp bootstrap nonce" };
       }
-      // Generate new nonce immediately for subsequent clients/restarts
-      this.mcpBootstrapNonce = crypto.randomBytes(32).toString("hex");
-      this._writeServerJson();
 
+      // 先校验 clientInfo.name 参数，防止格式错误意外烧毁合法凭据
       const declaredCli = typeof clientInfo.name === "string" && clientInfo.name.trim()
         ? clientInfo.name.trim()
         : "unknown";
       if (declaredCli.length > 128 || /[\u0000-\u001f\u007f]/.test(declaredCli)) {
         throw { status: 400, code: "INVALID_ARGUMENT", message: "MCP clientInfo.name must be at most 128 characters without control characters" };
       }
+
+      // 校验全部通过后，才轮转 nonce 并落盘
+      this.mcpBootstrapNonce = crypto.randomBytes(32).toString("hex");
+      this._writeServerJson();
       const controllerId = `${declaredCli.slice(0, 80)}-${crypto.randomUUID().slice(0, 8)}`;
       const token = `mcp_${crypto.randomBytes(32).toString("hex")}`;
       this.controllerTokens.set(token, {
@@ -500,11 +570,15 @@ class ExternalPlayService {
         createdAt: Date.now()
       });
 
-      return {
+      const responsePayload = {
         controller_token: token,
         controller_id: controllerId,
         instance_id: this.instanceId
       };
+      if (previousRunSnapshot) {
+        responsePayload.previous_run = previousRunSnapshot;
+      }
+      return responsePayload;
     });
   }
 
@@ -514,11 +588,18 @@ class ExternalPlayService {
     const info = this.controllerTokens.get(token);
     if (!info) return null;
     if (info.instanceId !== this.instanceId) return null;
-    if (Date.now() - info.createdAt > CONTROLLER_TOKEN_TTL_MS) {
+    if (Date.now() - (info.renewedAt || info.createdAt) > CONTROLLER_TOKEN_TTL_MS) {
       this.controllerTokens.delete(token);
       return null;
     }
     return { ...info, token };
+  }
+
+  renewControllerToken(controllerInfo) {
+    // 仅成功的租约心跳续期；已过期或撤销的凭据不能复活。
+    const valid = this.validateControllerToken(`Bearer ${controllerInfo.token}`);
+    if (!valid || valid.controllerId !== controllerInfo.controllerId) return;
+    this.controllerTokens.get(controllerInfo.token).renewedAt = Date.now();
   }
 
   generateViewerToken(runId) {
@@ -884,7 +965,14 @@ class ExternalPlayService {
       throw { status: 404, code: "NOT_FOUND", message: `Run not found: ${runId}` };
     }
     if (TERMINAL_STATUSES.has(run.status)) {
-      throw { status: 409, code: "CONFLICT", message: `Run ${runId} has already ended with status ${run.status}` };
+      throw {
+        status: 409,
+        code: "RUN_ENDED",
+        message: "Run " + runId + " has already ended with status " + run.status,
+        run_id: runId,
+        status_name: run.status,
+        ended: true
+      };
     }
     if (run.status === "armed") {
       throw { status: 409, code: "CONFLICT", message: `Run ${runId} is still armed; use start to claim it` };
@@ -1037,7 +1125,7 @@ class ExternalPlayService {
         isTokenValid = Array.from(this.controllerTokens.values()).some(
           info => info.controllerId === req.controllerId &&
           info.instanceId === this.instanceId &&
-          Date.now() - info.createdAt <= CONTROLLER_TOKEN_TTL_MS
+          Date.now() - (info.renewedAt || info.createdAt) <= CONTROLLER_TOKEN_TTL_MS
         );
       }
       if (!isTokenValid) {
@@ -1218,6 +1306,9 @@ class RunInstance {
     this.disposed = false;
 
     this.operationIndex = new Map(); // operation_id -> final record / response
+    // 引用 WAL 已持有的动作对象，分页无需重复读取和解析整个投影文件。
+    this.actionRecords = [];
+    this.eventRecords = [];
   }
 
   _startResponseMetadata(overrides = {}) {
@@ -1314,22 +1405,29 @@ class RunInstance {
       fs.closeSync(fd);
     }
 
-    // Append to actions.jsonl if action_committed
-    if (record.type === "action_committed" && record.action_record) {
-      const actionLine = JSON.stringify(record.action_record) + "\n";
-      fs.appendFileSync(this.actionsPath, actionLine, "utf8");
-    }
-
+    // WAL 写入与 fsync 成功即作为唯一确认提交点，立即同步权威内存状态与幂等索引
     this.lastJournalSeq = record.journal_seq;
-
-    // Index operation for idempotency
     if (record.operation_id) {
       this.operationIndex.set(record.operation_id, record);
     }
-
-    // Apply to in-memory state and projection
     this._applyJournalRecord(record);
-    this._publishJournalRecord(record);
+
+    // 次级投影：actions.jsonl（作为从属物可从权威 WAL 重建），异常捕获并记 warning，绝不抛出打断已提交状态
+    if (record.type === "action_committed" && record.action_record) {
+      try {
+        const actionLine = JSON.stringify(record.action_record) + "\n";
+        fs.appendFileSync(this.actionsPath, actionLine, "utf8");
+      } catch (projectionErr) {
+        console.warn(`[Run ${this.runId}] Projection warning: failed appending to actions.jsonl (recoverable from WAL):`, projectionErr);
+      }
+    }
+
+    // 投影广播与水位线通知容错
+    try {
+      this._publishJournalRecord(record);
+    } catch (publishErr) {
+      console.warn(`[Run ${this.runId}] Projection warning: failed publishing journal record:`, publishErr);
+    }
   }
 
   _writeImmutableBlob(digest, content) {
@@ -1364,6 +1462,8 @@ class RunInstance {
   }
 
   _applyJournalRecord(record) {
+    const eventId = record.event_id || record.ended_event_id;
+    if (eventId) this.eventRecords[eventId - 1] = { record, actionSeq: record.action_seq || this.lastActionSeq };
     switch (record.type) {
       case "run_armed":
         this.status = "armed";
@@ -1417,6 +1517,7 @@ class RunInstance {
         break;
 
       case "action_committed":
+        this.actionRecords[record.action_seq - 1] = record.action_record;
         this.lastActionSeq = record.action_seq;
         this.lastEventId = record.event_id;
         this.currentViewerStateHash = record.viewer_state_hash;
@@ -1535,6 +1636,11 @@ class RunInstance {
     const payload = `id: ${eventData.event_id}\nevent: ${eventData.type}\ndata: ${JSON.stringify(eventData)}\n\n`;
     for (const subscriber of this.subscribers) {
       try {
+        if (subscriber.writableLength > 1024 * 1024) {
+          subscriber.destroy();
+          this.subscribers.delete(subscriber);
+          continue;
+        }
         subscriber.write(payload);
         if (typeof subscriber.flush === "function") subscriber.flush();
       } catch (_e) {
@@ -1618,6 +1724,64 @@ class RunInstance {
     });
   }
 
+  async _reconcileActionsJsonl(providedActionRecords = null) {
+    if (!fs.existsSync(this.journalPath)) return;
+    try {
+      let actionRecords = providedActionRecords;
+      if (!actionRecords) {
+        const content = fs.readFileSync(this.journalPath, "utf8");
+        const lines = content.split("\n").filter((l) => l.trim().length > 0);
+        actionRecords = [];
+        for (const line of lines) {
+          try {
+            const record = JSON.parse(line);
+            if (record.type === "action_committed" && record.action_record) {
+              actionRecords.push(record.action_record);
+            }
+          } catch (_parseErr) {}
+        }
+      }
+
+      let isActionsValid = false;
+      if (fs.existsSync(this.actionsPath)) {
+        try {
+          const existingContent = fs.readFileSync(this.actionsPath, "utf8");
+          if (actionRecords.length === 0 && existingContent.trim().length === 0) {
+            isActionsValid = true;
+          } else if (existingContent.endsWith("\n")) {
+            const lines = existingContent.trim().split("\n").filter((l) => l.trim().length > 0);
+            if (lines.length === actionRecords.length) {
+              let allMatch = true;
+              for (let i = 0; i < lines.length; i++) {
+                const parsed = JSON.parse(lines[i]);
+                const authoritativeLine = JSON.stringify(actionRecords[i]);
+                if (!parsed || parsed.seq !== actionRecords[i].seq || lines[i] !== authoritativeLine) {
+                  allMatch = false;
+                  break;
+                }
+              }
+              if (allMatch) {
+                isActionsValid = true;
+              }
+            }
+          }
+        } catch (_e) {
+          isActionsValid = false;
+        }
+      }
+      if (!isActionsValid) {
+        const tmpPath = `${this.actionsPath}.tmp-${Date.now()}`;
+        const actionContent = actionRecords.length > 0
+          ? actionRecords.map((a) => JSON.stringify(a)).join("\n") + "\n"
+          : "";
+        fs.writeFileSync(tmpPath, actionContent, "utf8");
+        fs.renameSync(tmpPath, this.actionsPath);
+      }
+    } catch (reconcileErr) {
+      console.warn(`[Run ${this.runId}] Failed to reconcile actions.jsonl from WAL:`, reconcileErr);
+    }
+  }
+
   async replayJournal() {
     try {
       if (!fs.existsSync(this.journalPath)) return;
@@ -1651,41 +1815,7 @@ class RunInstance {
       }
 
       // Always reconcile actions.jsonl against authoritative WAL actionRecords
-      let isActionsValid = false;
-      if (fs.existsSync(this.actionsPath)) {
-        try {
-          const content = fs.readFileSync(this.actionsPath, "utf8");
-          if (actionRecords.length === 0 && content.trim().length === 0) {
-            isActionsValid = true;
-          } else if (content.endsWith("\n")) {
-            const lines = content.trim().split("\n").filter((l) => l.trim().length > 0);
-            if (lines.length === actionRecords.length) {
-              let allMatch = true;
-              for (let i = 0; i < lines.length; i++) {
-                const parsed = JSON.parse(lines[i]);
-                const authoritativeLine = JSON.stringify(actionRecords[i]);
-                if (!parsed || parsed.seq !== actionRecords[i].seq || lines[i] !== authoritativeLine) {
-                  allMatch = false;
-                  break;
-                }
-              }
-              if (allMatch) {
-                isActionsValid = true;
-              }
-            }
-          }
-        } catch (_e) {
-          isActionsValid = false;
-        }
-      }
-      if (!isActionsValid) {
-        const tmpPath = `${this.actionsPath}.tmp-${Date.now()}`;
-        const actionContent = actionRecords.length > 0
-          ? actionRecords.map((a) => JSON.stringify(a)).join("\n") + "\n"
-          : "";
-        fs.writeFileSync(tmpPath, actionContent, "utf8");
-        fs.renameSync(tmpPath, this.actionsPath);
-      }
+      this._reconcileActionsJsonl(actionRecords);
 
       // Reconstruct or restore base viewer state
       if (fs.existsSync(this.baseViewerStatePath)) {
@@ -2015,6 +2145,10 @@ class RunInstance {
       ) {
         throw { status: 409, code: "CONFLICT", message: "Invalid or expired lease epoch/id" };
       }
+      // 锁内校验租约到期时间：若已超时立即拒绝，且不得续期
+      if (Date.now() > this.currentLease.expiresAt) {
+        throw { status: 409, code: "CONFLICT", message: "Lease has expired" };
+      }
 
       const newExpiresAt = Date.now() + LEASE_TTL_MS;
       this.currentLease.expiresAt = newExpiresAt;
@@ -2069,6 +2203,10 @@ class RunInstance {
         if (!this.currentLease || this.currentLease.controllerId !== controllerInfo.controllerId) {
           throw { status: 409, code: "CONFLICT", message: "Run is not leased by this controller" };
         }
+        // 锁内校验租约到期时间：若已超时立即拒绝观察
+        if (Date.now() > this.currentLease.expiresAt) {
+          throw { status: 409, code: "CONFLICT", message: "Lease has expired" };
+        }
       }
       currentJ = this.lastJournalSeq;
     });
@@ -2111,6 +2249,10 @@ class RunInstance {
       ) {
         throw { status: 409, code: "CONFLICT", message: "Invalid lease credentials or epoch" };
       }
+      // 锁内校验租约到期时间：若已超时立即拒绝执行动作
+      if (Date.now() > this.currentLease.expiresAt) {
+        throw { status: 409, code: "CONFLICT", message: "Lease has expired" };
+      }
 
       const opId = operationId || `op-${crypto.randomUUID()}`;
       const fingerprint = crypto.createHash("sha256").update(JSON.stringify({
@@ -2122,6 +2264,27 @@ class RunInstance {
         const cached = this.operationIndex.get(opId);
         if (cached.controller_id !== controllerInfo.controllerId || (cached.request_fingerprint && cached.request_fingerprint !== fingerprint)) {
           throw { status: 409, code: "IDEMPOTENCY_CONFLICT", message: "Operation ID already used with different arguments or controller" };
+        }
+        if (cached.sanitized_result) {
+          return cached.sanitized_result;
+        }
+        if (cached.final_response) {
+          return cached.final_response;
+        }
+        // 兼容历史未记录 sanitized_result 的 action_rejected 记录，绝不返回 undefined
+        if (cached.type === "action_rejected") {
+          return {
+            resultType: "complete",
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: cached.error_payload?.message || "Action rejected",
+                ok: false,
+                ended: false
+              })
+            }],
+            isError: true
+          };
         }
         return cached.sanitized_result || cached.final_response;
       }
@@ -2149,6 +2312,11 @@ class RunInstance {
 
       if (!mapped.ok) {
         // Record action_rejected
+        const mcpErrorResult = {
+          resultType: "complete",
+          content: [{ type: "text", text: JSON.stringify({ error: mapped.error, ok: false, ended: false }) }],
+          isError: true
+        };
         const rejectedRecord = {
           journal_seq: this.lastJournalSeq + 1,
           timestamp: new Date().toISOString(),
@@ -2165,14 +2333,12 @@ class RunInstance {
           error_payload: {
             code: "INVALID_ARGUMENT",
             message: mapped.error
-          }
+          },
+          sanitized_result: mcpErrorResult
         };
         await this.appendJournalRecord(rejectedRecord);
 
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: mapped.error, ok: false, ended: false }) }],
-          isError: true
-        };
+        return mcpErrorResult;
       }
 
       const beforeState = extractViewerState(this.gameSession, this.lastActionSeq, this.worldBundleDigest);
@@ -2183,6 +2349,11 @@ class RunInstance {
         bridgeResult = getBridge().handleCommand(this.gameSession, mapped.message);
       } catch (err) {
         // Bridge gameplay rejection (e.g. death or invalid jump)
+        const mcpErrorResult = {
+          resultType: "complete",
+          content: [{ type: "text", text: JSON.stringify({ error: err.message, ok: false, ended: false }) }],
+          isError: true
+        };
         const rejectedRecord = {
           journal_seq: this.lastJournalSeq + 1,
           timestamp: new Date().toISOString(),
@@ -2199,14 +2370,12 @@ class RunInstance {
           error_payload: {
             code: "INVALID_ARGUMENT",
             message: err.message
-          }
+          },
+          sanitized_result: mcpErrorResult
         };
         await this.appendJournalRecord(rejectedRecord);
 
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: err.message, ok: false, ended: false }) }],
-          isError: true
-        };
+        return mcpErrorResult;
       }
 
       const nextActionSeq = this.lastActionSeq + 1;
@@ -2361,6 +2530,9 @@ class RunInstance {
     setImmediate(async () => {
       if (this._deleted) return;
       try {
+        // 结算前确保 actions.jsonl 完整对齐权威 WAL，杜绝副本写入缺失导致结算指标偏离
+        this._reconcileActionsJsonl();
+
         // Build summary
         const summary = SummaryBuilder.buildSummary(this, outcome);
         const summaryStr = JSON.stringify(summary, null, 2);

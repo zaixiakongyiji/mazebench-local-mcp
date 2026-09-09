@@ -6,6 +6,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const { TERMINAL_STATUSES } = require("../server/external-run-groups");
 
 const PROTOCOL_VERSION = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
@@ -265,6 +266,8 @@ class StdioMcpAdapter {
     this.activeRunId = null;
     this.leaseId = null;
     this.leaseEpoch = null;
+    this.generation = 0;
+    this.startInProgress = false;
 
     this.cancelledRequests = new Set();
     this.activeRequests = new Map();
@@ -291,56 +294,53 @@ class StdioMcpAdapter {
     }
 
     return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
       const client = url.protocol === "https:" ? https : http;
+      let settled = false;
+      let timer;
+      let tracked;
+      const finish = (err, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (requestId !== null && this.activeRequests.get(requestId) === tracked) this.activeRequests.delete(requestId);
+        if (err) {
+          logStderr(`HTTP ${method} ${url.pathname} failed after ${Date.now() - startedAt}ms (${err.code || err.statusCode || "NETWORK_ERROR"})`);
+          reject(err);
+        } else resolve(value);
+      };
       const req = client.request(options, (res) => {
         let responseData = "";
         res.setEncoding("utf8");
         res.on("data", (chunk) => (responseData += chunk));
+        res.on("error", (err) => finish(err));
+        res.on("aborted", () => finish(Object.assign(new Error("HTTP response interrupted"), { code: "ECONNRESET" })));
         res.on("end", () => {
-          if (requestId !== null) this.activeRequests.delete(requestId);
           try {
             const parsed = responseData ? JSON.parse(responseData) : null;
-            if (res.statusCode >= 200 && res.statusCode < 300) {
-              resolve(parsed);
-            } else {
-              const err = new Error(parsed?.error || parsed?.message || `HTTP ${res.statusCode}`);
-              err.statusCode = res.statusCode;
-              err.data = parsed;
-              reject(err);
-            }
-          } catch (e) {
-            if (res.statusCode >= 200 && res.statusCode < 300) {
-              resolve(responseData);
-            } else {
-              reject(new Error(`HTTP ${res.statusCode}: ${responseData}`));
-            }
+            if (res.statusCode >= 200 && res.statusCode < 300) finish(null, parsed);
+            else finish(Object.assign(new Error(parsed?.error || parsed?.message || `HTTP ${res.statusCode}`), { statusCode: res.statusCode, data: parsed }));
+          } catch (err) {
+            finish(Object.assign(new Error("Invalid JSON response from MazeBench"), { code: "INVALID_RESPONSE", statusCode: res.statusCode }));
           }
         });
       });
-
-      if (requestId !== null) {
-        this.activeRequests.set(requestId, {
-          abort: () => {
-            req.destroy();
-            const err = new Error("Request cancelled by client");
-            err.code = "CANCELLED";
-            reject(err);
-          }
-        });
-      }
-
-      req.on("error", (err) => {
-        if (requestId !== null) this.activeRequests.delete(requestId);
-        reject(err);
-      });
-      if (body) {
-        req.write(typeof body === "string" ? body : JSON.stringify(body));
-      }
+      const abort = (err) => {
+        finish(err);
+        req.destroy();
+      };
+      tracked = { abort: () => abort(Object.assign(new Error("Request cancelled by client"), { code: "CANCELLED" })) };
+      if (requestId !== null) this.activeRequests.set(requestId, tracked);
+      // 总期限覆盖连接、响应头和响应体，避免半响应或慢速流无限占用连接。
+      const timeoutMs = this.httpTimeoutMs || (url.pathname.endsWith("/heartbeat") ? 8000 : 20000);
+      timer = setTimeout(() => abort(Object.assign(new Error(`MazeBench request timed out after ${timeoutMs}ms`), { code: "ETIMEDOUT" })), timeoutMs);
+      req.on("error", (err) => finish(err));
+      if (body) req.write(typeof body === "string" ? body : JSON.stringify(body));
       req.end();
     });
   }
 
-  async connectServer(force = false, { forResume = false } = {}) {
+  async connectServer(force = false, { forResume = false, assertCurrent = () => {} } = {}) {
     if (this.claimedState && (force || !this.controllerToken)) {
       this.requireResumption();
       if (!forResume) throw new Error("Controller authentication lost. Use resume to request resumption approval.");
@@ -388,9 +388,11 @@ class StdioMcpAdapter {
               clientInfo: this.clientInfo || {}
             }
           );
+          assertCurrent();
           this.controllerToken = sessionRes.controller_token;
           this.controllerId = sessionRes.controller_id;
           this.instanceId = sessionRes.instance_id;
+          this.generation += 1;
           exchanged = true;
           break;
         } catch (err) {
@@ -429,23 +431,40 @@ class StdioMcpAdapter {
 
   startHeartbeat() {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    const heartbeatGen = this.generation;
+    const heartbeatRunId = this.activeRunId;
+    const heartbeatLeaseId = this.leaseId;
+    const heartbeatLeaseEpoch = this.leaseEpoch;
+
+    let inFlight = false;
     this.heartbeatTimer = setInterval(async () => {
-      if (!this.activeRunId || !this.leaseId || !this.leaseEpoch) return;
-      const heartbeatLeaseId = this.leaseId;
+      if (inFlight) return;
+      if (
+        this.generation !== heartbeatGen ||
+        this.activeRunId !== heartbeatRunId ||
+        this.leaseId !== heartbeatLeaseId ||
+        this.leaseEpoch !== heartbeatLeaseEpoch ||
+        !this.activeRunId ||
+        !this.leaseId
+      ) {
+        return;
+      }
+      inFlight = true;
       try {
         await this.httpRequest("POST", "/api/external-play/lease/heartbeat", {
-          run_id: this.activeRunId,
-          lease_id: this.leaseId,
-          lease_epoch: this.leaseEpoch
+          run_id: heartbeatRunId,
+          lease_id: heartbeatLeaseId,
+          lease_epoch: heartbeatLeaseEpoch
         });
       } catch (err) {
-        if (this.leaseId !== heartbeatLeaseId) return;
+        if (this.generation !== heartbeatGen || this.leaseId !== heartbeatLeaseId) return;
         logStderr(`Heartbeat failed: ${err.message}`);
         if ([401, 403, 404, 409].includes(err.statusCode)) {
           if (err.statusCode === 401 || err.statusCode === 403) this.controllerToken = null;
           this.requireResumption();
         }
       }
+      finally { inFlight = false; }
     }, HEARTBEAT_INTERVAL_MS);
   }
 
@@ -464,6 +483,83 @@ class StdioMcpAdapter {
     this.stopResumePolling();
   }
 
+  _cleanupSession({ resetClaimedState = true } = {}) {
+    this.generation += 1;
+    this.stopHeartbeat();
+    this.stopResumePolling();
+    this.activeRunId = null;
+    this.leaseId = null;
+    this.leaseEpoch = null;
+    this.authorizationRequired = false;
+    if (resetClaimedState) {
+      this.claimedState = null;
+    }
+  }
+
+  async _authenticateWithPreviousRun(previousRunId, requestId, assertCurrent = () => {}) {
+    let serverJson = null;
+    for (let retry = 0; retry < 3; retry++) {
+      if (fs.existsSync(this.serverJsonPath)) {
+        try {
+          serverJson = JSON.parse(fs.readFileSync(this.serverJsonPath, "utf8"));
+          break;
+        } catch (_e) {}
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    if (!serverJson && !this.serverUrl) {
+      logStderr("MazeBench server is not running. Please start it first using 'mazebench launch'.");
+      throw new Error("MazeBench server is not running.");
+    }
+
+    if (serverJson) {
+      this.serverUrl = serverJson.url;
+      this.instanceId = serverJson.instance_id;
+    }
+
+    let sessionRes = null;
+    for (let retry = 0; retry < 12; retry++) {
+      assertCurrent();
+      try {
+        serverJson = JSON.parse(fs.readFileSync(this.serverJsonPath, "utf8"));
+      } catch (_e) {}
+      if (!serverJson?.mcp_bootstrap_nonce) {
+        await new Promise((r) => setTimeout(r, 50 + retry * 20));
+        continue;
+      }
+
+      try {
+        sessionRes = await this.httpRequest(
+          "POST",
+          "/api/external-play/controller/session",
+          {
+            mcp_bootstrap_nonce: serverJson.mcp_bootstrap_nonce,
+            clientInfo: this.clientInfo || {},
+            previous_run_id: previousRunId
+          }, {}, requestId
+        );
+        assertCurrent();
+        break;
+      } catch (err) {
+        if (err.statusCode === 403) {
+          serverJson = null;
+          await new Promise((r) => setTimeout(r, 25 + Math.floor(Math.random() * 50) + retry * 20));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!sessionRes) {
+      logStderr("Failed to authenticate with MazeBench External Play service.");
+      throw new Error("Failed to authenticate with MazeBench External Play service.");
+    }
+
+    assertCurrent();
+    return sessionRes;
+  }
+
   stopResumePolling() {
     const pending = this.pendingResume;
     this.pendingResume = null;
@@ -478,6 +574,8 @@ class StdioMcpAdapter {
 
   attachResumedLease(data) {
     this.stopResumePolling();
+    this.pendingStart = null;
+    this.generation += 1;
     this.activeRunId = data.run_id;
     this.leaseId = data.lease_id;
     this.leaseEpoch = data.lease_epoch;
@@ -488,17 +586,22 @@ class StdioMcpAdapter {
 
   startResumePolling(requestId) {
     this.stopResumePolling();
-    const pending = { requestId, token: this.controllerToken, httpRequestId: Symbol("resume-poll"), timer: null };
+    const currentGen = this.generation;
+    const pending = { requestId, token: this.controllerToken, generation: currentGen, httpRequestId: Symbol("resume-poll"), timer: null };
     this.pendingResume = pending;
     const poll = async () => {
-      if (this.pendingResume !== pending) return;
+      if (this.pendingResume !== pending || this.generation !== currentGen) return;
       try {
         const data = await this.httpRequest(
           "GET", `/api/external-play/resume-requests/${encodeURIComponent(requestId)}/status`,
           null, {}, pending.httpRequestId
         );
         // 取消或换会话后，迟到的审批响应不能重新附着租约。
-        if (this.pendingResume !== pending || this.controllerToken !== pending.token) return;
+        if (
+          this.pendingResume !== pending ||
+          this.generation !== currentGen ||
+          this.controllerToken !== pending.token
+        ) return;
         if (data.status === "approved") {
           this.attachResumedLease(data);
           logStderr(`Resume approved for ${data.run_id}. Lease attached; call observe or resume to retrieve the current state.`);
@@ -511,7 +614,7 @@ class StdioMcpAdapter {
         }
         pending.timer = setTimeout(poll, 2000);
       } catch (err) {
-        if (this.pendingResume !== pending) return;
+        if (this.pendingResume !== pending || this.generation !== currentGen) return;
         this.stopResumePolling();
         if (err.statusCode === 401 || err.statusCode === 403) {
           this.controllerToken = null;
@@ -524,6 +627,7 @@ class StdioMcpAdapter {
   }
 
   async detach() {
+    this.generation += 1;
     this.stopResumePolling();
     this.stopHeartbeat();
     if (this.activeRunId && this.leaseId && this.leaseEpoch) {
@@ -535,6 +639,71 @@ class StdioMcpAdapter {
         });
       } catch (_e) {}
     }
+  }
+
+  _sendStartSuccess(id, proxyRes) {
+    this.generation += 1;
+    this.authorizationRequired = false;
+    if (proxyRes.run_id) {
+      this.activeRunId = proxyRes.run_id;
+      this.claimedState = this.activeRunId;
+    }
+    if (proxyRes.lease_id && proxyRes.lease_epoch) {
+      this.leaseId = proxyRes.lease_id;
+      this.leaseEpoch = proxyRes.lease_epoch;
+      this.startHeartbeat();
+    }
+    const observation = proxyRes.observation || (
+      proxyRes.sanitized_result?.content?.[0]?.text
+        ? (() => {
+            try {
+              return JSON.parse(proxyRes.sanitized_result.content[0].text).observation;
+            } catch (_e) {
+              return {};
+            }
+          })()
+        : {}
+    ) || {};
+    sendStdout({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              run_id: this.activeRunId,
+              ...(proxyRes.group_id ? {
+                group_id: proxyRes.group_id,
+                entry_id: proxyRes.entry_id,
+                group_mode: proxyRes.group_mode
+              } : {}),
+              model_name: proxyRes.model_name,
+              harness: proxyRes.harness,
+              instructions_version: proxyRes.instructions_version,
+              run_instructions: proxyRes.run_instructions,
+              status: proxyRes.status,
+              action_seq: proxyRes.action_seq ?? observation.action_count ?? 0,
+              observation,
+              game_won: Boolean(proxyRes.game_won),
+              ended: Boolean(proxyRes.ended),
+              ...(proxyRes.outcome ? { outcome: proxyRes.outcome } : {}),
+              ...(proxyRes.max_actions ? {
+                max_actions: proxyRes.max_actions,
+                actions_remaining: proxyRes.actions_remaining
+              } : {}),
+              ...(proxyRes.duration_ms ? {
+                duration_ms: proxyRes.duration_ms,
+                deadline_at: proxyRes.deadline_at,
+                time_remaining_ms: proxyRes.time_remaining_ms
+              } : {}),
+              message: "MazeBench session armed and ready"
+            })
+          }
+        ],
+        isError: false
+      }
+    });
   }
 
   async handleRequest(request) {
@@ -655,11 +824,85 @@ class StdioMcpAdapter {
         return;
       }
 
+      if (toolName === "start" || toolName === "resume") {
+        if (this.startInProgress) {
+          sendStdout({
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: "Error: A start operation is already in progress or a resume transition is in progress for this adapter." }],
+              isError: true
+            }
+          });
+          return;
+        }
+        this.startInProgress = true;
+      }
+
+      // 请求代次必须在 catch 可见；只有本请求主动切换认证时才更新。
+      let requestGen = this.generation;
+      const ensureCurrent = () => {
+        if (this.cancelledRequests.has(id)) {
+          throw Object.assign(new Error("Request cancelled by client"), { code: "CANCELLED" });
+        }
+        if (this.generation !== requestGen) {
+          throw new Error("Session changed while request was in progress; request stopped.");
+        }
+      };
+      const reauthenticateEndedRun = async () => {
+        const previousRunId = this.claimedState;
+        let data;
+        try {
+          data = await this._authenticateWithPreviousRun(previousRunId, id, ensureCurrent);
+          ensureCurrent();
+          const nonempty = (value) => typeof value === "string" && value.trim().length > 0;
+          if (data?.previous_run?.run_id !== previousRunId || data.previous_run.ended !== true ||
+              !TERMINAL_STATUSES.has(data.previous_run.status) ||
+              !nonempty(data.controller_token) || !nonempty(data.controller_id) ||
+              !nonempty(data.instance_id) || data.instance_id !== this.instanceId) {
+            throw new Error("Invalid previous_run verification. Please update the matching server and adapter.");
+          }
+        } catch (err) {
+          ensureCurrent();
+          this.requireResumption();
+          if (err.data?.code === "RUN_RESUME_REQUIRED") {
+            throw new Error(`Run ${previousRunId} requires resume approval before continuing.`);
+          }
+          if (err.data?.code === "PREVIOUS_RUN_UNVERIFIED") {
+            throw new Error(`Previous run ${previousRunId} cannot be verified. Ask the user to check the service and run history.`);
+          }
+          throw err;
+        }
+        this._cleanupSession();
+        this.controllerToken = data.controller_token;
+        this.controllerId = data.controller_id;
+        this.instanceId = data.instance_id;
+        requestGen = this.generation;
+        logStderr(`Previous run ${previousRunId} confirmed ended (${data.previous_run.status}). Session ready for explicit start.`);
+      };
+      const reconnect = async (forResume = false) => {
+        ensureCurrent();
+        const connectionGen = requestGen;
+        await this.connectServer(true, { forResume, assertCurrent: ensureCurrent });
+        if (this.generation !== connectionGen + 1) {
+          throw new Error("Session changed during authentication; request stopped.");
+        }
+        requestGen = this.generation;
+        ensureCurrent();
+      };
       try {
         let proxyRes;
-        let targetRunId = toolArgs?.run_id || null;
+        ensureCurrent();
+        if (toolName === "start") {
+          if (this.pendingResume) {
+            throw new Error("Run authorization required. A resume request is currently pending approval.");
+          }
+          if (this.claimedState && (this.authorizationRequired || !this.controllerToken)) {
+            await reauthenticateEndedRun();
+          }
+        }
 
-        if (toolName !== "resume" && (this.authorizationRequired || this.pendingResume ||
+        if (toolName !== "resume" && toolName !== "start" && (this.authorizationRequired || this.pendingResume ||
             (this.claimedState && !this.controllerToken))) {
           throw new Error("Run authorization required. Use resume and wait for approval before continuing.");
         }
@@ -674,7 +917,11 @@ class StdioMcpAdapter {
           let ended = false;
           let stopReason = null;
 
+          const sequenceRunId = this.activeRunId;
+          const sequenceLeaseId = this.leaseId;
+          const sequenceLeaseEpoch = this.leaseEpoch;
           for (let index = 0; index < toolArgs.actions.length; index += 1) {
+            ensureCurrent();
             if (this.cancelledRequests.has(id)) {
               const cancelled = new Error("Request cancelled by client");
               cancelled.code = "CANCELLED";
@@ -686,16 +933,17 @@ class StdioMcpAdapter {
               "POST",
               "/api/external-play/mcp",
               {
-                run_id: this.activeRunId,
+                run_id: sequenceRunId,
                 tool: parsedAction.tool,
                 arguments: parsedAction.arguments,
-                lease_id: this.leaseId,
-                lease_epoch: this.leaseEpoch,
+                lease_id: sequenceLeaseId,
+                lease_epoch: sequenceLeaseEpoch,
                 operation_id: `mcp-seq-${crypto.randomUUID()}-${index}`
               },
               {},
               id
             );
+            ensureCurrent();
             const stepResult = stepResponse?.result || stepResponse;
             const payload = parseToolResultPayload(stepResult);
             finalObservation = payload.observation || finalObservation;
@@ -724,7 +972,11 @@ class StdioMcpAdapter {
             }
           }
 
-          if (ended) this.stopHeartbeat();
+          if (ended) {
+            if (this.generation === requestGen) {
+              this._cleanupSession({ resetClaimedState: false });
+            }
+          }
           sendStdout({
             jsonrpc: "2.0",
             id,
@@ -764,7 +1016,7 @@ class StdioMcpAdapter {
           }
 
           if (!this.controllerToken) {
-            await this.connectServer(true, { forResume: true });
+            await reconnect(true);
           }
 
           const resumeOpId = `mcp-resume-${id}-${crypto.randomUUID()}`;
@@ -782,6 +1034,7 @@ class StdioMcpAdapter {
               id
             );
           } catch (requestErr) {
+            ensureCurrent();
             if (
               requestErr.statusCode === 401 ||
               requestErr.statusCode === 403 ||
@@ -791,7 +1044,7 @@ class StdioMcpAdapter {
               if (requestErr.statusCode === 401 || requestErr.statusCode === 403) {
                 this.controllerToken = null;
               }
-              await this.connectServer(true, { forResume: true });
+              await reconnect(true);
               initialRes = await this.httpRequest(
                 "POST",
                 "/api/external-play/mcp",
@@ -808,6 +1061,7 @@ class StdioMcpAdapter {
             }
           }
 
+          ensureCurrent();
           const reqData = initialRes.result?.content?.[0]?.text
             ? JSON.parse(initialRes.result.content[0].text)
             : initialRes;
@@ -888,139 +1142,73 @@ class StdioMcpAdapter {
           throw new Error(reqData.message || `Resume request returned status ${reqData.status}`);
         }
 
-        const callOperationId = `mcp-call-${id}-${crypto.randomUUID()}`;
+        const retryingStart = toolName === "start" && Boolean(this.pendingStart);
+        const startFingerprint = JSON.stringify(toolArgs);
+        if (toolName === "start" && this.pendingStart && this.pendingStart.fingerprint !== startFingerprint) {
+          throw new Error("Previous start outcome is unknown. Retry start with the same arguments first.");
+        }
+        const callOperationId = toolName === "start" && this.pendingStart
+          ? this.pendingStart.operationId : `mcp-call-${id}-${crypto.randomUUID()}`;
+        if (toolName === "start" && !this.pendingStart) this.pendingStart = { operationId: callOperationId, fingerprint: startFingerprint };
+        const callTool = () => {
+          ensureCurrent();
+          if (toolName === "start") {
+            if (this.pendingStart?.controllerToken && this.pendingStart.controllerToken !== this.controllerToken) {
+              throw new Error("Previous start outcome is unknown and controller changed. Request resume approval for the claimed run.");
+            }
+            this.pendingStart = { operationId: callOperationId, fingerprint: startFingerprint, controllerToken: this.controllerToken };
+          }
+          return this.httpRequest("POST", "/api/external-play/mcp", {
+            run_id: toolName === "start" ? undefined : this.activeRunId,
+            tool: toolName,
+            arguments: toolArgs,
+            lease_id: this.leaseId,
+            lease_epoch: this.leaseEpoch,
+            operation_id: callOperationId
+          }, {}, id);
+        };
+        if (!this.controllerToken) await reconnect();
         try {
-          if (!this.controllerToken) {
-            await this.connectServer(true);
+          proxyRes = await callTool();
+        } catch (err) {
+          ensureCurrent();
+          if (![401, 403, 404].includes(err.statusCode)) {
+            // 保留未知认领的幂等 ID；网络失败后显式重试不得领取新席位。
+            if (toolName === "start" && err.statusCode >= 400 && err.statusCode < 500) this.pendingStart = null;
+            throw err;
           }
-          proxyRes = await this.httpRequest(
-            "POST",
-            "/api/external-play/mcp",
-            {
-              run_id: toolName === "start" ? undefined : this.activeRunId,
-              tool: toolName,
-              arguments: toolArgs,
-              lease_id: this.leaseId,
-              lease_epoch: this.leaseEpoch,
-              operation_id: callOperationId
-            },
-            {},
-            id
-          );
-        } catch (requestErr) {
-          if (
-            requestErr.statusCode === 401 ||
-            requestErr.statusCode === 403 ||
-            requestErr.statusCode === 404
-          ) {
-            logStderr(`Request failed with status ${requestErr.statusCode}. Attempting to reconnect...`);
-            if (requestErr.statusCode === 401 || requestErr.statusCode === 403) {
-              this.controllerToken = null;
-              if (this.claimedState) {
-                this.requireResumption();
-                logStderr(`Controller authentication lost for claimed run ${this.claimedState}. Re-authorization via resume required.`);
-                throw new Error(`Controller authentication lost for claimed run ${this.claimedState}. Use resume tool to request resumption approval.`);
-              }
+          if (toolName === "start" && [401, 403].includes(err.statusCode)) {
+            if (retryingStart) throw new Error("Previous start outcome is unknown and authentication is no longer valid. Request resume approval for the claimed run.");
+            this.pendingStart = null;
+          }
+          if (err.statusCode === 401 || err.statusCode === 403) {
+            this.controllerToken = null;
+            if (toolName === "start" && this.claimedState) {
+              await reauthenticateEndedRun();
+            } else if (this.claimedState) {
+              this.requireResumption();
+              throw new Error(`Controller authentication lost for claimed run ${this.claimedState}. Use resume tool to request resumption approval.`);
+            } else {
+              await reconnect();
             }
-            await this.connectServer(true);
-            proxyRes = await this.httpRequest(
-              "POST",
-              "/api/external-play/mcp",
-              {
-                run_id: toolName === "start" ? undefined : this.activeRunId,
-                tool: toolName,
-                arguments: toolArgs,
-                lease_id: this.leaseId,
-                lease_epoch: this.leaseEpoch,
-                operation_id: callOperationId
-              },
-              {},
-              id
-            );
           } else {
-            throw requestErr;
+            await reconnect();
           }
+          proxyRes = await callTool();
         }
-
-        if (this.cancelledRequests.has(id)) {
-          this.cancelledRequests.delete(id);
-          sendStdout({
-            jsonrpc: "2.0",
-            id,
-            error: {
-              code: -32800,
-              message: "Request cancelled by client"
-            }
-          });
-          return;
-        }
-
+        ensureCurrent();
         if (toolName === "start") {
-          if (proxyRes.run_id) {
-            this.activeRunId = proxyRes.run_id;
-            this.claimedState = this.activeRunId;
-          }
-          if (proxyRes.lease_id && proxyRes.lease_epoch) {
-            this.leaseId = proxyRes.lease_id;
-            this.leaseEpoch = proxyRes.lease_epoch;
-            this.startHeartbeat();
-          }
-          const observation = proxyRes.observation || (
-            proxyRes.sanitized_result?.content?.[0]?.text
-              ? (() => {
-                  try {
-                    return JSON.parse(proxyRes.sanitized_result.content[0].text).observation;
-                  } catch (_e) {
-                    return {};
-                  }
-                })()
-              : {}
-          ) || {};
-          sendStdout({
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify({
-                    run_id: this.activeRunId,
-                    ...(proxyRes.group_id ? {
-                      group_id: proxyRes.group_id,
-                      entry_id: proxyRes.entry_id,
-                      group_mode: proxyRes.group_mode
-                    } : {}),
-                    model_name: proxyRes.model_name,
-                    harness: proxyRes.harness,
-                    instructions_version: proxyRes.instructions_version,
-                    run_instructions: proxyRes.run_instructions,
-                    status: proxyRes.status,
-                    action_seq: proxyRes.action_seq ?? observation.action_count ?? 0,
-                    observation,
-                    game_won: Boolean(proxyRes.game_won),
-                    ended: Boolean(proxyRes.ended),
-                    ...(proxyRes.outcome ? { outcome: proxyRes.outcome } : {}),
-                    ...(proxyRes.max_actions ? {
-                      max_actions: proxyRes.max_actions,
-                      actions_remaining: proxyRes.actions_remaining
-                    } : {}),
-                    ...(proxyRes.duration_ms ? {
-                      duration_ms: proxyRes.duration_ms,
-                      deadline_at: proxyRes.deadline_at,
-                      time_remaining_ms: proxyRes.time_remaining_ms
-                    } : {}),
-                    message: "MazeBench session armed and ready"
-                  })
-                }
-              ],
-              isError: false
-            }
-          });
+          this.pendingStart = null;
+          this._sendStartSuccess(id, proxyRes);
           return;
         }
 
         const result = proxyRes.result || proxyRes;
-        if (parseToolResultPayload(result).ended) this.stopHeartbeat();
+        if (parseToolResultPayload(result).ended) {
+          if (this.generation === requestGen) {
+            this._cleanupSession({ resetClaimedState: false });
+          }
+        }
         sendStdout({
           jsonrpc: "2.0",
           id,
@@ -1028,8 +1216,10 @@ class StdioMcpAdapter {
         });
       } catch (err) {
         if ((err.statusCode === 401 || err.statusCode === 403) && this.claimedState) {
-          this.controllerToken = null;
-          this.requireResumption();
+          if (this.generation === requestGen) {
+            this.controllerToken = null;
+            this.requireResumption();
+          }
         }
         if (err.code === "CANCELLED" || this.cancelledRequests.has(id)) {
           this.cancelledRequests.delete(id);
@@ -1051,6 +1241,10 @@ class StdioMcpAdapter {
             isError: true
           }
         });
+      } finally {
+        if (toolName === "start" || toolName === "resume") {
+          this.startInProgress = false;
+        }
       }
       return;
     }

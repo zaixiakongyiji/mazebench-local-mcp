@@ -24,6 +24,7 @@ const {
   validateSummary,
   computeViewerStateHash
 } = require("../shared/validators.standalone");
+const { createRequestRouter } = require("../server/router");
 
 async function runTests() {
   console.log("Starting ExternalPlayService unit & integration tests...");
@@ -1038,6 +1039,604 @@ async function runTests() {
         const next = await test23Service.createRun();
         const claim = await test23Service.claimRun(owner, { model_name: "Next model" });
         assert.equal(claim.run_id, next.runId);
+      }
+
+      console.log("  [Test 31] Authoritative WAL commit with projection fault tolerance (AC-R1)");
+      const ctrl31 = await newController("ctrl31-wal-fault");
+      const run31 = await test23Service.createRun({ maxActions: 100 });
+      const lease31 = await test23Service.claimRun(ctrl31, { model_name: "Model 31" });
+
+      // 1. 模拟 actions.jsonl 写入故障注入
+      const originalAppendFileSync = fs.appendFileSync;
+      let appendAttempts = 0;
+      fs.appendFileSync = function (filePath, data, options) {
+        if (typeof filePath === "string" && filePath.includes(run31.runId) && filePath.endsWith("actions.jsonl")) {
+          appendAttempts++;
+          throw new Error("Synthetic projection failure appending to actions.jsonl");
+        }
+        return originalAppendFileSync.apply(this, arguments);
+      };
+
+      let replayRun = null;
+      try {
+        const opId1 = "op-wal-fault-1";
+        // 执行动作：actions.jsonl 次级投影抛错，但权威 WAL 必须成功提交且不向调用方外抛异常
+        const result1 = await run31.executeAction(
+          ctrl31,
+          lease31.lease_id,
+          lease31.lease_epoch,
+          "rotate_camera_left",
+          {},
+          opId1
+        );
+        assert.ok(result1, "executeAction 应当正常返回结果，不被次级投影错误中断");
+        assert.equal(appendAttempts, 1, "应当触发并捕获 actions.jsonl 写入异常");
+
+        // 2. 验证权威 WAL (journal.jsonl) 记录了 action_committed 且序号严格更新
+        const journalLines = fs.readFileSync(run31.journalPath, "utf8").trim().split("\n").map(JSON.parse);
+        const actionCommittedRecords = journalLines.filter((r) => r.type === "action_committed");
+        assert.equal(actionCommittedRecords.length, 1, "WAL 必须持久化记录 action_committed");
+        assert.equal(actionCommittedRecords[0].operation_id, opId1);
+        const seq1 = actionCommittedRecords[0].journal_seq;
+        assert.equal(run31.lastJournalSeq, seq1, "内存 lastJournalSeq 必须与权威 WAL 最新序号同步");
+        assert.ok(run31.operationIndex.has(opId1), "operationIndex 必须包含已提交的 opId");
+
+        // 3. 相同 operation_id 重试：必须命中幂等缓存，且 WAL 绝不产生重复记录与序号
+        const retryResult = await run31.executeAction(
+          ctrl31,
+          lease31.lease_id,
+          lease31.lease_epoch,
+          "rotate_camera_left",
+          {},
+          opId1
+        );
+        assert.deepEqual(retryResult, result1, "幂等重试应返回已缓存结果");
+        const journalLinesAfterRetry = fs.readFileSync(run31.journalPath, "utf8").trim().split("\n").map(JSON.parse);
+        assert.equal(journalLinesAfterRetry.length, journalLines.length, "WAL 绝不应追加重复记录");
+
+        // 恢复 fs.appendFileSync
+        fs.appendFileSync = originalAppendFileSync;
+
+        // 4. 后续新动作保持序号严格自增且连续
+        const opId2 = "op-wal-fault-2";
+        const result2 = await run31.executeAction(
+          ctrl31,
+          lease31.lease_id,
+          lease31.lease_epoch,
+          "rotate_camera_left",
+          {},
+          opId2
+        );
+        assert.ok(result2);
+        const journalLinesAfterNext = fs.readFileSync(run31.journalPath, "utf8").trim().split("\n").map(JSON.parse);
+        const allSeqs = journalLinesAfterNext.map((r) => r.journal_seq);
+        for (let i = 0; i < allSeqs.length; i++) {
+          assert.equal(allSeqs[i], i + 1, `journal_seq 必须严格递增连贯: expected ${i + 1}, got ${allSeqs[i]}`);
+        }
+
+        // 5. 重启重放 journal：replayJournal 平滑通过且基于权威 WAL 自动调和 actions.jsonl
+        replayRun = new (run31.constructor)(
+          test23Service,
+          run31.runId,
+          run31.runDir,
+          run31.manifest
+        );
+        await replayRun.replayJournal();
+        assert.equal(replayRun.lastJournalSeq, run31.lastJournalSeq, "重放必须恢复出一致的 journal seq");
+
+        const replayedActionLines = fs.readFileSync(run31.actionsPath, "utf8").trim().split("\n").filter(Boolean);
+        assert.equal(replayedActionLines.length, 2, "actions.jsonl 必须在 replayJournal 中完整对齐重建");
+      } finally {
+        fs.appendFileSync = originalAppendFileSync;
+        if (replayRun) replayRun.cleanup();
+        if (run31) run31.cleanup();
+      }
+
+      console.log("  [Test 32] Strict lease expiry check inside session mutex (AC-R3)");
+      const ctrl32 = await newController("ctrl32-lease-expiry");
+      const run32 = await test23Service.createRun({ maxActions: 100 });
+      const lease32 = await test23Service.claimRun(ctrl32, { model_name: "Model 32" });
+
+      try {
+        // 人为模拟租约已过期
+        const expiredTime = Date.now() - 500;
+        run32.currentLease.expiresAt = expiredTime;
+
+        // 1. 在锁内调用 heartbeat，必须被拒绝 (409 CONFLICT) 且不得续期
+        await assert.rejects(
+          async () => {
+            await run32.heartbeat(ctrl32, lease32.lease_id, lease32.lease_epoch);
+          },
+          (err) => {
+            assert.equal(err.status, 409);
+            assert.equal(err.code, "CONFLICT");
+            assert.match(err.message, /expired/i);
+            return true;
+          },
+          "过期租约的 heartbeat 必须返回 409 CONFLICT"
+        );
+        assert.equal(run32.currentLease.expiresAt, expiredTime, "heartbeat 绝不可延长已过期租约的时间");
+
+        // 2. 在锁内调用 executeAction，必须被拒绝 (409 CONFLICT) 且动作不得执行
+        await assert.rejects(
+          async () => {
+            await run32.executeAction(
+              ctrl32,
+              lease32.lease_id,
+              lease32.lease_epoch,
+              "rotate_camera_left",
+              {},
+              "op-expired-action-1"
+            );
+          },
+          (err) => {
+            assert.equal(err.status, 409);
+            assert.equal(err.code, "CONFLICT");
+            assert.match(err.message, /expired/i);
+            return true;
+          },
+          "过期租约的 executeAction 必须返回 409 CONFLICT"
+        );
+        assert.equal(run32.lastActionSeq, 0, "过期租约不得提交任何动作");
+        // 3. 在锁内调用 observe，必须被拒绝 (409 CONFLICT) 且不得返回观察
+        await assert.rejects(
+          async () => {
+            await run32.observe(ctrl32);
+          },
+          (err) => {
+            assert.equal(err.status, 409);
+            assert.equal(err.code, "CONFLICT");
+            assert.match(err.message, /expired/i);
+            return true;
+          },
+          "过期租约的 observe 必须返回 409 CONFLICT"
+        );
+      } finally {
+        if (run32) run32.cleanup();
+      }
+
+      console.log("  [Test 33] Idempotent retry of rejected actions returns structured error (AC-R5)");
+      const ctrl33 = await newController("ctrl33-rejected-idempotency");
+      const run33 = await test23Service.createRun({ maxActions: 100 });
+      const lease33 = await test23Service.claimRun(ctrl33, { model_name: "Model 33" });
+
+      try {
+        const opIdReject = "op-rejected-idempotent-1";
+
+        // 1. 触发动作拒绝 (非法参数或非法指令)
+        const rejectResult1 = await run33.executeAction(
+          ctrl33,
+          lease33.lease_id,
+          lease33.lease_epoch,
+          "go_to_level",
+          { x: "1", y: "2" },
+          opIdReject
+        );
+
+        assert.ok(rejectResult1, "初次被拒绝响应必须非空");
+        assert.equal(rejectResult1.isError, true, "初次被拒绝响应 isError 必须为 true");
+        assert.equal(rejectResult1.resultType, "complete", "resultType 必须为 complete");
+        assert.ok(Array.isArray(rejectResult1.content) && rejectResult1.content.length > 0, "响应 content 必须非空数组");
+
+        // 验证权威 WAL 记录了 action_rejected 且包含 sanitized_result，并通过 schema 校验
+        const journalLines = fs.readFileSync(run33.journalPath, "utf8").trim().split("\n").map(JSON.parse);
+        const rejectedRecord = journalLines.find((r) => r.type === "action_rejected" && r.operation_id === opIdReject);
+        assert.ok(rejectedRecord, "WAL 必须包含 action_rejected 记录");
+        assert.equal(validateJournalRecord(rejectedRecord), true, "action_rejected 记录必须符合 JSON schema");
+        assert.deepEqual(rejectedRecord.sanitized_result, rejectResult1, "WAL 中 sanitized_result 必须与初次响应一致");
+
+        // 2. 相同 operation_id 重试：必须返回完全相同的结构化错误响应，绝不可返回 undefined 或空响应
+        const retryRejectResult = await run33.executeAction(
+          ctrl33,
+          lease33.lease_id,
+          lease33.lease_epoch,
+          "go_to_level",
+          { x: "1", y: "2" },
+          opIdReject
+        );
+        assert.deepEqual(retryRejectResult, rejectResult1, "幂等重试必须返回相同的结构化错误响应");
+        assert.equal(retryRejectResult.isError, true);
+
+        // 3. 相同 operation_id 但不同参数：必须抛出 IDEMPOTENCY_CONFLICT
+        await assert.rejects(
+          async () => {
+            await run33.executeAction(
+              ctrl33,
+              lease33.lease_id,
+              lease33.lease_epoch,
+              "rotate_camera_right",
+              {},
+              opIdReject
+            );
+          },
+          (err) => {
+            assert.equal(err.status, 409);
+            assert.equal(err.code, "IDEMPOTENCY_CONFLICT");
+            return true;
+          },
+          "相同 operation_id 篡改参数必须返回 IDEMPOTENCY_CONFLICT"
+        );
+
+        // 4. 验证历史未缓存 sanitized_result 的 action_rejected 回退行为
+        const fallbackOpId = "op-historical-fallback";
+        run33.operationIndex.set(fallbackOpId, {
+          journal_seq: 999,
+          type: "action_rejected",
+          operation_id: fallbackOpId,
+          controller_id: ctrl33.controllerId,
+          error_payload: { message: "Legacy error without sanitized_result" }
+        });
+        const fallbackResult = await run33.executeAction(
+          ctrl33,
+          lease33.lease_id,
+          lease33.lease_epoch,
+          "rotate_camera_left",
+          {},
+          fallbackOpId
+        );
+        assert.ok(fallbackResult, "历史回退响应不得为 undefined");
+        assert.equal(fallbackResult.isError, true);
+        assert.equal(fallbackResult.resultType, "complete");
+      } finally {
+        if (run33) run33.cleanup();
+      }
+
+      console.log("  [Test 34] Actions replica reconciliation before finalization & accurate novelty calculation");
+      const ctrl34 = await newController("ctrl34-reconcile-novelty");
+      const run34 = await test23Service.createRun({ maxActions: 100 });
+      const lease34 = await test23Service.claimRun(ctrl34, { model_name: "Model 34" });
+
+      try {
+        // 1. 动作 1: 原地旋转，正常写入 WAL 与 actions.jsonl
+        await run34.executeAction(
+          ctrl34,
+          lease34.lease_id,
+          lease34.lease_epoch,
+          "rotate_camera_left",
+          {},
+          "op-rot-1"
+        );
+
+        // 2. 动作 2: 再次原地旋转，模拟次级副本写入失败（抛错）
+        const origAppend = fs.appendFileSync;
+        fs.appendFileSync = (file, data, opt) => {
+          if (typeof file === "string" && file.endsWith("actions.jsonl")) {
+            throw new Error("Synthetic failure on 2nd rotation actions replica");
+          }
+          return origAppend(file, data, opt);
+        };
+
+        try {
+          await run34.executeAction(
+            ctrl34,
+            lease34.lease_id,
+            lease34.lease_epoch,
+            "rotate_camera_left",
+            {},
+            "op-rot-2"
+          );
+        } finally {
+          fs.appendFileSync = origAppend;
+        }
+
+        // 此时 actions.jsonl 缺少第二步（仅有 1 步）
+        const unalignedActions = fs.readFileSync(run34.actionsPath, "utf8").trim().split("\n").filter(Boolean);
+        assert.equal(unalignedActions.length, 1, "注入写入失败后，actions.jsonl 暂时缺失第 2 步动作");
+
+        // 3. 执行最终结算（_startFinalize）
+        await run34._startFinalize("won", "Goal reached");
+        // 等待异步 finalizeWorker 执行完毕
+        await new Promise((resolve) => setTimeout(resolve, 150));
+
+        // 4. 验证结算前 actions.jsonl 已自动向权威 WAL 完整对齐
+        const reconciledActions = fs.readFileSync(run34.actionsPath, "utf8").trim().split("\n").filter(Boolean);
+        assert.equal(reconciledActions.length, 2, "结算前 actions.jsonl 必须向权威 WAL 完整对齐（2 步动作）");
+
+        // 5. 验证从权威数据源计算的 novelty：两次原地旋转（同一坐标）novelty 应为 50，绝不固化为错误的 100
+        const { getRunFinalNovelty } = require("../server/run-rankings");
+        const finalNovelty = getRunFinalNovelty(run34.runDir);
+        assert.equal(finalNovelty, 50, `两次原地旋转的 novelty 必须精确为 50，实际值为 ${finalNovelty}`);
+      } finally {
+        if (run34) run34.cleanup();
+      }
+
+      console.log("  [Test 35] Controlled session extension with authoritative terminal verification & binding cleanup");
+      const ctrl35A = await newController("ctrl35-terminal-reclaim");
+      const run35A = await test23Service.createRun({ maxActions: 10 });
+      const lease35A = await test23Service.claimRun(ctrl35A, { model_name: "Model 35A" });
+      assert.equal(test23Service.controllerRunBindings.get(ctrl35A.controllerId), run35A.runId);
+
+      let run35B = null;
+      try {
+        // 1. 终态 run 携带 previous_run_id 成功签发凭据、返回 previous_run 快照并清理旧绑定
+        await run35A._startFinalize("won", "Goal reached successfully");
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.equal(run35A.status, "won");
+
+        // 模拟旧局残存的 controller 绑定（例如异步清理滞后或异常残留）
+        const residualCtrlId = `residual-${ctrl35A.controllerId}`;
+        test23Service.controllerRunBindings.set(residualCtrlId, run35A.runId);
+        assert.equal(test23Service.controllerRunBindings.get(residualCtrlId), run35A.runId);
+
+        // 1a. 对抗测试：使用非法 nonce 携带 terminal runId，必须立即被 403 阻断，严禁泄露状态且严禁清理旧绑定
+        const nonceBeforeBadTerminal = test23Service.mcpBootstrapNonce;
+        await assert.rejects(
+          test23Service.handleControllerSession(
+            "WRONG_BOOTSTRAP_NONCE",
+            { name: "adversary-terminal" },
+            { previousRunId: run35A.runId }
+          ),
+          (err) => {
+            assert.equal(err.status, 403);
+            assert.equal(err.code, "FORBIDDEN");
+            assert.equal(err.run_id, undefined);
+            assert.equal(err.status_name, undefined);
+            return true;
+          },
+          "非法 nonce 探测 terminal run 必须立即返回 403 FORBIDDEN"
+        );
+        assert.equal(
+          test23Service.controllerRunBindings.get(residualCtrlId),
+          run35A.runId,
+          "未认证的非法请求严禁清理旧绑定"
+        );
+        assert.equal(test23Service.mcpBootstrapNonce, nonceBeforeBadTerminal, "非法请求严禁消耗 nonce");
+
+        // 1b. 终态 run 携带合法 nonce 与 previous_run_id 成功签发凭据、返回 previous_run 快照并清理旧绑定
+        const nonceBeforeSuccess = test23Service.mcpBootstrapNonce;
+        const sessionRes35A = await test23Service.handleControllerSession(
+          nonceBeforeSuccess,
+          { name: "ctrl35-reconnect" },
+          { previousRunId: run35A.runId }
+        );
+
+        assert.ok(sessionRes35A.controller_token);
+        assert.ok(sessionRes35A.controller_id.startsWith("ctrl35-reconnect"));
+        assert.equal(sessionRes35A.instance_id, test23Service.instanceId);
+        assert.deepEqual(sessionRes35A.previous_run, {
+          run_id: run35A.runId,
+          ended: true,
+          status: "won"
+        });
+        assert.equal(test23Service.controllerRunBindings.has(residualCtrlId), false, "旧绑定必须在终态核验后清理");
+        assert.equal(test23Service.controllerRunBindings.has(ctrl35A.controllerId), false, "原有绑定也已清理");
+        assert.notEqual(test23Service.mcpBootstrapNonce, nonceBeforeSuccess, "成功签发后 nonce 必须轮转");
+
+        // 2. 处于 active 状态的 run 携带 previous_run_id 必须拒绝 (RUN_RESUME_REQUIRED)，且严禁消耗 nonce
+        const ctrl35B = await newController("ctrl35-active-holder");
+        run35B = await test23Service.createRun({ maxActions: 10 });
+        await test23Service.claimRun(ctrl35B, { model_name: "Model 35B" });
+        assert.equal(run35B.status, "active");
+
+        // 2a. 对抗测试：使用非法 nonce 携带 active runId，必须直接返回 403 FORBIDDEN，严禁泄露 RUN_RESUME_REQUIRED 或 active 状态
+        const nonceBeforeBadActive = test23Service.mcpBootstrapNonce;
+        await assert.rejects(
+          test23Service.handleControllerSession(
+            "WRONG_BOOTSTRAP_NONCE",
+            { name: "adversary-active" },
+            { previousRunId: run35B.runId }
+          ),
+          (err) => {
+            assert.equal(err.status, 403);
+            assert.equal(err.code, "FORBIDDEN");
+            assert.equal(err.run_id, undefined);
+            assert.equal(err.status_name, undefined);
+            return true;
+          },
+          "非法 nonce 探测 active run 必须直接抛出 403 FORBIDDEN 且不泄露状态"
+        );
+        assert.equal(
+          test23Service.controllerRunBindings.get(ctrl35B.controllerId),
+          run35B.runId,
+          "非法请求严禁影响 active 绑定"
+        );
+        assert.equal(test23Service.mcpBootstrapNonce, nonceBeforeBadActive, "非法请求严禁消耗 nonce");
+
+        const nonceBeforeActiveReject = test23Service.mcpBootstrapNonce;
+        await assert.rejects(
+          test23Service.handleControllerSession(
+            nonceBeforeActiveReject,
+            { name: "ctrl35-active-reclaim" },
+            { previousRunId: run35B.runId }
+          ),
+          (err) => {
+            assert.equal(err.status, 409);
+            assert.equal(err.code, "RUN_RESUME_REQUIRED");
+            assert.equal(err.run_id, run35B.runId);
+            assert.equal(err.status_name, "active");
+            return true;
+          },
+          "Active run 带 previous_run_id 必须抛出 409 RUN_RESUME_REQUIRED"
+        );
+        assert.equal(test23Service.mcpBootstrapNonce, nonceBeforeActiveReject, "校验失败严禁消耗 nonce");
+
+        // 3. 不存在的 run 携带 previous_run_id 必须拒绝 (PREVIOUS_RUN_UNVERIFIED)，且严禁消耗 nonce
+        const ghostRunId = "ext-00000000-ghost-4000-8000-000000000000";
+
+        // 3a. 对抗测试：使用非法 nonce 携带 ghost runId，必须直接返回 403 FORBIDDEN，严禁泄露 PREVIOUS_RUN_UNVERIFIED
+        const nonceBeforeBadGhost = test23Service.mcpBootstrapNonce;
+        await assert.rejects(
+          test23Service.handleControllerSession(
+            "WRONG_BOOTSTRAP_NONCE",
+            { name: "adversary-ghost" },
+            { previousRunId: ghostRunId }
+          ),
+          (err) => {
+            assert.equal(err.status, 403);
+            assert.equal(err.code, "FORBIDDEN");
+            assert.equal(err.run_id, undefined);
+            assert.equal(err.status_name, undefined);
+            return true;
+          },
+          "非法 nonce 探测 ghost run 必须直接抛出 403 FORBIDDEN 且不泄露未验证状态"
+        );
+        assert.equal(test23Service.mcpBootstrapNonce, nonceBeforeBadGhost, "非法请求严禁消耗 nonce");
+
+        const nonceBeforeNotFoundReject = test23Service.mcpBootstrapNonce;
+        await assert.rejects(
+          test23Service.handleControllerSession(
+            nonceBeforeNotFoundReject,
+            { name: "ctrl35-ghost-reclaim" },
+            { previousRunId: ghostRunId }
+          ),
+          (err) => {
+            assert.equal(err.status, 409);
+            assert.equal(err.code, "PREVIOUS_RUN_UNVERIFIED");
+            assert.equal(err.run_id, ghostRunId);
+            return true;
+          },
+          "不存在的 run 必须抛出 409 PREVIOUS_RUN_UNVERIFIED"
+        );
+        assert.equal(test23Service.mcpBootstrapNonce, nonceBeforeNotFoundReject, "校验失败严禁消耗 nonce");
+
+        // 4. 无 previous_run_id 时完全保持向后兼容（不返回 previous_run 字段，且正常消费轮转 nonce）
+        const nonceBeforeLegacy = test23Service.mcpBootstrapNonce;
+        const legacySessionRes = await test23Service.handleControllerSession(
+          nonceBeforeLegacy,
+          { name: "ctrl35-legacy" }
+        );
+        assert.ok(legacySessionRes.controller_token);
+        assert.ok(legacySessionRes.controller_id.startsWith("ctrl35-legacy"));
+        assert.equal(legacySessionRes.previous_run, undefined);
+        assert.notEqual(test23Service.mcpBootstrapNonce, nonceBeforeLegacy);
+
+        // 5. 对终态 run 发起 createResumeRequest 必须抛出 409 RUN_ENDED
+        const ctrl35Legacy = test23Service.validateControllerToken(`Bearer ${legacySessionRes.controller_token}`);
+        await assert.rejects(
+          test23Service.createResumeRequest(ctrl35Legacy, run35A.runId),
+          (err) => {
+            assert.equal(err.status, 409);
+            assert.equal(err.code, "RUN_ENDED");
+            assert.equal(err.run_id, run35A.runId);
+            assert.equal(err.ended, true);
+            return true;
+          },
+          "对终态 run 请求 resume 必须抛出 409 RUN_ENDED"
+        );
+
+        // 6. 非法 previous_run_id 类型（空字符串或非字符串）必须抛出 400 INVALID_ARGUMENT，且严禁消耗 nonce
+        const nonceBeforeInvalidArg = test23Service.mcpBootstrapNonce;
+        await assert.rejects(
+          test23Service.handleControllerSession(
+            nonceBeforeInvalidArg,
+            { name: "ctrl35-invalid" },
+            { previousRunId: "   " }
+          ),
+          (err) => {
+            assert.equal(err.status, 400);
+            assert.equal(err.code, "INVALID_ARGUMENT");
+            return true;
+          },
+          "空白 previous_run_id 必须抛出 400 INVALID_ARGUMENT"
+        );
+        assert.equal(test23Service.mcpBootstrapNonce, nonceBeforeInvalidArg, "参数校验失败严禁消耗 nonce");
+
+        // 6b. 合法 nonce 下 clientInfo.name 参数非法（含控制字符或超长）必须抛出 400 INVALID_ARGUMENT 且严禁提前消耗/轮转 nonce
+        const nonceBeforeBadClient = test23Service.mcpBootstrapNonce;
+        await assert.rejects(
+          test23Service.handleControllerSession(
+            nonceBeforeBadClient,
+            { name: "bad\x00client" }
+          ),
+          (err) => {
+            assert.equal(err.status, 400);
+            assert.equal(err.code, "INVALID_ARGUMENT");
+            return true;
+          },
+          "含控制字符的 clientInfo.name 必须抛出 400 INVALID_ARGUMENT"
+        );
+        assert.equal(test23Service.mcpBootstrapNonce, nonceBeforeBadClient, "clientInfo.name 校验失败严禁提前消耗轮转 nonce");
+
+        // 7. 路由层 (server/router.js) 端到端集成测试
+        const router35 = createRequestRouter({
+          externalPlay: test23Service,
+          publicFileRoutes: new Map(),
+          readJsonBody: async (req) => req.body || {},
+          sendJson: (res, status, payload) => {
+            res.writeHead(status);
+            res.end(JSON.stringify(payload));
+          },
+          getLevelState: () => ({ width: 10, height: 10 }),
+          getLevel: () => ({ id: "lvl-1" }),
+          getGame: () => ({ id: "maze" }),
+          worldMaps: {
+            defaultLevelIdForGame: () => "lvl-1",
+            isMazeWorldLevelId: () => false
+          }
+        });
+
+        const dispatchMockPost = async (url, body) => {
+          let resStatus = null;
+          let resJson = null;
+          const req = {
+            method: "POST",
+            url,
+            headers: {
+              host: "127.0.0.1:3018",
+              "sec-fetch-site": "same-origin",
+              "content-type": "application/json"
+            },
+            socket: { remoteAddress: "127.0.0.1" },
+            body
+          };
+          const res = {
+            writeHead(status) { resStatus = status; },
+            end(data) { if (data) resJson = JSON.parse(data); }
+          };
+          await router35.handleRequest(req, res);
+          return { status: resStatus, body: resJson };
+        };
+
+        // 7a. 路由层成功处理终态 previous_run_id
+        const routerNonce1 = test23Service.mcpBootstrapNonce;
+        const routeResSuccess = await dispatchMockPost("/api/external-play/controller/session", {
+          mcp_bootstrap_nonce: routerNonce1,
+          clientInfo: { name: "router-client" },
+          previous_run_id: run35A.runId
+        });
+        assert.equal(routeResSuccess.status, 200);
+        assert.ok(routeResSuccess.body.controller_token);
+        assert.deepEqual(routeResSuccess.body.previous_run, {
+          run_id: run35A.runId,
+          ended: true,
+          status: "won"
+        });
+
+        // 7b. 路由层拒绝 active previous_run_id 并返回 409 RUN_RESUME_REQUIRED
+        const routerNonce2 = test23Service.mcpBootstrapNonce;
+        const routeResActive = await dispatchMockPost("/api/external-play/controller/session", {
+          mcp_bootstrap_nonce: routerNonce2,
+          clientInfo: { name: "router-client" },
+          previous_run_id: run35B.runId
+        });
+        assert.equal(routeResActive.status, 409);
+        assert.equal(routeResActive.body.code, "RUN_RESUME_REQUIRED");
+        assert.equal(routeResActive.body.run_id, run35B.runId);
+        assert.equal(routeResActive.body.status, "active");
+
+        // 7c. 路由层拒绝不存在的 previous_run_id 并返回 409 PREVIOUS_RUN_UNVERIFIED
+        const routeResNotFound = await dispatchMockPost("/api/external-play/controller/session", {
+          mcp_bootstrap_nonce: routerNonce2,
+          clientInfo: { name: "router-client" },
+          previous_run_id: "ext-non-existent"
+        });
+        assert.equal(routeResNotFound.status, 409);
+        assert.equal(routeResNotFound.body.code, "PREVIOUS_RUN_UNVERIFIED");
+        assert.equal(routeResNotFound.body.run_id, "ext-non-existent");
+
+        // 7d. 路由层使用非法 nonce 携带 previous_run_id 必须直接返回 403 FORBIDDEN 且不泄露状态
+        const routeResBadNonce = await dispatchMockPost("/api/external-play/controller/session", {
+          mcp_bootstrap_nonce: "WRONG_NONCE",
+          clientInfo: { name: "router-client" },
+          previous_run_id: run35A.runId
+        });
+        assert.equal(routeResBadNonce.status, 403);
+        assert.equal(routeResBadNonce.body.code, "FORBIDDEN");
+        assert.equal(routeResBadNonce.body.status, undefined);
+        assert.equal(routeResBadNonce.body.run_id, undefined);
+      } finally {
+        if (run35A) run35A.cleanup();
+        if (run35B) run35B.cleanup();
       }
     } finally {
       await new Promise((r) => setTimeout(r, 60));

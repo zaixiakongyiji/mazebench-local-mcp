@@ -29,7 +29,7 @@ External Play allows evaluated models and autonomous agents (e.g. Claude Desktop
   - 禁止共享 `MAZEBENCH_LOCAL_MCP_TOKEN`；每个独立 stdio MCP adapter 进程协商独立 controller。多模型并发必须使用独立 adapter 连接，不得假设同一客户端的不同对话或窗口天然隔离，也不要求使用不同品牌客户端。
   - 同一 controller 最多绑定一个未结束 run。运行结束或授权接管成功后，服务端解除原绑定；接管必须按 run ID 清理旧绑定，包括租约已经断开或超时的情况。仅断开或超时不自动释放绑定。
   - 审批和新认领必须共用 controller 绑定锁，锁顺序保持 `admissionMutex -> sessionMutex`，在同一事务范围内检查和更新绑定，防止同一 controller 同时取得两个 run 的租约。
-  - adapter 已认领 run 后丢失认证，必须持续保留重新授权状态；后续 `start` 重试不得创建新 controller 或领取下一席位。只有通过 `resume` 获批才能恢复控制，服务端解绑不能用来绕过 adapter 的授权限制。
+  - adapter 已认领 run 后丢失认证，必须持续保留重新授权状态；未经权威终态确认，后续 `start` 重试不得创建新 controller 或领取下一席位。活动或状态未知的旧局只有通过 `resume` 获批才能恢复控制，服务端解绑不能用来绕过 adapter 的授权限制。唯一例外：本次显式 `start` 经内部认证接口确认 adapter 保存的旧 run 已处于合法终态，且确认结果的 run ID、状态、服务实例与凭据均有效时，可以更新 controller 并直接认领新席位；未知、缺失、非终态或无效响应必须拒绝。
   - Idempotent operations must be scoped to `controller_id + operation_id` to guarantee safe retries without unintended seat allocations.
 - Durable audit logging:
   - 认领、租约附着、撤销及强制接管必须持久化到 WAL（`journal.jsonl`）。首次认领记录为 `run_started`；恢复附着的 `lease_attached` 写入 `request_id`、`previous_controller_id`（可为 `null`）和 `forced`。
