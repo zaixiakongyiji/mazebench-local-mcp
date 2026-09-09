@@ -588,11 +588,18 @@ class ExternalPlayService {
     const info = this.controllerTokens.get(token);
     if (!info) return null;
     if (info.instanceId !== this.instanceId) return null;
-    if (Date.now() - info.createdAt > CONTROLLER_TOKEN_TTL_MS) {
+    if (Date.now() - (info.renewedAt || info.createdAt) > CONTROLLER_TOKEN_TTL_MS) {
       this.controllerTokens.delete(token);
       return null;
     }
     return { ...info, token };
+  }
+
+  renewControllerToken(controllerInfo) {
+    // 仅成功的租约心跳续期；已过期或撤销的凭据不能复活。
+    const valid = this.validateControllerToken(`Bearer ${controllerInfo.token}`);
+    if (!valid || valid.controllerId !== controllerInfo.controllerId) return;
+    this.controllerTokens.get(controllerInfo.token).renewedAt = Date.now();
   }
 
   generateViewerToken(runId) {
@@ -1118,7 +1125,7 @@ class ExternalPlayService {
         isTokenValid = Array.from(this.controllerTokens.values()).some(
           info => info.controllerId === req.controllerId &&
           info.instanceId === this.instanceId &&
-          Date.now() - info.createdAt <= CONTROLLER_TOKEN_TTL_MS
+          Date.now() - (info.renewedAt || info.createdAt) <= CONTROLLER_TOKEN_TTL_MS
         );
       }
       if (!isTokenValid) {
@@ -1299,6 +1306,9 @@ class RunInstance {
     this.disposed = false;
 
     this.operationIndex = new Map(); // operation_id -> final record / response
+    // 引用 WAL 已持有的动作对象，分页无需重复读取和解析整个投影文件。
+    this.actionRecords = [];
+    this.eventRecords = [];
   }
 
   _startResponseMetadata(overrides = {}) {
@@ -1452,6 +1462,8 @@ class RunInstance {
   }
 
   _applyJournalRecord(record) {
+    const eventId = record.event_id || record.ended_event_id;
+    if (eventId) this.eventRecords[eventId - 1] = { record, actionSeq: record.action_seq || this.lastActionSeq };
     switch (record.type) {
       case "run_armed":
         this.status = "armed";
@@ -1505,6 +1517,7 @@ class RunInstance {
         break;
 
       case "action_committed":
+        this.actionRecords[record.action_seq - 1] = record.action_record;
         this.lastActionSeq = record.action_seq;
         this.lastEventId = record.event_id;
         this.currentViewerStateHash = record.viewer_state_hash;
@@ -1623,6 +1636,11 @@ class RunInstance {
     const payload = `id: ${eventData.event_id}\nevent: ${eventData.type}\ndata: ${JSON.stringify(eventData)}\n\n`;
     for (const subscriber of this.subscribers) {
       try {
+        if (subscriber.writableLength > 1024 * 1024) {
+          subscriber.destroy();
+          this.subscribers.delete(subscriber);
+          continue;
+        }
         subscriber.write(payload);
         if (typeof subscriber.flush === "function") subscriber.flush();
       } catch (_e) {

@@ -339,6 +339,7 @@ function createRequestRouter({
         }
         try {
           const res = await run.heartbeat(controllerInfo, payload.lease_id, payload.lease_epoch);
+          externalPlay.renewControllerToken(controllerInfo);
           sendJson(response, 200, res);
         } catch (err) {
           sendJson(response, err.status || 500, { error: err.message, code: err.code || "INTERNAL_ERROR" });
@@ -613,6 +614,8 @@ function createRequestRouter({
           }
           sendJson(response, 200, {
             base_viewer_state: run.baseViewerState,
+            current_viewer_state: run.currentViewerState,
+            visited_levels: Array.from(run.gameSession?.visitedLevels || []),
             world_bundle_digest: run.worldBundleDigest,
             action_seq: run.lastActionSeq,
             as_of_event_id: run.lastEventId,
@@ -649,18 +652,7 @@ function createRequestRouter({
             return;
           }
 
-          const actions = [];
-          if (run.actionsPath && fs.existsSync(run.actionsPath)) {
-            const content = fs.readFileSync(run.actionsPath, "utf8");
-            const lines = content.split("\n").filter((l) => l.trim().length > 0);
-            for (const line of lines) {
-              const act = JSON.parse(line);
-              if (act.seq >= fromSeq && act.seq <= toSeq) {
-                actions.push(act);
-                if (actions.length >= limit) break;
-              }
-            }
-          }
+          const actions = run.actionRecords.slice(fromSeq - 1, Math.min(toSeq, fromSeq - 1 + limit));
 
           const lastReturnedSeq = actions.length > 0 ? actions[actions.length - 1].seq : fromSeq - 1;
           const hasMore = lastReturnedSeq < toSeq && lastReturnedSeq < run.lastActionSeq;
@@ -710,6 +702,12 @@ function createRequestRouter({
             }
           }
 
+          // 过大的追赶改走最新快照，避免一个慢观众阻塞游戏与心跳。
+          if (run.lastEventId - afterEventId > 500) {
+            sendJson(response, 410, { code: "CURSOR_EXPIRED", latest_event_id: run.lastEventId });
+            return;
+          }
+
           response.writeHead(200, {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache, no-transform",
@@ -717,47 +715,25 @@ function createRequestRouter({
           });
           response.flushHeaders?.();
 
-          // Replay past events from journal
-          let replayActionSeq = 0;
-          if (fs.existsSync(run.journalPath)) {
-            const content = fs.readFileSync(run.journalPath, "utf8");
-            const lines = content.split("\n").filter((l) => l.trim().length > 0);
-            for (const line of lines) {
-              const rec = JSON.parse(line);
-              let sseData = null;
-              if (rec.type === "action_committed") {
-                replayActionSeq = rec.action_seq;
-                if (rec.event_id > afterEventId) {
-                  sseData = {
-                    event_id: rec.event_id,
-                    type: "action",
-                    action_seq: rec.action_seq,
-                    tool: rec.action_record.tool,
-                    action_record: rec.action_record
-                  };
-                }
-              } else if (rec.type === "action_rejected" && rec.event_id > afterEventId) {
-                sseData = {
-                  event_id: rec.event_id,
-                  type: "action_rejected",
-                  action_seq: replayActionSeq,
-                  tool: rec.tool,
-                  error: rec.error_payload.message
-                };
-              } else if ((rec.type === "run_finalized" || rec.type === "run_failed") && rec.ended_event_id > afterEventId) {
-                sseData = {
-                  event_id: rec.ended_event_id,
-                  type: "ended",
-                  action_seq: run.lastActionSeq,
-                  outcome: rec.outcome,
-                  summary_digest: rec.summary_digest || rec.partial_summary_digest || null,
-                  summary_url: rec.final_response?.summary_url || null
-                };
-              }
-              if (sseData) {
-                response.write(`id: ${sseData.event_id}\nevent: ${sseData.type}\ndata: ${JSON.stringify(sseData)}\n\n`);
-              }
-            }
+          // WAL 投影索引与实时水位同步；连接最新水位时无需扫描日志。
+          for (const entry of run.eventRecords.slice(afterEventId)) {
+            if (!entry) continue;
+            const rec = entry.record;
+            let event = null;
+            if (rec.type === "action_committed") event = {
+              event_id: rec.event_id, type: "action", action_seq: rec.action_seq,
+              tool: rec.action_record.tool, action_record: rec.action_record
+            };
+            else if (rec.type === "action_rejected") event = {
+              event_id: rec.event_id, type: "action_rejected", action_seq: entry.actionSeq,
+              tool: rec.tool, error: rec.error_payload.message
+            };
+            else if (rec.type === "run_finalized" || rec.type === "run_failed") event = {
+              event_id: rec.ended_event_id, type: "ended", action_seq: entry.actionSeq,
+              outcome: rec.outcome, summary_digest: rec.summary_digest || rec.partial_summary_digest || null,
+              summary_url: rec.final_response?.summary_url || null
+            };
+            if (event) response.write(`id: ${event.event_id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
           }
 
           // Register subscriber for live fanout if run is not terminal

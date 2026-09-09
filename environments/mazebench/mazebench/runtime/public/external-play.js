@@ -703,6 +703,41 @@
 
     let baseViewerState = null;
     let historyActions = [];
+    const cachedSteps = new Set();
+    const FEED_LIMIT = 200;
+    let seekGeneration = 0;
+    let streamAbortController = null;
+    function rememberAction(item) {
+      historyActions[item.seq - 1] = item;
+      cachedSteps.delete(item.seq);
+      cachedSteps.add(item.seq);
+      while (cachedSteps.size > 1000) {
+        const oldest = cachedSteps.values().next().value;
+        cachedSteps.delete(oldest);
+        delete historyActions[oldest - 1];
+      }
+    }
+    async function fetchActionsAround(step, generation = currentGenerationId) {
+      const from = Math.max(1, step - 100);
+      const to = Math.min(historyActions.length, step + 99);
+      const response = await viewerFetch(`/api/external-play/runs/${encodeURIComponent(runId)}/actions?from_seq=${from}&to_seq=${to}&limit=200`);
+      if (!response.ok) throw new Error(`History request failed: HTTP ${response.status}`);
+      const data = await response.json();
+      if (generation !== currentGenerationId) return false;
+      for (const act of data.actions || []) rememberAction({
+        seq: act.seq, action: act.tool, transition: act.viewer_transition,
+        post_viewer_state: act.post_viewer_state, post_viewer_state_digest: act.post_viewer_state_digest,
+        observation: act.sanitized_status
+      });
+      return true;
+    }
+    function renderFeedAround(step) {
+      if (!actionFeedList) return;
+      actionFeedList.replaceChildren();
+      for (let n = Math.max(1, step - 99); n <= Math.min(historyActions.length, step + 99); n++) {
+        if (historyActions[n - 1]) appendFeedItem(historyActions[n - 1], n, false);
+      }
+    }
     let currentPlaybackStep = 0;
     let isLiveMode = true;
     let isPaused = false;
@@ -739,14 +774,17 @@
       return { icon: "🎮", name: escapeText(tool).toUpperCase() };
     }
 
-    function appendFeedItem(item, stepIndex) {
+    function appendFeedItem(item, stepIndex, follow = true) {
       if (!actionFeedList) return;
       const emptyTip = actionFeedList.querySelector(".feed-empty-tip");
       if (emptyTip) emptyTip.remove();
 
       const { icon, name } = formatTool(item.action);
       let statusHtml = '<span class="feed-item-status">✓</span>';
-      if (item.observation?.gem_delta > 0 || (item.observation?.collected_gems_count !== undefined && item.observation.collected_gems_count > gemCount)) {
+      const previous = historyActions[stepIndex - 2]?.observation;
+      const previousGems = stepIndex === 1 ? 0 : previous?.collected_gems_count ?? previous?.gem_count;
+      const currentGems = item.observation?.collected_gems_count ?? item.observation?.gem_count;
+      if (item.observation?.gem_delta > 0 || (previousGems !== undefined && currentGems > previousGems)) {
         statusHtml = '<span class="feed-item-status feed-item-status--gem">💎 Gem!</span>';
       } else if (item.action && item.action.startsWith("rotate")) {
         statusHtml = '<span class="feed-item-status">Cam</span>';
@@ -772,22 +810,15 @@
       });
 
       actionFeedList.appendChild(feedItem);
-      if (isLiveMode) {
-        feedItem.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      }
+      while (actionFeedList.children.length > FEED_LIMIT) actionFeedList.firstElementChild.remove();
+      if (isLiveMode && follow) actionFeedList.scrollTop = actionFeedList.scrollHeight;
     }
 
     function highlightFeedStep(stepIndex) {
       if (!actionFeedList) return;
-      const items = actionFeedList.querySelectorAll(".feed-item");
-      items.forEach((it) => {
-        const itStep = parseInt(it.dataset.step, 10);
-        const isCur = itStep === stepIndex;
-        it.classList.toggle("is-current", isCur);
-        if (isCur) {
-          it.scrollIntoView({ behavior: "smooth", block: "nearest" });
-        }
-      });
+      actionFeedList.querySelector(".is-current")?.classList.remove("is-current");
+      const item = actionFeedList.querySelector(`[data-step="${stepIndex}"]`);
+      item?.classList.add("is-current");
     }
 
     function updateStatsUI(roomsCount, roomName, gems, actions) {
@@ -841,6 +872,7 @@
     }
 
     async function seekToStep(targetStep) {
+      const seekId = ++seekGeneration;
       const clamped = Math.max(0, Math.min(historyActions.length, targetStep));
       currentPlaybackStep = clamped;
       updateScrubberUI();
@@ -857,7 +889,18 @@
         return;
       }
 
+      const generation = currentGenerationId;
+      if (!historyActions[clamped - 1] || !historyActions[Math.max(0, clamped - 2)]) {
+        await fetchActionsAround(clamped, generation);
+      }
+      if (seekId !== seekGeneration || generation !== currentGenerationId) return;
       const targetAction = historyActions[clamped - 1];
+      if (targetAction && !targetAction.post_viewer_state && targetAction.post_viewer_state_digest) {
+        targetAction.post_viewer_state = await fetchAndVerifyBlob(targetAction.post_viewer_state_digest, "viewer_state");
+      }
+      if (seekId !== seekGeneration || generation !== currentGenerationId) return;
+      renderFeedAround(clamped);
+      highlightFeedStep(clamped);
       if (targetAction) {
         if (targetAction.post_viewer_state) {
           await host.applySnapshot(targetAction.post_viewer_state);
@@ -1090,8 +1133,10 @@
             return;
           }
 
+          // 实时积压时直接同步最新完整状态，历史仍可按序号回放。
+          if (actionQueue.length > 10) actionQueue.splice(0, actionQueue.length - 1);
           const item = actionQueue.shift();
-          const isImmediate = isEnded || item.immediate === true;
+          const isImmediate = isEnded || item.immediate === true || totalActions + 1 < item.seq;
 
           // Calibrate step delay: if ended or behind queue, speed up smoothly
           if (isImmediate) {
@@ -1113,6 +1158,7 @@
               console.warn("Error applying action in host:", err);
             }
           }
+          if (genId !== undefined && genId !== currentGenerationId) return;
 
           const roomName = item.post_viewer_state?.current_room || item.transition?.world_transition?.target_room || item.observation?.current_room;
           if (roomName) {
@@ -1128,7 +1174,7 @@
             }
           }
 
-          totalActions++;
+          totalActions = item.seq;
           if (isLiveMode || isImmediate) {
             currentPlaybackStep = totalActions;
             updateStatsUI(visitedRooms.size, currentRoom, gemCount, totalActions);
@@ -1165,12 +1211,22 @@
       }
     }
 
+    async function viewerFetch(url, options = {}) {
+      const request = () => fetch(url, { ...options, headers: { ...options.headers, ...(viewerToken ? { Authorization: `Bearer ${viewerToken}` } : {}) } });
+      let response = await request();
+      if (response.status === 401 || response.status === 403) {
+        await obtainViewerToken();
+        response = await request();
+      }
+      return response;
+    }
+
     // Fetch, verify hash and validate schema for blob
     async function fetchAndVerifyBlob(digest, kind = "transition") {
       if (!digest) return null;
       try {
         const authHeaders = viewerToken ? { Authorization: `Bearer ${viewerToken}` } : {};
-        const res = await fetch(`/api/external-play/runs/${encodeURIComponent(runId)}/blobs/${digest}`, {
+        const res = await viewerFetch(`/api/external-play/runs/${encodeURIComponent(runId)}/blobs/${digest}`, {
           headers: authHeaders
         });
         if (!res.ok) throw new Error(`HTTP ${res.status} fetching blob ${digest}`);
@@ -1216,12 +1272,14 @@
     // Load Initial Snapshot and catch up all actions
     async function loadSnapshotAndCatchUp() {
       const myGen = ++currentGenerationId;
+      streamAbortController?.abort();
       await obtainViewerToken();
+      if (myGen !== currentGenerationId) return;
 
       const authHeaders = viewerToken ? { Authorization: `Bearer ${viewerToken}` } : {};
 
       try {
-        const snapRes = await fetch(`/api/external-play/runs/${encodeURIComponent(runId)}/snapshot`, {
+        const snapRes = await viewerFetch(`/api/external-play/runs/${encodeURIComponent(runId)}/snapshot`, {
           headers: authHeaders
         });
         if (!snapRes.ok) return;
@@ -1230,9 +1288,15 @@
         if (myGen !== currentGenerationId) return;
 
         lastEventId = snapshot.as_of_event_id || 0;
+        seekGeneration++;
         totalActions = 0;
         actionQueue = [];
         eventLog = [];
+        historyActions = [];
+        cachedSteps.clear();
+        actionFeedList?.replaceChildren();
+        gemCount = 0;
+        visitedRooms = new Set(snapshot.visited_levels || []);
 
         // Save base viewer state
         if (snapshot.base_viewer_state) {
@@ -1255,64 +1319,20 @@
           await host.applySnapshot(baseViewerState);
         }
 
-        // Catch up all historical actions up to the exact snapshot.action_seq watermark
+        // 仅加载当前附近的指令，直接应用水位对应的状态，不逐步重演全历史。
         const snapshotActionSeq = Number(snapshot.action_seq) || 0;
-        let nextFromSeq = 1;
-        while (nextFromSeq <= snapshotActionSeq) {
+        historyActions.length = snapshotActionSeq;
+        if (snapshotActionSeq > 0) {
+          await fetchActionsAround(snapshotActionSeq, myGen);
           if (myGen !== currentGenerationId) return;
-          const actionsRes = await fetch(
-            `/api/external-play/runs/${encodeURIComponent(runId)}/actions?from_seq=${nextFromSeq}&to_seq=${snapshotActionSeq}&limit=100`,
-            { headers: authHeaders }
-          );
-          if (!actionsRes.ok) break;
-
-          const actData = await actionsRes.json();
-          const list = actData.actions || [];
-          if (list.length === 0) break;
-
-          for (const act of list) {
-            let transition = act.viewer_transition;
-            if (!transition && act.transition_digest) {
-              transition = await fetchAndVerifyBlob(act.transition_digest, "transition");
-            }
-            if (!act.post_viewer_state && act.post_viewer_state_digest) {
-              act.post_viewer_state = await fetchAndVerifyBlob(act.post_viewer_state_digest, "viewer_state");
-            }
-
-            const item = {
-              seq: act.seq,
-              action: act.tool,
-              transition,
-              post_viewer_state: act.post_viewer_state,
-              observation: act.sanitized_status,
-              immediate: true
-            };
-            historyActions.push(item);
-            actionQueue.push(item);
-            appendFeedItem(item, historyActions.length);
-            eventLog.push({ type: "action", ...act, viewer_transition: transition });
-          }
-
-          if (actData.has_more) {
-            if (actData.next_seq) {
-              nextFromSeq = actData.next_seq;
-            } else {
-              nextFromSeq = list[list.length - 1].seq + 1;
-            }
-          } else {
-            break;
-          }
+          const latest = historyActions[snapshotActionSeq - 1];
+          if (latest && snapshot.current_viewer_state) latest.post_viewer_state = snapshot.current_viewer_state;
+          await seekToStep(snapshotActionSeq);
         }
-
         if (myGen !== currentGenerationId) return;
-
-        // Process and drain all caught-up actions immediately to sync 3D position
-        await processActionQueue(myGen);
-        while (actionQueue.length > 0 || isProcessingQueue) {
-          await new Promise((r) => setTimeout(r, 20));
-        }
-        currentPlaybackStep = historyActions.length;
-        updateStatsUI(visitedRooms.size, currentRoom, gemCount, totalActions);
+        totalActions = snapshotActionSeq;
+        currentPlaybackStep = snapshotActionSeq;
+        updateStatsUI(visitedRooms.size || 1, currentRoom, gemCount, totalActions);
         updateScrubberUI();
 
         // Check if run is in a terminal state
@@ -1343,13 +1363,17 @@
       const url = `/api/external-play/runs/${encodeURIComponent(runId)}/events?after_event_id=${lastEventId}`;
 
       try {
-        const response = await fetch(url, {
+        const streamController = new AbortController();
+        streamAbortController = streamController;
+        const response = await viewerFetch(url, {
+          signal: streamController.signal,
           headers: {
             Accept: "text/event-stream",
             ...authHeaders
           }
         });
 
+        if (genId !== undefined && genId !== currentGenerationId) return;
         if (response.status === 409 || response.status === 410) {
           // Gap detected or desynced: full snapshot catch-up
           console.warn("SSE stream desynced (gap), triggering catch-up...");
@@ -1384,6 +1408,7 @@
           }
 
           const { value, done } = await reader.read();
+          if (genId !== undefined && genId !== currentGenerationId) { reader.cancel(); return; }
           if (done) {
             // Normal stream close (EOF): reconnect if not ended
             if (!isEnded && (genId === undefined || genId === currentGenerationId)) {
@@ -1442,6 +1467,7 @@
               try {
                 const record = JSON.parse(eventDataStr);
                 eventLog.push(record);
+                if (eventLog.length > 200) eventLog.shift();
                 await handleSSEMessage(eventType, record, genId);
               } catch (e) {
                 console.warn("Failed to parse SSE payload:", e);
@@ -1450,6 +1476,7 @@
           }
         }
       } catch (err) {
+        if (genId !== undefined && genId !== currentGenerationId) return;
         if (controllerStatusElem) {
           controllerStatusElem.textContent = "Stream Disconnected";
           controllerStatusElem.className = "spectator-badge controller-badge is-disconnected";
@@ -1496,7 +1523,9 @@
           post_viewer_state: postViewerState,
           observation: record.action_record?.sanitized_status || record.observation
         };
-        historyActions.push(item);
+        if (genId !== undefined && genId !== currentGenerationId) return;
+        if (item.seq <= historyActions.length) return;
+        rememberAction(item);
         actionQueue.push(item);
         appendFeedItem(item, historyActions.length);
         updateScrubberUI();

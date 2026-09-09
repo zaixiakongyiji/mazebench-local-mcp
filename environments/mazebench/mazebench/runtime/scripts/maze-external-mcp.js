@@ -294,51 +294,48 @@ class StdioMcpAdapter {
     }
 
     return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
       const client = url.protocol === "https:" ? https : http;
+      let settled = false;
+      let timer;
+      let tracked;
+      const finish = (err, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (requestId !== null && this.activeRequests.get(requestId) === tracked) this.activeRequests.delete(requestId);
+        if (err) {
+          logStderr(`HTTP ${method} ${url.pathname} failed after ${Date.now() - startedAt}ms (${err.code || err.statusCode || "NETWORK_ERROR"})`);
+          reject(err);
+        } else resolve(value);
+      };
       const req = client.request(options, (res) => {
         let responseData = "";
         res.setEncoding("utf8");
         res.on("data", (chunk) => (responseData += chunk));
+        res.on("error", (err) => finish(err));
+        res.on("aborted", () => finish(Object.assign(new Error("HTTP response interrupted"), { code: "ECONNRESET" })));
         res.on("end", () => {
-          if (requestId !== null) this.activeRequests.delete(requestId);
           try {
             const parsed = responseData ? JSON.parse(responseData) : null;
-            if (res.statusCode >= 200 && res.statusCode < 300) {
-              resolve(parsed);
-            } else {
-              const err = new Error(parsed?.error || parsed?.message || `HTTP ${res.statusCode}`);
-              err.statusCode = res.statusCode;
-              err.data = parsed;
-              reject(err);
-            }
-          } catch (e) {
-            if (res.statusCode >= 200 && res.statusCode < 300) {
-              resolve(responseData);
-            } else {
-              reject(new Error(`HTTP ${res.statusCode}: ${responseData}`));
-            }
+            if (res.statusCode >= 200 && res.statusCode < 300) finish(null, parsed);
+            else finish(Object.assign(new Error(parsed?.error || parsed?.message || `HTTP ${res.statusCode}`), { statusCode: res.statusCode, data: parsed }));
+          } catch (err) {
+            finish(Object.assign(new Error("Invalid JSON response from MazeBench"), { code: "INVALID_RESPONSE", statusCode: res.statusCode }));
           }
         });
       });
-
-      if (requestId !== null) {
-        this.activeRequests.set(requestId, {
-          abort: () => {
-            req.destroy();
-            const err = new Error("Request cancelled by client");
-            err.code = "CANCELLED";
-            reject(err);
-          }
-        });
-      }
-
-      req.on("error", (err) => {
-        if (requestId !== null) this.activeRequests.delete(requestId);
-        reject(err);
-      });
-      if (body) {
-        req.write(typeof body === "string" ? body : JSON.stringify(body));
-      }
+      const abort = (err) => {
+        finish(err);
+        req.destroy();
+      };
+      tracked = { abort: () => abort(Object.assign(new Error("Request cancelled by client"), { code: "CANCELLED" })) };
+      if (requestId !== null) this.activeRequests.set(requestId, tracked);
+      // 总期限覆盖连接、响应头和响应体，避免半响应或慢速流无限占用连接。
+      const timeoutMs = this.httpTimeoutMs || (url.pathname.endsWith("/heartbeat") ? 8000 : 20000);
+      timer = setTimeout(() => abort(Object.assign(new Error(`MazeBench request timed out after ${timeoutMs}ms`), { code: "ETIMEDOUT" })), timeoutMs);
+      req.on("error", (err) => finish(err));
+      if (body) req.write(typeof body === "string" ? body : JSON.stringify(body));
       req.end();
     });
   }
@@ -439,7 +436,9 @@ class StdioMcpAdapter {
     const heartbeatLeaseId = this.leaseId;
     const heartbeatLeaseEpoch = this.leaseEpoch;
 
+    let inFlight = false;
     this.heartbeatTimer = setInterval(async () => {
+      if (inFlight) return;
       if (
         this.generation !== heartbeatGen ||
         this.activeRunId !== heartbeatRunId ||
@@ -450,6 +449,7 @@ class StdioMcpAdapter {
       ) {
         return;
       }
+      inFlight = true;
       try {
         await this.httpRequest("POST", "/api/external-play/lease/heartbeat", {
           run_id: heartbeatRunId,
@@ -464,6 +464,7 @@ class StdioMcpAdapter {
           this.requireResumption();
         }
       }
+      finally { inFlight = false; }
     }, HEARTBEAT_INTERVAL_MS);
   }
 
@@ -573,6 +574,7 @@ class StdioMcpAdapter {
 
   attachResumedLease(data) {
     this.stopResumePolling();
+    this.pendingStart = null;
     this.generation += 1;
     this.activeRunId = data.run_id;
     this.leaseId = data.lease_id;
@@ -1140,9 +1142,22 @@ class StdioMcpAdapter {
           throw new Error(reqData.message || `Resume request returned status ${reqData.status}`);
         }
 
-        const callOperationId = `mcp-call-${id}-${crypto.randomUUID()}`;
+        const retryingStart = toolName === "start" && Boolean(this.pendingStart);
+        const startFingerprint = JSON.stringify(toolArgs);
+        if (toolName === "start" && this.pendingStart && this.pendingStart.fingerprint !== startFingerprint) {
+          throw new Error("Previous start outcome is unknown. Retry start with the same arguments first.");
+        }
+        const callOperationId = toolName === "start" && this.pendingStart
+          ? this.pendingStart.operationId : `mcp-call-${id}-${crypto.randomUUID()}`;
+        if (toolName === "start" && !this.pendingStart) this.pendingStart = { operationId: callOperationId, fingerprint: startFingerprint };
         const callTool = () => {
           ensureCurrent();
+          if (toolName === "start") {
+            if (this.pendingStart?.controllerToken && this.pendingStart.controllerToken !== this.controllerToken) {
+              throw new Error("Previous start outcome is unknown and controller changed. Request resume approval for the claimed run.");
+            }
+            this.pendingStart = { operationId: callOperationId, fingerprint: startFingerprint, controllerToken: this.controllerToken };
+          }
           return this.httpRequest("POST", "/api/external-play/mcp", {
             run_id: toolName === "start" ? undefined : this.activeRunId,
             tool: toolName,
@@ -1157,7 +1172,15 @@ class StdioMcpAdapter {
           proxyRes = await callTool();
         } catch (err) {
           ensureCurrent();
-          if (![401, 403, 404].includes(err.statusCode)) throw err;
+          if (![401, 403, 404].includes(err.statusCode)) {
+            // 保留未知认领的幂等 ID；网络失败后显式重试不得领取新席位。
+            if (toolName === "start" && err.statusCode >= 400 && err.statusCode < 500) this.pendingStart = null;
+            throw err;
+          }
+          if (toolName === "start" && [401, 403].includes(err.statusCode)) {
+            if (retryingStart) throw new Error("Previous start outcome is unknown and authentication is no longer valid. Request resume approval for the claimed run.");
+            this.pendingStart = null;
+          }
           if (err.statusCode === 401 || err.statusCode === 403) {
             this.controllerToken = null;
             if (toolName === "start" && this.claimedState) {
@@ -1175,6 +1198,7 @@ class StdioMcpAdapter {
         }
         ensureCurrent();
         if (toolName === "start") {
+          this.pendingStart = null;
           this._sendStartSuccess(id, proxyRes);
           return;
         }
