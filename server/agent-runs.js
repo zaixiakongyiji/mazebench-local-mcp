@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { StringDecoder } = require("node:string_decoder");
 const { isDeepStrictEqual } = require("node:util");
 const { spawn, spawnSync } = require("child_process");
 const {
@@ -2958,59 +2959,122 @@ function createAgentRunService({
     const journalPath = path.join(runDir, "journal.jsonl");
     const eventsPath = path.join(runDir, "agent-events.jsonl");
 
+    function forEachJsonLineInFile(filePath, onRecord) {
+      if (!filePath || !fs.existsSync(filePath)) return;
+      const fd = fs.openSync(filePath, "r");
+      try {
+        const buffer = Buffer.alloc(1024 * 1024);
+        // 解码器保留跨块字符，诊断内容与原始日志保持一致。
+        const decoder = new StringDecoder("utf8");
+        let carry = "";
+        let bytes = 0;
+        while ((bytes = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+          const chunk = carry + decoder.write(buffer.subarray(0, bytes));
+          const lines = chunk.split("\n");
+          carry = lines.pop() || "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed) {
+              try {
+                onRecord(JSON.parse(trimmed));
+              } catch (_e) {}
+            }
+          }
+        }
+        const trimmedCarry = (carry + decoder.end()).trim();
+        if (trimmedCarry) {
+          try {
+            onRecord(JSON.parse(trimmedCarry));
+          } catch (_e) {}
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+
     let journalMeta = null;
     if (fs.existsSync(journalPath)) {
       try {
-        const firstLine = fs.readFileSync(journalPath, "utf8").split("\n")[0];
-        if (firstLine) journalMeta = JSON.parse(firstLine);
-      } catch (_e) {}
-      try {
-        const lines = fs.readFileSync(journalPath, "utf8").split("\n");
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const ev = JSON.parse(line);
-            if (ev.type === "action_committed") {
-              const pv = ev.action_record?.post_viewer_state;
-              const curRoom = pv?.current_room || ev.action_record?.sanitized_status?.current_room || "level_HxI";
-              const player = pv?.player;
-              const seq = ev.action_seq || trajectory.length + 1;
-              if (player && typeof player.x === "number" && typeof player.y === "number") {
-                trajectory.push({ seq, room: curRoom, x: player.x, y: player.y });
-                visitedSet.add(`${curRoom}:${player.x}:${player.y}`);
-              }
-              roomsVisitedSet.add(curRoom);
-              if (ev.action_record?.sanitized_status?.collected_gems_count != null) {
-                gemsCollected = ev.action_record.sanitized_status.collected_gems_count;
-              }
+        forEachJsonLineInFile(journalPath, (ev) => {
+          if (!journalMeta && ev.type === "run_started") {
+            journalMeta = ev;
+          }
+          if (ev.type === "action_committed") {
+            const pv = ev.action_record?.post_viewer_state;
+            const curRoom = pv?.current_room || ev.action_record?.sanitized_status?.current_room || "level_HxI";
+            const player = pv?.player;
+            const seq = ev.action_seq || trajectory.length + 1;
+            if (player && typeof player.x === "number" && typeof player.y === "number") {
+              trajectory.push({ seq, room: curRoom, x: player.x, y: player.y });
+              visitedSet.add(`${curRoom}:${player.x}:${player.y}`);
+            }
+            const prevRoomsCount = roomsVisitedSet.size;
+            roomsVisitedSet.add(curRoom);
+            const prevGems = gemsCollected;
+            if (ev.action_record?.sanitized_status?.collected_gems_count != null) {
+              gemsCollected = ev.action_record.sanitized_status.collected_gems_count;
+            }
+            if (progressCurve.length === 0 || roomsVisitedSet.size !== prevRoomsCount || gemsCollected !== prevGems) {
               progressCurve.push({
                 seq,
                 rooms: roomsVisitedSet.size,
                 gems: gemsCollected
               });
+            } else {
+              const lastSeq = progressCurve[progressCurve.length - 1].seq;
+              if (seq - lastSeq >= 50) {
+                progressCurve.push({
+                  seq,
+                  rooms: roomsVisitedSet.size,
+                  gems: gemsCollected
+                });
+              }
             }
-          } catch (_err) {}
+          }
+        });
+        if (trajectory.length > 0 && progressCurve.length > 0 && progressCurve[progressCurve.length - 1].seq !== trajectory[trajectory.length - 1].seq) {
+          progressCurve.push({
+            seq: trajectory[trajectory.length - 1].seq,
+            rooms: roomsVisitedSet.size,
+            gems: gemsCollected
+          });
         }
       } catch (_e) {}
     } else if (fs.existsSync(eventsPath)) {
       try {
-        const lines = fs.readFileSync(eventsPath, "utf8").split("\n");
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const ev = JSON.parse(line);
-            if (ev.player && ev.room) {
-              const seq = ev.action_seq || trajectory.length + 1;
-              trajectory.push({ seq, room: ev.room, x: ev.player.x, y: ev.player.y });
-              visitedSet.add(`${ev.room}:${ev.player.x}:${ev.player.y}`);
-              roomsVisitedSet.add(ev.room);
+        forEachJsonLineInFile(eventsPath, (ev) => {
+          if (ev.player && ev.room) {
+            const seq = ev.action_seq || trajectory.length + 1;
+            trajectory.push({ seq, room: ev.room, x: ev.player.x, y: ev.player.y });
+            visitedSet.add(`${ev.room}:${ev.player.x}:${ev.player.y}`);
+            const prevRoomsCount = roomsVisitedSet.size;
+            roomsVisitedSet.add(ev.room);
+            const gems = ev.gem_count || 0;
+            if (progressCurve.length === 0 || roomsVisitedSet.size !== prevRoomsCount || gems !== gemsCollected) {
+              gemsCollected = gems;
               progressCurve.push({
                 seq,
                 rooms: roomsVisitedSet.size,
-                gems: ev.gem_count || 0
+                gems: gemsCollected
               });
+            } else {
+              const lastSeq = progressCurve[progressCurve.length - 1].seq;
+              if (seq - lastSeq >= 50) {
+                progressCurve.push({
+                  seq,
+                  rooms: roomsVisitedSet.size,
+                  gems: gemsCollected
+                });
+              }
             }
-          } catch (_err) {}
+          }
+        });
+        if (trajectory.length > 0 && progressCurve.length > 0 && progressCurve[progressCurve.length - 1].seq !== trajectory[trajectory.length - 1].seq) {
+          progressCurve.push({
+            seq: trajectory[trajectory.length - 1].seq,
+            rooms: roomsVisitedSet.size,
+            gems: gemsCollected
+          });
         }
       } catch (_e) {}
     }
@@ -3019,15 +3083,18 @@ function createAgentRunService({
     const windowSize = 50;
     const noveltyWindow = [];
     const seenStateKeys = new Set();
+    const sampleInterval = trajectory.length > 1000 ? Math.ceil(trajectory.length / 500) : 1;
     for (let i = 0; i < trajectory.length; i++) {
       const cellKey = `${trajectory[i].room}:${trajectory[i].x}:${trajectory[i].y}`;
       const isNovel = seenStateKeys.has(cellKey) ? 0 : 1;
       seenStateKeys.add(cellKey);
       noveltyWindow.push(isNovel);
       if (noveltyWindow.length > windowSize) noveltyWindow.shift();
-      const sum = noveltyWindow.reduce((a, b) => a + b, 0);
-      const noveltyPct = Math.round((sum / noveltyWindow.length) * 100);
-      noveltyCurve.push({ seq: trajectory[i].seq, pct: noveltyPct });
+      if (i === 0 || i === trajectory.length - 1 || i % sampleInterval === 0) {
+        const sum = noveltyWindow.reduce((a, b) => a + b, 0);
+        const noveltyPct = Math.round((sum / noveltyWindow.length) * 100);
+        noveltyCurve.push({ seq: trajectory[i].seq, pct: noveltyPct });
+      }
     }
 
     const modelName =

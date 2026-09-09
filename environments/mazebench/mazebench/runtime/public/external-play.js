@@ -731,16 +731,30 @@
       });
       return true;
     }
+    let feedWindow = { start: 0, end: 0 };
     function renderFeedAround(step) {
       if (!actionFeedList) return;
+      const targetStart = Math.max(1, step - 99);
+      const targetEnd = Math.min(historyActions.length, step + 99);
+      if (feedWindow.start === targetStart && feedWindow.end === targetEnd && actionFeedList.children.length > 0) {
+        return;
+      }
+      feedWindow = { start: targetStart, end: targetEnd };
       actionFeedList.replaceChildren();
-      for (let n = Math.max(1, step - 99); n <= Math.min(historyActions.length, step + 99); n++) {
+      for (let n = targetStart; n <= targetEnd; n++) {
         if (historyActions[n - 1]) appendFeedItem(historyActions[n - 1], n, false);
       }
     }
+
+    function isTerminalStatus(status) {
+      const s = String(status || "").toLowerCase();
+      return ["won", "action_limit", "timed_out", "stopped", "cancelled", "failed", "ended", "finished"].includes(s);
+    }
+
     let currentPlaybackStep = 0;
-    let isLiveMode = true;
-    let isPaused = false;
+    let isEnded = isTerminalStatus(runData.status);
+    let isLiveMode = !isEnded;
+    let isPaused = isEnded;
     let autoPlayInterval = null;
     let currentSummaryData = null;
 
@@ -751,7 +765,6 @@
     let gemCount = 0;
     let currentRoom = "level_HxI";
     let visitedRooms = new Set(["level_HxI"]);
-    let isEnded = ["won", "action_limit", "timed_out", "cancelled", "failed", "ended"].includes(runData.status);
     let lastEventTimestamp = Date.now();
     let lastEventId = 0;
     let dynamicStepDelayMs = 200;
@@ -944,18 +957,26 @@
       }
     }
 
+    let isAutoPlayingStep = false;
     function startAutoPlay() {
       stopAutoPlay();
       autoPlayInterval = setInterval(async () => {
+        if (isAutoPlayingStep) return;
         if (currentPlaybackStep < historyActions.length) {
-          await seekToStep(currentPlaybackStep + 1);
+          isAutoPlayingStep = true;
+          try {
+            const stepSize = historyActions.length > 2000 ? Math.ceil(historyActions.length / 500) : 1;
+            await seekToStep(Math.min(historyActions.length, currentPlaybackStep + stepSize));
+          } finally {
+            isAutoPlayingStep = false;
+          }
         } else {
           stopAutoPlay();
           isPaused = true;
           if (isEnded) isLiveMode = false;
           updateScrubberUI();
         }
-      }, 250);
+      }, 200);
     }
 
     function togglePlayPause() {
@@ -1336,10 +1357,14 @@
         updateScrubberUI();
 
         // Check if run is in a terminal state
-        if (["won", "action_limit", "timed_out", "cancelled", "failed"].includes(snapshot.status)) {
+        if (isTerminalStatus(snapshot.status)) {
           isEnded = true;
+          isLiveMode = false;
+          isPaused = true;
+          stopAutoPlay();
           statusPill.textContent = snapshot.status.toUpperCase();
           statusPill.className = "status-pill status-pill--ended";
+          updateScrubberUI();
 
           await showSummaryModal();
           return;
@@ -1653,10 +1678,9 @@
         summaryOverlay.hidden = true;
         summaryOverlay.style.display = "none";
         isLiveMode = false;
-        isPaused = false;
-        seekToStep(0).then(() => {
-          startAutoPlay();
-        });
+        isPaused = true;
+        stopAutoPlay();
+        seekToStep(0);
       });
     }
 

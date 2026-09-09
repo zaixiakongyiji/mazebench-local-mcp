@@ -35,6 +35,12 @@ External Play allows evaluated models and autonomous agents (e.g. Claude Desktop
   - 认领、租约附着、撤销及强制接管必须持久化到 WAL（`journal.jsonl`）。首次认领记录为 `run_started`；恢复附着的 `lease_attached` 写入 `request_id`、`previous_controller_id`（可为 `null`）和 `forced`。
   - `lease_revoked` 记录被撤销的 controller、lease ID、epoch 和 `reason`，不要求上述恢复附着专用字段。schema 中的新增审计字段保持可选以兼容旧历史，不重写旧 journal。
 
+## 文档与计划维护
+
+- README.md 只维护当前可用行为、配置方式和验证入口，不列出已完成的实施计划。
+- 新的实施计划如确有必要可临时放在 docs/plan/；完成后删除，不作为当前待办，历史追溯使用 Git 历史。
+- 关卡格式、打包和其他长期有效说明放在 docs/ 下，并随代码行为变化同步更新。
+
 ## 生成文件与回归验证
 
 - schema 生成源为 `scripts/build-standalone-validators.js`。修改后运行 `npm run build:validators`，不要手工编辑 `shared/validators.standalone.js` 或 `public/validators.standalone.js`。

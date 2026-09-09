@@ -55,6 +55,7 @@
     elements.diagGems = document.querySelector("#diag-gems");
     elements.diagMoves = document.querySelector("#diag-moves");
     elements.diagActions = document.querySelector("#diag-actions");
+    elements.diagActionsLabel = document.querySelector("#diag-actions-label");
     elements.diagStatus = document.querySelector("#diag-status");
     elements.diagRoomsBadge = document.querySelector("#diag-rooms-badge");
     elements.diagGemsBadge = document.querySelector("#diag-gems-badge");
@@ -764,12 +765,21 @@
 
     if (elements.diagRooms) elements.diagRooms.textContent = entry.room_count || 1;
     if (elements.diagGems) elements.diagGems.textContent = entry.gem_count || 0;
+    if (elements.diagMoves) elements.diagMoves.textContent = Number(entry.turns ?? entry.moves ?? 0).toLocaleString();
     if (elements.diagActions) {
       if (entry.is_time_limited && entry.duration_ms) {
         const mins = Math.round(Number(entry.duration_ms) / 60000);
         elements.diagActions.textContent = mins >= 1 ? `${mins}m limit` : `${Math.round(Number(entry.duration_ms) / 1000)}s limit`;
+        if (elements.diagActionsLabel) {
+          elements.diagActionsLabel.dataset.i18n = "lb_time_limit";
+          elements.diagActionsLabel.textContent = isZh() ? "时间限制" : "TIME LIMIT";
+        }
       } else {
         elements.diagActions.textContent = entry.max_actions || 256;
+        if (elements.diagActionsLabel) {
+          elements.diagActionsLabel.dataset.i18n = "lb_max_actions";
+          elements.diagActionsLabel.textContent = isZh() ? "步数上限" : "MAX ACTIONS";
+        }
       }
     }
     if (elements.diagStatus) {
@@ -790,7 +800,7 @@
 
     if (elements.selectedRooms) elements.selectedRooms.textContent = `${entry.room_count} / ${entry.room_total || 256}`;
     if (elements.selectedGems) elements.selectedGems.textContent = `${entry.gem_count} / ${entry.gem_total || 90}`;
-    if (elements.selectedMoves) elements.selectedMoves.textContent = `${entry.moves ?? entry.turns ?? 0}`;
+    if (elements.selectedMoves) elements.selectedMoves.textContent = `${Number(entry.moves ?? entry.turns ?? 0).toLocaleString()}`;
     if (elements.selectedActions) {
       if (entry.is_time_limited && entry.duration_ms) {
         const mins = Math.round(Number(entry.duration_ms) / 60000);
@@ -815,6 +825,9 @@
       .then((res) => (res.ok ? res.json() : null))
       .then((diag) => {
         if (!diag || currentPlayback.runId !== entry.id) return;
+        if (diag.turns != null && elements.diagMoves) {
+          elements.diagMoves.textContent = Number(diag.turns).toLocaleString();
+        }
         if (elements.diagUniqueCells) {
           const count = diag.unique_cells || diag.trajectory?.length || 0;
           elements.diagUniqueCells.textContent = window.i18n?.isZh()

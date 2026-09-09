@@ -348,9 +348,6 @@ npm test
 
 相关文档：
 
-- [本地 MCP 实时观战与总结功能改造方案](docs/plan/2026-08-25-local-mcp-live-service.md)
-- [External Play 本地鉴权简化与 Prime CLI 解耦方案](docs/plan/2026-08-31-external-play-local-auth-and-prime-decoupling.md)
-- [External Play 认领与授权恢复执行计划](docs/plan/2026-09-06-external-play-claim-and-auth-resume.md)
 - [Maze level 格式](docs/maze-level-format.md)
 - [Python 打包说明](docs/packaging.md)
 
@@ -372,6 +369,7 @@ Copyright (c) 2026 Jonathan Pappas and David Pappas
 
 ## 长时间运行与长记录观战
 
+- 恢复时逐条对照权威 WAL 校验 `actions.jsonl`，修复内容不一致、缺失记录或末尾缺少换行的投影；恢复索引、逐步重建游戏状态、结算校验及诊断均分块读取日志，不将整份 WAL 转为字符串，并保留完整 UTF-8 字符。
 - 活动 controller 的有效凭据随成功的租约心跳续期，持续连接不会因为最初的 24 小时期限被强制中断。租约仍为 30 秒，adapter 每 10 秒发送心跳；已过期、撤销、被接管或服务重启后的旧授权仍需按 `resume` 审批恢复。
 - adapter 的普通 HTTP 请求总期限为 20 秒，心跳为 8 秒，并禁止重叠心跳。超时与响应中断会返回错误和不含凭据的 stderr 诊断。`start` 结果不明时，使用相同参数显式重试会沿用原操作 ID；不能更换身份自动领取新席位。
 - 观战进入时直接同步最新状态，只加载附近的动作；拖动时间轴按需加载历史。指令列表最多 200 个节点，浏览器缓存最多 1000 条动作。宝石提示按相邻历史步骤的计数变化计算，与播放位置无关。

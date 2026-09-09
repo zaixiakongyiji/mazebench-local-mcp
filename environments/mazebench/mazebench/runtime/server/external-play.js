@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const { StringDecoder } = require("node:string_decoder");
 const {
   validateJournalRecord,
   validateActionRecord,
@@ -103,6 +104,34 @@ function pidAlive(pid) {
   } catch (e) {
     if (e.code === "EPERM") return true;
     return false;
+  }
+}
+
+function forEachFileJsonLineSync(filePath, onLine) {
+  if (!filePath || !fs.existsSync(filePath)) return;
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(1024 * 1024);
+    // 保留跨块的 UTF-8 字节，避免中文或 emoji 被替换为乱码。
+    const decoder = new StringDecoder("utf8");
+    let endsWithNewline = false;
+    let carry = "";
+    let bytes = 0;
+    while ((bytes = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      endsWithNewline = buffer[bytes - 1] === 10;
+      const chunk = carry + decoder.write(buffer.subarray(0, bytes));
+      const lines = chunk.split("\n");
+      carry = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) onLine(trimmed);
+      }
+    }
+    const trimmedCarry = (carry + decoder.end()).trim();
+    if (trimmedCarry) onLine(trimmedCarry);
+    return endsWithNewline;
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -1729,41 +1758,35 @@ class RunInstance {
     try {
       let actionRecords = providedActionRecords;
       if (!actionRecords) {
-        const content = fs.readFileSync(this.journalPath, "utf8");
-        const lines = content.split("\n").filter((l) => l.trim().length > 0);
         actionRecords = [];
-        for (const line of lines) {
+        // 结算也使用分块读取，避免长局日志超过单个字符串的长度上限。
+        forEachFileJsonLineSync(this.journalPath, (line) => {
           try {
             const record = JSON.parse(line);
             if (record.type === "action_committed" && record.action_record) {
               actionRecords.push(record.action_record);
             }
           } catch (_parseErr) {}
-        }
+        });
       }
 
       let isActionsValid = false;
       if (fs.existsSync(this.actionsPath)) {
         try {
-          const existingContent = fs.readFileSync(this.actionsPath, "utf8");
-          if (actionRecords.length === 0 && existingContent.trim().length === 0) {
+          const stat = fs.statSync(this.actionsPath);
+          if (actionRecords.length === 0 && stat.size === 0) {
             isActionsValid = true;
-          } else if (existingContent.endsWith("\n")) {
-            const lines = existingContent.trim().split("\n").filter((l) => l.trim().length > 0);
-            if (lines.length === actionRecords.length) {
-              let allMatch = true;
-              for (let i = 0; i < lines.length; i++) {
-                const parsed = JSON.parse(lines[i]);
-                const authoritativeLine = JSON.stringify(actionRecords[i]);
-                if (!parsed || parsed.seq !== actionRecords[i].seq || lines[i] !== authoritativeLine) {
-                  allMatch = false;
-                  break;
-                }
+          } else {
+            let existingCount = 0;
+            let allMatch = true;
+            const endsWithNewline = forEachFileJsonLineSync(this.actionsPath, (line) => {
+              // 每条投影必须与权威 WAL 完全一致，首尾序号不能证明中间内容有效。
+              if (existingCount >= actionRecords.length || line !== JSON.stringify(actionRecords[existingCount])) {
+                allMatch = false;
               }
-              if (allMatch) {
-                isActionsValid = true;
-              }
-            }
+              existingCount++;
+            });
+            isActionsValid = allMatch && existingCount === actionRecords.length && endsWithNewline;
           }
         } catch (_e) {
           isActionsValid = false;
@@ -1771,10 +1794,14 @@ class RunInstance {
       }
       if (!isActionsValid) {
         const tmpPath = `${this.actionsPath}.tmp-${Date.now()}`;
-        const actionContent = actionRecords.length > 0
-          ? actionRecords.map((a) => JSON.stringify(a)).join("\n") + "\n"
-          : "";
-        fs.writeFileSync(tmpPath, actionContent, "utf8");
+        const fd = fs.openSync(tmpPath, "w");
+        try {
+          for (const a of actionRecords) {
+            fs.writeSync(fd, JSON.stringify(a) + "\n");
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
         fs.renameSync(tmpPath, this.actionsPath);
       }
     } catch (reconcileErr) {
@@ -1785,12 +1812,10 @@ class RunInstance {
   async replayJournal() {
     try {
       if (!fs.existsSync(this.journalPath)) return;
-      const content = fs.readFileSync(this.journalPath, "utf8");
-      const lines = content.split("\n").filter((l) => l.trim().length > 0);
 
       const actionRecords = [];
       let expectedSeq = 1;
-      for (const line of lines) {
+      forEachFileJsonLineSync(this.journalPath, (line) => {
         const record = JSON.parse(line);
         if (!validateJournalRecord(record)) {
           throw new Error(`Corrupt journal record at seq ${expectedSeq}: ` + JSON.stringify(validateJournalRecord.errors));
@@ -1812,7 +1837,7 @@ class RunInstance {
 
         this._applyJournalRecord(record);
         expectedSeq += 1;
-      }
+      });
 
       // Always reconcile actions.jsonl against authoritative WAL actionRecords
       this._reconcileActionsJsonl(actionRecords);
@@ -1843,10 +1868,8 @@ class RunInstance {
     this.gameSession = this._createGameSession();
 
     if (!fs.existsSync(this.journalPath)) return;
-    const content = fs.readFileSync(this.journalPath, "utf8");
-    const lines = content.split("\n").filter((l) => l.trim().length > 0);
-
-    for (const line of lines) {
+    // 重建游戏状态时逐条重放，保留每一步的状态哈希校验。
+    forEachFileJsonLineSync(this.journalPath, (line) => {
       const record = JSON.parse(line);
       if (record.type === "action_committed") {
         const msg = record.action_record.message;
@@ -1864,7 +1887,7 @@ class RunInstance {
           throw new Error(`Projection reconciliation failed at action ${record.action_seq}`);
         }
       }
-    }
+    });
 
     this.currentViewerState = extractViewerState(this.gameSession, this.lastActionSeq, this.worldBundleDigest);
     this.currentViewerStateHash = computeViewerStateHash(this.currentViewerState);

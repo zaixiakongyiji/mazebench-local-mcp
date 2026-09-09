@@ -290,6 +290,28 @@ try {
   assert.equal(allRoomsPerModel[1].room_count, 20);
   assert.equal(allRoomsPerModel[1].id, "ext-gpt4o-long");
 
+  // 诊断读取的 WAL 与旧版事件日志都必须保留跨块的中文和 emoji。
+  for (const fileName of ["journal.jsonl", "agent-events.jsonl"]) {
+    for (const character of ["中", "😀"]) {
+      for (let split = 1; split < Buffer.byteLength(character); split++) {
+        const runId = "ext-utf8-diagnostics";
+        const runDir = path.join(extRunsDir, runId);
+        fs.mkdirSync(runDir, { recursive: true });
+        const record = fileName === "journal.jsonl"
+          ? { type: "action_committed", action_seq: 1, action_record: { post_viewer_state: { player: { x: 1, y: 2 }, current_room: character } } }
+          : { action_seq: 1, player: { x: 1, y: 2 }, room: character };
+        const line = JSON.stringify(record);
+        const prefixLength = Buffer.byteLength(line.slice(0, line.indexOf(character)));
+        const padding = 1024 * 1024 - prefixLength - split;
+        const filePath = path.join(runDir, fileName);
+        fs.writeFileSync(filePath, " ".repeat(padding - 1) + "\n" + line + (split % 2 ? "\n" : ""));
+        try {
+          assert.deepEqual(service.getRunDiagnostics(runId).trajectory, [{ seq: 1, room: character, x: 1, y: 2 }]);
+        } finally { fs.unlinkSync(filePath); }
+      }
+    }
+  }
+
   console.log("Leaderboard unit tests passed successfully!");
 } finally {
   try {

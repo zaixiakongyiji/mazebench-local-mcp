@@ -1913,7 +1913,7 @@ args = ["mcp"]</code></pre>
                   <div class="diag-stat-value"><strong id="diag-moves">0</strong></div>
                 </div>
                 <div class="diag-stat-card">
-                  <span class="diag-stat-label" data-i18n="lb_max_actions">MAX ACTIONS</span>
+                  <span class="diag-stat-label" id="diag-actions-label" data-i18n="lb_max_actions">MAX ACTIONS</span>
                   <div class="diag-stat-value"><strong id="diag-actions">256</strong></div>
                 </div>
                 <div class="diag-stat-card">
