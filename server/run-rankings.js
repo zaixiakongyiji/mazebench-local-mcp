@@ -18,40 +18,80 @@ function getRunFinalNovelty(runDir, summary = null) {
   try {
     const stat = fs.statSync(targetPath);
     const cached = noveltyCache.get(targetPath);
-    if (cached && cached.mtime === stat.mtimeMs) return cached.novelty;
-
-    const noveltyWindow = [];
-    const seen = new Set();
-    let lastNovelty = 0;
-    for (const line of fs.readFileSync(targetPath, "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        let room = null;
-        let player = null;
-        if (entry.type === "action_committed") {
-          const viewer = entry.action_record?.post_viewer_state;
-          room = viewer?.current_room || entry.action_record?.sanitized_status?.current_room || "level_HxI";
-          player = viewer?.player;
-        } else if (entry.post_viewer_state) {
-          room = entry.post_viewer_state.current_room || "level_HxI";
-          player = entry.post_viewer_state.player;
-        } else if (entry.player && entry.room) {
-          room = entry.room;
-          player = entry.player;
-        }
-
-        if (player && typeof player.x === "number" && typeof player.y === "number") {
-          const cellKey = `${room || "level_HxI"}:${player.x}:${player.y}`;
-          noveltyWindow.push(seen.has(cellKey) ? 0 : 1);
-          seen.add(cellKey);
-          if (noveltyWindow.length > 50) noveltyWindow.shift();
-          lastNovelty = Math.round((noveltyWindow.reduce((sum, value) => sum + value, 0) / noveltyWindow.length) * 100);
-        }
-      } catch (_error) {}
+    if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
+      return cached.novelty;
     }
 
-    noveltyCache.set(targetPath, { mtime: stat.mtimeMs, novelty: lastNovelty });
+    const canResumeIncrementally =
+      cached &&
+      typeof cached.offset === "number" &&
+      cached.offset > 0 &&
+      stat.size >= cached.offset &&
+      Array.isArray(cached.noveltyWindow) &&
+      cached.seen instanceof Set;
+
+    const noveltyWindow = canResumeIncrementally ? cached.noveltyWindow : [];
+    const seen = canResumeIncrementally ? cached.seen : new Set();
+    let lastNovelty = canResumeIncrementally ? cached.novelty : 0;
+    const startOffset = canResumeIncrementally ? cached.offset : 0;
+    let processedOffset = startOffset;
+
+    if (stat.size > startOffset) {
+      const fd = fs.openSync(targetPath, "r");
+      try {
+        const chunkLen = stat.size - startOffset;
+        const buf = Buffer.allocUnsafe(chunkLen);
+        const bytesRead = fs.readSync(fd, buf, 0, chunkLen, startOffset);
+        const lastNewline = buf.lastIndexOf(10, bytesRead - 1);
+        if (lastNewline !== -1) {
+          processedOffset = startOffset + lastNewline + 1;
+          const textSlice = buf.subarray(0, lastNewline + 1).toString("utf8");
+          for (const line of textSlice.split("\n")) {
+            if (!line.trim()) continue;
+            try {
+              const entry = JSON.parse(line);
+              let room = null;
+              let player = null;
+              if (entry.type === "action_committed") {
+                const viewer = entry.action_record?.post_viewer_state;
+                room = viewer?.current_room || entry.action_record?.sanitized_status?.current_room || "level_HxI";
+                player = viewer?.player;
+              } else if (entry.post_viewer_state) {
+                room = entry.post_viewer_state.current_room || "level_HxI";
+                player = entry.post_viewer_state.player;
+              } else if (entry.player && entry.room) {
+                room = entry.room;
+                player = entry.player;
+              }
+
+              if (player && typeof player.x === "number" && typeof player.y === "number") {
+                const cellKey = `${room || "level_HxI"}:${player.x}:${player.y}`;
+                noveltyWindow.push(seen.has(cellKey) ? 0 : 1);
+                seen.add(cellKey);
+                if (noveltyWindow.length > 50) noveltyWindow.shift();
+                lastNovelty = Math.round((noveltyWindow.reduce((sum, value) => sum + value, 0) / noveltyWindow.length) * 100);
+              }
+            } catch (_error) {}
+          }
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+
+    if (noveltyCache.size > 512 && !noveltyCache.has(targetPath)) {
+      const oldestKey = noveltyCache.keys().next().value;
+      if (oldestKey) noveltyCache.delete(oldestKey);
+    }
+
+    noveltyCache.set(targetPath, {
+      mtime: stat.mtimeMs,
+      size: stat.size,
+      offset: processedOffset,
+      noveltyWindow,
+      seen,
+      novelty: lastNovelty
+    });
     return lastNovelty;
   } catch (_error) {
     return 0;

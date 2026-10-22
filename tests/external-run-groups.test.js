@@ -342,7 +342,26 @@ async function runTests() {
       assert.ok(fs.existsSync(rDir), "Run directory must exist before delete");
     }
 
+    // 覆盖活动与未认领席位的删除，持有引用检查订阅和水位等待者确实释放。
+    const deleteController = await createController(service, "delete-test");
+    await service.claimRun(deleteController, { model_name: "delete-test" }, "delete-test-claim");
+    const deletedRuns = test7RunIds.map((id) => service.getRun(id));
+    let closedSubscribers = 0;
+    const pendingWatermarks = deletedRuns.map((run) => {
+      run.subscribers.add({ write() {}, end() { closedSubscribers += 1; } });
+      return run.waitForWatermark(run.lastJournalSeq + 100);
+    });
     const deleteRes = await service.deleteGroup(test7GroupId);
+    assert.deepEqual(await Promise.all(pendingWatermarks), [false, false]);
+    assert.equal(closedSubscribers, 2, "删除必须关闭所有观战订阅");
+    for (const run of deletedRuns) {
+      assert.equal(run.disposed, true);
+      assert.equal(run.subscribers.size, 0);
+      assert.equal(run.watermarkWaiters.length, 0);
+      assert.equal(run.leaseTimer, null);
+      assert.equal(run.deadlineTimer, null);
+    }
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(deleteRes, { deleted: true, group_id: test7GroupId });
     assert.equal(service.getGroup(test7GroupId), null, "Group must be removed from memory");
     for (const rId of test7RunIds) {

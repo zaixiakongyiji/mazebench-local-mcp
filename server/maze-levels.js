@@ -195,7 +195,17 @@ function createMazeLevelService({
       .filter((entry) => typeof entry.token === "string" && entry.token.length > 0);
   }
 
+  const objectDefinitionsCache = new WeakMap();
+
   function getObjectDefinitions(game) {
+    const parserObj = game?.parser;
+    if (parserObj && typeof parserObj === "object") {
+      const cached = objectDefinitionsCache.get(parserObj);
+      if (cached && cached.gameId === game.id) {
+        return cached.result;
+      }
+    }
+
     const definitions = Object.entries(game.parser?.objects || {}).map(([name, config]) => {
       const relativeImagePath = typeof config?.image === "string" ? config.image : null;
       const assetPath = relativeImagePath ? resolveGameAssetPath(game.id, relativeImagePath) : null;
@@ -260,7 +270,7 @@ function createMazeLevelService({
       return synthesized;
     }
 
-    return {
+    const result = {
       resolveToken(token) {
         return resolveDefinitionForToken(this.byName, this.byToken, token);
       },
@@ -283,6 +293,12 @@ function createMazeLevelService({
           )
       )
     };
+
+    if (parserObj && typeof parserObj === "object") {
+      objectDefinitionsCache.set(parserObj, { gameId: game.id, result });
+    }
+
+    return result;
   }
 
   function buildTerrainCell(type, definition = null, options = {}) {

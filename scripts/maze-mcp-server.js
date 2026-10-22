@@ -1845,15 +1845,23 @@ if (require.main === module) {
       workerKey: process.env.MAZEBENCH_WORKER_KEY || ""
     });
     const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+    let pendingChain = Promise.resolve();
     input.on("line", (line) => {
       if (!line.trim()) return;
+      let parsed;
       try {
-        handle(JSON.parse(line), stdioSend, stdioContext);
+        parsed = JSON.parse(line);
       } catch (error) {
         failure(stdioSend, null, error);
+        return;
       }
+      pendingChain = pendingChain
+        .then(() => handle(parsed, stdioSend, stdioContext))
+        .catch((error) => failure(stdioSend, parsed?.id ?? null, error));
     });
-    input.on("close", () => finishWorkerContext(stdioContext));
+    input.on("close", () => {
+      pendingChain.finally(() => finishWorkerContext(stdioContext));
+    });
   }
 }
 

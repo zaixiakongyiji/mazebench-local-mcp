@@ -744,7 +744,19 @@ class StdioMcpAdapter {
         return;
       }
 
-      await this.connectServer();
+      try {
+        await this.connectServer();
+      } catch (err) {
+        sendStdout({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32603,
+            message: `Failed to connect to local MazeBench server: ${err.message || err}`
+          }
+        });
+        return;
+      }
       this.initialized = true;
 
       sendStdout({
@@ -1260,9 +1272,16 @@ class StdioMcpAdapter {
   }
 
   start() {
+    const MAX_STDIO_BUFFER_BYTES = 8 * 1024 * 1024;
     let buffer = Buffer.alloc(0);
 
     process.stdin.on("data", (chunk) => {
+      if (buffer.length + chunk.length > MAX_STDIO_BUFFER_BYTES) {
+        logStderr("stdio input buffer exceeded maximum allowed size (8 MiB); resetting buffer.");
+        buffer = Buffer.alloc(0);
+        sendStdout({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Request too large" } });
+        return;
+      }
       buffer = Buffer.concat([buffer, chunk]);
       this._processBuffer();
     });
@@ -1304,6 +1323,12 @@ class StdioMcpAdapter {
           }
         }
 
+        // If buffer starts with Content-Length header prefix but header terminator hasn't arrived yet, wait for more chunks
+        const leadingPreview = buffer.slice(0, Math.min(buffer.length, 64)).toString("utf8").trimStart();
+        if (/^Content-Length:/i.test(leadingPreview)) {
+          break;
+        }
+
         // 2. Standard JSONL (line delimited) fallback
         const newlineIdx = buffer.indexOf(10); // '\n' = 10
         if (newlineIdx !== -1) {
@@ -1325,7 +1350,10 @@ class StdioMcpAdapter {
       }
     };
 
+    let cleaningUp = false;
     const cleanup = async () => {
+      if (cleaningUp) return;
+      cleaningUp = true;
       await this.detach();
       process.exit(0);
     };

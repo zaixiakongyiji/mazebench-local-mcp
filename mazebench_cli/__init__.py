@@ -556,7 +556,7 @@ def run_stop(root: Path, pairs: dict[str, str]) -> int:
         time.sleep(0.1)
     else:
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         except OSError:
             pass
 

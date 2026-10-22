@@ -752,11 +752,14 @@ function createRequestRouter({
               run.subscribers.delete(response);
             }
           }, 15000);
+          heartbeatInterval.unref?.();
 
-          request.on("close", () => {
+          const closeSubscriber = () => {
             clearInterval(heartbeatInterval);
             run.subscribers.delete(response);
-          });
+          };
+          request.on("close", closeSubscriber);
+          response.on("close", closeSubscriber);
           return;
         }
 
