@@ -153,6 +153,12 @@
       // host-only route state (such as MazeJam save ids) and run a custom
       // camera flight before committing the destination room.
       hostOwnsWorldMapNavigation: playData?.hostOwnsWorldMapNavigation === true,
+      // Spectator hosts (External Play / Local MCP) maintain their own /external-play/:runId route.
+      // Room transitions inside spectator sessions must never rewrite the browser URL to /play/:game/:level.
+      isExternalSpectator:
+        playData?.externalSpectator === true ||
+        Boolean(typeof window !== "undefined" && window.__EXTERNAL_PLAY_RUN__) ||
+        Boolean(typeof window !== "undefined" && window.location?.pathname && window.location.pathname.startsWith("/external-play")),
       disableHorizontalNeighborFetches:
         playData?.disableHorizontalNeighborFetches === true,
       autoUndoPlayerFalls: playData?.autoUndoPlayerFalls === true,
@@ -1521,6 +1527,10 @@
     }
 
     function syncDocumentLevelState() {
+      if (app.isExternalSpectator) {
+        return;
+      }
+
       const levelMeta = app.playHeader?.querySelector(".play-header-meta p");
 
       if (levelMeta && app.currentLevelLabel) {
@@ -1664,7 +1674,7 @@
         app.levelEntrySnapshot = cloneLevelSnapshot();
       }
 
-      if (updateUrl && app.currentLevelId) {
+      if (updateUrl && app.currentLevelId && !app.isExternalSpectator) {
         const routePrefix = app.playRoutePrefix || "play";
         const nextPath = `/${encodeURIComponent(routePrefix)}/${encodeURIComponent(app.currentGameId)}/${encodeURIComponent(app.currentLevelId)}`;
         // Hosts attach the active run identity in the query string (for

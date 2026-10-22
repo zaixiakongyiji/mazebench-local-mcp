@@ -758,8 +758,8 @@
     let autoPlayInterval = null;
     let currentSummaryData = null;
 
-    let eventLog = [];
     let actionQueue = [];
+    let spectatorResumeManager = null;
     let isProcessingQueue = false;
     let totalActions = 0;
     let gemCount = 0;
@@ -897,6 +897,7 @@
           await host.applySnapshot(baseViewerState);
           currentRoom = baseViewerState.current_room || "level_HxI";
         }
+        visitedRooms = new Set([currentRoom]);
         gemCount = 0;
         updateStatsUI(1, currentRoom, 0, 0);
         return;
@@ -1073,8 +1074,18 @@
     }
 
     // Action budget and controller liveness display.
+    let statusInterval = null;
     function updateRunStatus() {
-      if (isEnded) return;
+      if (isEnded) {
+        if (statusInterval) {
+          clearInterval(statusInterval);
+          statusInterval = null;
+        }
+        if (spectatorResumeManager) {
+          spectatorResumeManager.stop();
+        }
+        return;
+      }
 
       const isTimeLimited = !runData.max_actions && (runData.duration_ms || runData.deadline_at);
 
@@ -1121,7 +1132,7 @@
       }
     }
 
-    const statusInterval = setInterval(updateRunStatus, 1000);
+    statusInterval = setInterval(updateRunStatus, 1000);
 
     // Cancel Button
     if (cancelBtn) {
@@ -1144,7 +1155,7 @@
     }
 
     // Action execution with dynamic step time calibration
-    async function processActionQueue(genId) {
+    async function processActionQueue(genId = currentGenerationId) {
       if (isProcessingQueue || actionQueue.length === 0) return;
       isProcessingQueue = true;
 
@@ -1158,6 +1169,15 @@
           if (actionQueue.length > 10) actionQueue.splice(0, actionQueue.length - 1);
           const item = actionQueue.shift();
           const isImmediate = isEnded || item.immediate === true || totalActions + 1 < item.seq;
+
+          if (!item.transition && item.transition_digest && !isImmediate) {
+            item.transition = await fetchAndVerifyBlob(item.transition_digest);
+            if (genId !== currentGenerationId) return;
+          }
+          if (!item.post_viewer_state && item.post_viewer_state_digest) {
+            item.post_viewer_state = await fetchAndVerifyBlob(item.post_viewer_state_digest, "viewer_state");
+            if (genId !== currentGenerationId) return;
+          }
 
           // Calibrate step delay: if ended or behind queue, speed up smoothly
           if (isImmediate) {
@@ -1174,7 +1194,10 @@
 
           if (host && item.action && (isLiveMode || isImmediate)) {
             try {
-              await host.applyAction(item.action, item.transition, item.post_viewer_state, { immediate: isImmediate });
+              await host.applyAction(item.action, item.transition, item.post_viewer_state, {
+                immediate: isImmediate,
+                isCurrent: () => genId === currentGenerationId
+              });
             } catch (err) {
               console.warn("Error applying action in host:", err);
             }
@@ -1208,6 +1231,10 @@
         }
       } finally {
         isProcessingQueue = false;
+        // 新快照的 SSE 可能已入队，旧处理器退出时交还处理权。
+        if (genId !== currentGenerationId && actionQueue.length > 0) {
+          await processActionQueue(currentGenerationId);
+        }
       }
     }
 
@@ -1293,6 +1320,8 @@
     // Load Initial Snapshot and catch up all actions
     async function loadSnapshotAndCatchUp() {
       const myGen = ++currentGenerationId;
+      // 代次变化时立即丢弃旧队列，不能等网络请求完成后再清理。
+      actionQueue = [];
       streamAbortController?.abort();
       await obtainViewerToken();
       if (myGen !== currentGenerationId) return;
@@ -1312,7 +1341,6 @@
         seekGeneration++;
         totalActions = 0;
         actionQueue = [];
-        eventLog = [];
         historyActions = [];
         cachedSteps.clear();
         actionFeedList?.replaceChildren();
@@ -1491,8 +1519,6 @@
             if (eventDataStr) {
               try {
                 const record = JSON.parse(eventDataStr);
-                eventLog.push(record);
-                if (eventLog.length > 200) eventLog.shift();
                 await handleSSEMessage(eventType, record, genId);
               } catch (e) {
                 console.warn("Failed to parse SSE payload:", e);
@@ -1525,16 +1551,16 @@
         controllerStatusElem.className = "spectator-badge controller-badge is-connected";
         updateRunStatus();
       } else if (type === "action" || record.type === "action") {
-        let transition = record.action_record?.viewer_transition || record.transition;
-        if (!transition && record.action_record?.transition_digest) {
-          transition = await fetchAndVerifyBlob(record.action_record.transition_digest);
+        const shouldDeferBlobFetch = actionQueue.length > 2;
+        let transition = record.action_record?.viewer_transition || record.transition || null;
+        const transitionDigest = record.action_record?.transition_digest || null;
+        if (!transition && transitionDigest && !shouldDeferBlobFetch) {
+          transition = await fetchAndVerifyBlob(transitionDigest);
         }
         let postViewerState = record.action_record?.post_viewer_state || null;
-        if (!postViewerState && record.action_record?.post_viewer_state_digest) {
-          postViewerState = await fetchAndVerifyBlob(
-            record.action_record.post_viewer_state_digest,
-            "viewer_state"
-          );
+        const postViewerStateDigest = record.action_record?.post_viewer_state_digest || null;
+        if (!postViewerState && postViewerStateDigest && !shouldDeferBlobFetch) {
+          postViewerState = await fetchAndVerifyBlob(postViewerStateDigest, "viewer_state");
         }
         if (record.action_record) {
           record.action_record.viewer_transition = transition;
@@ -1545,7 +1571,9 @@
           seq: record.action_seq,
           action: record.tool || record.action,
           transition,
+          transition_digest: transitionDigest,
           post_viewer_state: postViewerState,
+          post_viewer_state_digest: postViewerStateDigest,
           observation: record.action_record?.sanitized_status || record.observation
         };
         if (genId !== undefined && genId !== currentGenerationId) return;
@@ -1557,6 +1585,13 @@
         processActionQueue(genId);
       } else if (type === "ended" || record.type === "ended") {
         isEnded = true;
+        if (statusInterval) {
+          clearInterval(statusInterval);
+          statusInterval = null;
+        }
+        if (spectatorResumeManager) {
+          spectatorResumeManager.stop();
+        }
         statusPill.textContent = (record.outcome || "ENDED").toUpperCase();
         statusPill.className = "status-pill status-pill--ended";
 
@@ -1691,7 +1726,7 @@
     const resumeCloseBtn = document.getElementById("resume-modal-close-btn");
 
     if (resumeOverlay && resumeBtn) {
-      initResumeRequestsManager({
+      spectatorResumeManager = initResumeRequestsManager({
         containerId: "spectator-resume-list",
         countId: null,
         targetRunId: runId,

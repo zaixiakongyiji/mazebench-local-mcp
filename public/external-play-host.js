@@ -22,11 +22,16 @@
 
   let currentAnimationRaf = 0;
   let currentAnimationDoneCallback = null;
+  let viewerUpdateGeneration = 0;
 
   function cancelCurrentAnimation() {
     if (currentAnimationRaf) {
       cancelAnimationFrame(currentAnimationRaf);
       currentAnimationRaf = 0;
+    }
+    const currentApp = getApp();
+    if (currentApp) {
+      currentApp.isAnimating = false;
     }
     if (typeof currentAnimationDoneCallback === "function") {
       const cb = currentAnimationDoneCallback;
@@ -54,18 +59,20 @@
     });
   }
 
-  async function applyViewerStateToApp(app, state) {
-    if (!app || !state) return;
+  async function applyViewerStateToApp(app, state, isCurrent = () => true) {
+    if (!app || !state || !isCurrent()) return;
 
     // 1. Authoritative Room Transition (awaited for full room load)
     const targetRoom = state.current_room || state.level_id || "level_HxI";
-    if (app.currentLevelId && app.currentLevelId !== targetRoom) {
-      if (typeof app.switchPlayWorldLevel === "function") {
-        try {
-          await app.switchPlayWorldLevel(targetRoom, { immediate: true });
-        } catch (_e) {}
-      }
+    // 即使目标仍是当前房间，也要排在已开始的跨房间加载之后。
+    if (typeof app.switchPlayWorldLevel === "function") {
+      try {
+        await app.switchPlayWorldLevel(targetRoom, { immediate: true, updateUrl: false });
+      } catch (_e) {}
     }
+
+    // 房间加载期间可能收到更新的快照，过期结果不能继续写入场景。
+    if (!isCurrent()) return;
 
     // 2. Authoritative 3D Camera Angles
     if (state.yaw !== undefined) {
@@ -184,7 +191,11 @@
 
     // 5. Collected Gems
     const collected = state.collected_gems || state.collected_gem_ids;
+    let gemsChanged = false;
     if (Array.isArray(collected) && app.collectedGemIds instanceof Set) {
+      if (collected.length !== app.collectedGemIds.size || collected.some((id) => !app.collectedGemIds.has(id))) {
+        gemsChanged = true;
+      }
       app.collectedGemIds.clear();
       collected.forEach((id) => app.collectedGemIds.add(id));
     }
@@ -199,6 +210,9 @@
           const gemId = act.collectionId || `${currentRoomId}:gem:${origX},${origY},${origElev}`;
           const isCollected = Boolean(app.collectedGemIds?.has(gemId));
 
+          if (Boolean(act.collected) !== isCollected) {
+            gemsChanged = true;
+          }
           if (isCollected) {
             if (typeof app.applyCollectedGemVisual === "function") {
               app.applyCollectedGemVisual(act);
@@ -242,7 +256,9 @@
     if (typeof app.applyCollectedGemProgressToActors === "function") {
       app.applyCollectedGemProgressToActors(app.state?.actors, currentRoomId);
     }
-    app.threeRenderer?.invalidateSceneCache?.();
+    if (gemsChanged) {
+      app.threeRenderer?.invalidateSceneCache?.();
+    }
 
     // 6. Terrain Overrides (Lifts & Devices)
     if (Array.isArray(state.terrain_overrides)) {
@@ -281,15 +297,16 @@
     }
   }
 
-  async function animateViewerTransition(app, transition, postViewerState, callback) {
+  async function animateViewerTransition(app, transition, postViewerState, callback, isCurrent) {
     if (!transition || !transition.duration_ms || transition.duration_ms <= 0) {
-      await applyViewerStateToApp(app, postViewerState || transition?.keyframes?.[1]?.viewer_state);
+      await applyViewerStateToApp(app, postViewerState || transition?.keyframes?.[1]?.viewer_state, isCurrent);
       if (typeof callback === "function") callback();
       return;
     }
 
     cancelCurrentAnimation();
     currentAnimationDoneCallback = callback;
+    app.isAnimating = true;
 
     const startMs = performance.now();
     const durationMs = transition.duration_ms;
@@ -297,7 +314,8 @@
     const endState = postViewerState || transition.keyframes?.[1]?.viewer_state;
 
     if (!startState || !endState) {
-      await applyViewerStateToApp(app, endState || startState);
+      app.isAnimating = false;
+      await applyViewerStateToApp(app, endState || startState, isCurrent);
       currentAnimationDoneCallback = null;
       if (typeof callback === "function") callback();
       return;
@@ -335,6 +353,10 @@
     }
 
     function stepAnimation(now) {
+      if (!isCurrent()) {
+        if (currentAnimationDoneCallback === callback) cancelCurrentAnimation();
+        return;
+      }
       const elapsed = now - startMs;
       const progress = Math.min(1, Math.max(0, elapsed / durationMs));
 
@@ -414,7 +436,9 @@
       if (typeof app.syncCameraTarget === "function") {
         app.syncCameraTarget(true);
       }
-      if (typeof app.render === "function") {
+      if (typeof app.renderOncePerFrame === "function") {
+        app.renderOncePerFrame(now);
+      } else if (typeof app.render === "function") {
         app.render();
       }
 
@@ -422,9 +446,10 @@
         currentAnimationRaf = requestAnimationFrame(stepAnimation);
       } else {
         currentAnimationRaf = 0;
+        app.isAnimating = false;
         const cb = currentAnimationDoneCallback;
         currentAnimationDoneCallback = null;
-        applyViewerStateToApp(app, endState).then(() => {
+        applyViewerStateToApp(app, endState, isCurrent).then(() => {
           if (typeof cb === "function") cb();
         });
       }
@@ -438,23 +463,26 @@
     waitForApp,
 
     async applyAction(action, transition = null, postViewerState = null, options = {}) {
+      const generation = ++viewerUpdateGeneration;
+      const isCurrent = () => generation === viewerUpdateGeneration && (options.isCurrent?.() ?? true);
+      cancelCurrentAnimation();
       const app = await waitForApp(3000) || getApp();
-      if (!app) return false;
+      if (!app || !isCurrent()) return false;
 
       // 1. Authoritative Transition Processing
       if (transition) {
         if (options.immediate === true || !transition.duration_ms) {
-          await applyViewerStateToApp(app, postViewerState || transition.keyframes?.[1]?.viewer_state);
+          await applyViewerStateToApp(app, postViewerState || transition.keyframes?.[1]?.viewer_state, isCurrent);
           return true;
         }
         return new Promise((resolve) => {
-          animateViewerTransition(app, transition, postViewerState, () => resolve(true));
+          animateViewerTransition(app, transition, postViewerState, () => resolve(true), isCurrent);
         });
       }
 
       // 2. Authoritative Post State Alignment
       if (postViewerState) {
-        await applyViewerStateToApp(app, postViewerState);
+        await applyViewerStateToApp(app, postViewerState, isCurrent);
         return true;
       }
 
@@ -504,7 +532,7 @@
       if (roomMatch && roomMatch[1]) {
         const targetRoom = roomMatch[1];
         if (typeof app.switchPlayWorldLevel === "function") {
-          await app.switchPlayWorldLevel(targetRoom);
+          await app.switchPlayWorldLevel(targetRoom, { updateUrl: false });
         }
         return true;
       }
@@ -524,9 +552,11 @@
     },
 
     async applySnapshot(snapshot) {
+      const generation = ++viewerUpdateGeneration;
+      cancelCurrentAnimation();
       const app = await waitForApp(3000) || getApp();
-      if (!app || !snapshot) return;
-      return applyViewerStateToApp(app, snapshot);
+      if (!app || !snapshot || generation !== viewerUpdateGeneration) return;
+      return applyViewerStateToApp(app, snapshot, () => generation === viewerUpdateGeneration);
     }
   };
 

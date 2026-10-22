@@ -213,8 +213,9 @@ class ExternalRunGroupStore {
   describe(groupId) {
     const record = this.get(groupId);
     if (!record) return null;
+    let currentEntries = null;
     if (!record.result) {
-      const currentEntries = record.manifest.entries.map((entry) => this.entryResult(entry));
+      currentEntries = record.manifest.entries.map((entry) => this.entryResult(entry));
       const allTerminal = currentEntries.every((entry) => TERMINAL_STATUSES.has(entry.status));
       if (allTerminal) {
         try {
@@ -232,7 +233,7 @@ class ExternalRunGroupStore {
         result: record.result
       };
     }
-    const entries = record.manifest.entries.map((entry) => this.entryResult(entry));
+    const entries = currentEntries || record.manifest.entries.map((entry) => this.entryResult(entry));
     const allTerminal = entries.every((entry) => TERMINAL_STATUSES.has(entry.status));
     const anyStarted = entries.some((entry) => entry.status !== "armed");
     const status = allTerminal ? "finalizing" : (anyStarted ? "running" : "awaiting_claim");

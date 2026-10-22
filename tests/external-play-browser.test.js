@@ -444,7 +444,10 @@ async function runBrowserTest() {
     });
     await longPage.goto(`http://127.0.0.1:${port}/external-play/${run9.runId}`, { waitUntil: "domcontentloaded" });
     await longPage.waitForFunction(() => document.querySelector("#playback-scrubber")?.value === "50000");
-    await longPage.waitForTimeout(500);
+    for (let i = 0; i < 50 && (snapshotRequests < 2 || actionPages < 2); i++) {
+      await longPage.waitForTimeout(100);
+    }
+    await longPage.waitForFunction(() => document.querySelectorAll(".feed-item").length > 0);
     assert.equal(snapshotRequests, 2, "事件缺口仅重载一次快照");
     assert.equal(actionPages, 2, "每次快照只加载一个动作窗口");
     assert.ok(await longPage.locator(".feed-item").count() <= 200, "指令 DOM 数量有界");

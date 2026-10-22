@@ -11,8 +11,7 @@ function handleShutdown() {
     try {
       externalPlay.shutdown();
     } catch (_e) {}
-  }
-  if (process.env.MAZEBENCH_STATE_FILE) {
+  } else if (process.env.MAZEBENCH_STATE_FILE) {
     try {
       if (fs.existsSync(process.env.MAZEBENCH_STATE_FILE)) {
         const content = JSON.parse(fs.readFileSync(process.env.MAZEBENCH_STATE_FILE, "utf8"));
@@ -55,8 +54,7 @@ async function startServer() {
     if (externalPlay) {
       externalPlay.serverPort = currentPort;
       externalPlay._writeServerJson();
-    }
-    if (process.env.MAZEBENCH_STATE_FILE) {
+    } else if (process.env.MAZEBENCH_STATE_FILE) {
       try {
         const statePath = process.env.MAZEBENCH_STATE_FILE;
         let existingState = {};

@@ -292,9 +292,15 @@ const LOCAL_AGENT_IMAGE_LABELS = Object.freeze({
 
 // A container run needs BOTH the docker binary AND a reachable daemon. Report
 // them separately so the UI can say "install Docker" vs "start Docker".
+function probeBinarySync(bin) {
+  if (process.platform === "win32") {
+    return spawnSync("where.exe", [bin], { encoding: "utf8", env: enrichedPathEnv() }).status === 0;
+  }
+  return spawnSync("sh", ["-c", "command -v \"$1\"", "sh", bin], { encoding: "utf8", env: enrichedPathEnv() }).status === 0;
+}
+
 function dockerState() {
-  const installed =
-    spawnSync("sh", ["-c", "command -v docker"], { encoding: "utf8", env: enrichedPathEnv() }).status === 0;
+  const installed = probeBinarySync("docker");
 
   if (!installed) {
     return { installed: false, running: false, image: false, imageVersions: {} };
@@ -390,11 +396,7 @@ function agentEnvironment(options = {}) {
     return agentEnvironmentCache?.value || { checking: true };
   }
 
-  const probe = (bin) =>
-    spawnSync("sh", ["-c", `command -v ${JSON.stringify(bin)}`], {
-      encoding: "utf8",
-      env: enrichedPathEnv()
-    }).status === 0;
+  const probe = (bin) => probeBinarySync(bin);
   const probeCommand = (bin, args, timeout = 5000) =>
     spawnSync(bin, args, {
       encoding: "utf8",
@@ -469,11 +471,19 @@ async function agentEnvironmentAsync(options = {}) {
 
   const commandExists = async (bin) => {
     try {
-      await execFileAsync("sh", ["-c", "command -v \"$1\"", "sh", bin], {
-        encoding: "utf8",
-        env: enrichedPathEnv(),
-        timeout: 3000
-      });
+      if (process.platform === "win32") {
+        await execFileAsync("where.exe", [bin], {
+          encoding: "utf8",
+          env: enrichedPathEnv(),
+          timeout: 3000
+        });
+      } else {
+        await execFileAsync("sh", ["-c", "command -v \"$1\"", "sh", bin], {
+          encoding: "utf8",
+          env: enrichedPathEnv(),
+          timeout: 3000
+        });
+      }
       return true;
     } catch (_error) {
       return false;
@@ -512,7 +522,8 @@ async function agentEnvironmentAsync(options = {}) {
     const claudeAuth = claudeSubscriptionStatus(claudeResult ? { ...claudeResult, status: 0 } : null);
     const kimiAuth = kimiAccountStatus(kimiResult ? { ...kimiResult, status: 0 } : null);
     const primeAuthenticated = Boolean(primeResult);
-    const dockerRunning = Boolean(dockerResult && String(dockerResult.stdout || "").trim());
+    const dockerVersion = String(dockerResult?.stdout || "").trim();
+    const dockerRunning = Boolean(dockerResult && dockerVersion.length > 0 && dockerVersion !== "<no value>");
     const imageResult = dockerRunning
       ? await runCommand(
           "docker",

@@ -112,12 +112,17 @@
     // short tokens keeps equality checks exact while making the per-frame
     // strings tiny.
     const signatureTokenCache = new Map();
+    // 房间和几何缓存仍会持有旧 token，淘汰映射时不能复用编号。
+    let nextSignatureTokenId = 0;
 
     function signatureToken(signature) {
       let token = signatureTokenCache.get(signature);
 
       if (token === undefined) {
-        token = `s${signatureTokenCache.size + 1}`;
+        if (signatureTokenCache.size >= 4096) {
+          signatureTokenCache.clear();
+        }
+        token = `s${++nextSignatureTokenId}`;
         signatureTokenCache.set(signature, token);
       }
 
@@ -13304,6 +13309,7 @@
       textureCache.clear();
       groupLabelTextureCache.forEach((texture) => texture?.dispose?.());
       groupLabelTextureCache.clear();
+      signatureTokenCache.clear();
       keyLight?.shadow?.dispose();
       keyLight?.dispose();
       ambientLight = null;

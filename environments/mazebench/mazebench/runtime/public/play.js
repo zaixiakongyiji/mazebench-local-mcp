@@ -437,6 +437,7 @@
 
   function syncPlayOverlayInputLock() {
     window.__MAZEBENCH_INPUT_LOCKED__ =
+      Boolean(app.isExternalSpectator || window.__EXTERNAL_PLAY_RUN__) ||
       worldMapSwitching ||
       document.getElementById("world-map-overlay")?.hidden === false ||
       document.getElementById("controls-settings-overlay")?.hidden === false;
@@ -684,8 +685,18 @@
     syncPlayHud();
   }
 
+  let activeWorldMapSwitchPromise = null;
+
   async function switchPlayWorldLevel(levelId, options = {}) {
-    if (!levelId || worldMapSwitching) return;
+    if (!levelId) return;
+    while (worldMapSwitching) {
+      if (options.immediate !== true && !app.isExternalSpectator) return;
+      if (!activeWorldMapSwitchPromise) return;
+      // 多个等待者醒来后，继续等待前一个请求新启动的切换。
+      try {
+        await activeWorldMapSwitchPromise;
+      } catch (_err) {}
+    }
     if (levelId === app.currentLevelId && options.reloadCurrent !== true) {
       setWorldMapOpen(false);
       return;
@@ -693,6 +704,7 @@
     worldMapSwitching = true;
     setWorldMapOpen(false);
     syncPlayOverlayInputLock();
+    const switchPromise = (async () => {
     try {
       const cells = worldMapCells();
       const outgoingCell = cells.find((cell) => cell.id === app.currentLevelId);
@@ -716,12 +728,14 @@
       }
 
       const levelState = await app.loadLevelState(levelId);
+      const shouldUpdateUrl =
+        options.updateUrl !== undefined ? Boolean(options.updateUrl) : !app.isExternalSpectator;
       app.applyLevelState(levelState, {
         deferRender: canAnimate,
         immediateCamera: true,
         resetHistory: true,
         resetLevelEntry: true,
-        updateUrl: true
+        updateUrl: shouldUpdateUrl
       });
 
       if (!canAnimate) {
@@ -763,7 +777,11 @@
         });
         app.render();
       });
-    } catch {
+    } catch (err) {
+      if (app.isExternalSpectator) {
+        console.error("Failed to switch level during external spectator:", err);
+        return;
+      }
       if (playWorldData?.game?.id) {
         window.location.assign(
           "/play/" + encodeURIComponent(playWorldData.game.id) + "/" + encodeURIComponent(levelId)
@@ -771,8 +789,12 @@
       }
     } finally {
       worldMapSwitching = false;
+      activeWorldMapSwitchPromise = null;
       syncPlayOverlayInputLock();
     }
+    })();
+    activeWorldMapSwitchPromise = switchPromise;
+    return switchPromise;
   }
 
   // Replay export uses the same world-map navigation path as the interactive

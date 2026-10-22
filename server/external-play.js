@@ -650,7 +650,9 @@ class ExternalPlayService {
     if (parts.length !== 2) return false;
     const [body, sig] = parts;
     const expectedSig = crypto.createHmac("sha256", this.viewerKey).update(body).digest("base64url");
-    if (sig !== expectedSig) return false;
+    const sigBuf = Buffer.from(sig, "utf8");
+    const expectedBuf = Buffer.from(expectedSig, "utf8");
+    if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) return false;
 
     try {
       const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
@@ -849,6 +851,7 @@ class ExternalPlayService {
 
       if (run) {
         run._deleted = true;
+        run.cleanup();
         this.runs.delete(run.runId);
         if (fs.existsSync(run.runDir)) {
           fs.rmSync(run.runDir, { recursive: true, force: true });
@@ -934,9 +937,16 @@ class ExternalPlayService {
 
   _cleanExpiredResumeRequests() {
     const now = Date.now();
+    const pruneGraceMs = 30 * 60 * 1000;
     for (const [id, req] of this.resumeRequests.entries()) {
       if (req.status === "pending" && req.expiresAt <= now) {
         req.status = "expired";
+      }
+      if (req.status !== "pending" && req.expiresAt + pruneGraceMs <= now) {
+        this.resumeRequests.delete(id);
+        if (this.controllerResumeIndex.get(req.controllerId) === id) {
+          this.controllerResumeIndex.delete(req.controllerId);
+        }
       }
     }
   }
@@ -1075,7 +1085,7 @@ class ExternalPlayService {
       result.push({
         request_id: req.id,
         run_id: req.runId,
-        entry_id: run.manifest?.group_entry_id || null,
+        entry_id: run.manifest?.entry_id || run.manifest?.group_entry_id || null,
         group_id: run.manifest?.group_id || null,
         model_name: run.modelName,
         declared_cli: req.declaredCli,
@@ -1219,21 +1229,23 @@ class ExternalPlayService {
   }
 
   async rejectResumeRequest(requestId) {
-    this._cleanExpiredResumeRequests();
-    const req = this.resumeRequests.get(requestId);
-    if (!req) {
-      throw { status: 404, code: "NOT_FOUND", message: `Resume request not found: ${requestId}` };
-    }
-    if (req.status !== "pending") {
-      throw { status: 409, code: "CONFLICT", message: `Resume request is already ${req.status}` };
-    }
-    req.status = "rejected";
-    this.controllerResumeIndex.delete(req.controllerId);
-    return {
-      status: "rejected",
-      request_id: req.id,
-      run_id: req.runId
-    };
+    return await this.admissionMutex.withLock(async () => {
+      this._cleanExpiredResumeRequests();
+      const req = this.resumeRequests.get(requestId);
+      if (!req) {
+        throw { status: 404, code: "NOT_FOUND", message: `Resume request not found: ${requestId}` };
+      }
+      if (req.status !== "pending") {
+        throw { status: 409, code: "CONFLICT", message: `Resume request is already ${req.status}` };
+      }
+      req.status = "rejected";
+      this.controllerResumeIndex.delete(req.controllerId);
+      return {
+        status: "rejected",
+        request_id: req.id,
+        run_id: req.runId
+      };
+    });
   }
 
   getRun(runId) {
@@ -1684,9 +1696,9 @@ class RunInstance {
       let timer = null;
       const waiter = {
         targetSeq,
-        resolve: () => {
+        resolve: (caughtUp = true) => {
           if (timer) clearTimeout(timer);
-          resolve(true);
+          resolve(caughtUp);
         }
       };
       this.watermarkWaiters.push(waiter);
@@ -2239,7 +2251,15 @@ class RunInstance {
       throw { status: 503, code: "PROJECTION_LAG", message: "Projection lag: state not caught up to current journal watermark" };
     }
 
-    return await this.projectionMutex.withLock(async () => {
+    return await this.sessionMutex.withLock(async () => {
+      if (controllerInfo) {
+        if (!this.currentLease || this.currentLease.controllerId !== controllerInfo.controllerId) {
+          throw { status: 409, code: "CONFLICT", message: "Run is not leased by this controller" };
+        }
+        if (Date.now() > this.currentLease.expiresAt) {
+          throw { status: 409, code: "CONFLICT", message: "Lease has expired" };
+        }
+      }
       const snap = this.gameSession ? getBridge().sessionSnapshot(this.gameSession) : {};
       return {
         run_id: this.runId,
@@ -2364,8 +2384,17 @@ class RunInstance {
         return mcpErrorResult;
       }
 
-      const beforeState = extractViewerState(this.gameSession, this.lastActionSeq, this.worldBundleDigest);
-      const beforeStateHash = computeViewerStateHash(beforeState);
+      const canReuseCurrentState =
+        this.currentViewerState &&
+        this.currentViewerState.action_seq === this.lastActionSeq &&
+        typeof this.currentViewerStateHash === "string" &&
+        this.currentViewerStateHash.length === 64;
+      const beforeState = canReuseCurrentState
+        ? this.currentViewerState
+        : extractViewerState(this.gameSession, this.lastActionSeq, this.worldBundleDigest);
+      const beforeStateHash = canReuseCurrentState
+        ? this.currentViewerStateHash
+        : computeViewerStateHash(beforeState);
 
       let bridgeResult;
       try {
@@ -2408,7 +2437,14 @@ class RunInstance {
       this.currentViewerState = afterState;
       this.currentViewerStateHash = afterStateHash;
 
-      const viewerTransition = buildViewerTransition(beforeState, afterState, tool, bridgeResult);
+      const viewerTransition = buildViewerTransition(
+        beforeState,
+        afterState,
+        tool,
+        bridgeResult,
+        beforeStateHash,
+        afterStateHash
+      );
       const sanitizedStatus = buildSanitizedStatus(this.gameSession);
 
       // Build Action Record V1 with 64KB blob overflow protection
@@ -2556,9 +2592,11 @@ class RunInstance {
         // 结算前确保 actions.jsonl 完整对齐权威 WAL，杜绝副本写入缺失导致结算指标偏离
         this._reconcileActionsJsonl();
 
+        if (this._deleted) return;
         // Build summary
         const summary = SummaryBuilder.buildSummary(this, outcome);
         const summaryStr = JSON.stringify(summary, null, 2);
+        if (this._deleted) return;
         this._writeSummaryAtomically(summaryStr);
         const summaryDigest = crypto.createHash("sha256").update(summaryStr, "utf8").digest("hex");
 
@@ -2571,7 +2609,7 @@ class RunInstance {
         };
 
         await this.sessionMutex.withLock(async () => {
-          if (["won", "action_limit", "timed_out", "cancelled", "failed"].includes(this.status)) return;
+          if (this._deleted || ["won", "action_limit", "timed_out", "cancelled", "failed"].includes(this.status)) return;
 
           const endedEventId = this.lastEventId + 1;
           const opId = `finalize-${outcome}-${this.finalizeSeq}`;
@@ -2698,6 +2736,19 @@ class RunInstance {
       this.deadlineTimer = null;
     }
     this.deadlineMonotonicMs = null;
+    if (Array.isArray(this.watermarkWaiters) && this.watermarkWaiters.length > 0) {
+      for (const waiter of this.watermarkWaiters.splice(0)) {
+        waiter.resolve(false);
+      }
+    }
+    if (this.subscribers && this.subscribers.size > 0) {
+      for (const sub of this.subscribers) {
+        try {
+          sub.end();
+        } catch (_e) {}
+      }
+      this.subscribers.clear();
+    }
   }
 }
 
@@ -2988,10 +3039,10 @@ function extractViewerState(session, actionSeq, worldBundleDigest) {
   };
 }
 
-function buildViewerTransition(beforeState, afterState, tool, bridgeResult) {
+function buildViewerTransition(beforeState, afterState, tool, bridgeResult, precomputedBeforeHash = null, precomputedAfterHash = null) {
   const durationMs = 250;
-  const beforeHash = computeViewerStateHash(beforeState);
-  const afterHash = computeViewerStateHash(afterState);
+  const beforeHash = precomputedBeforeHash || computeViewerStateHash(beforeState);
+  const afterHash = precomputedAfterHash || computeViewerStateHash(afterState);
   const transSource = bridgeResult?._transition_source || {};
 
   // 1. Compute actor deltas (including player)
